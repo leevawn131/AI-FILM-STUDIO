@@ -221,7 +221,7 @@ def test_4_duplicate_job_submission(tmp_path):
         )
         # Complete job
         result_data = {"shots": ["shot-1", "shot-2", "shot-3", "shot-4"]}
-        job_manager.complete_job(db=session, job_id=job1.id, result=result_data)
+        job_manager.complete_job(db=session, job_id=job1.id, result=result_data, fencing_token=job1.fencing_token)
         assert job1.status == "COMPLETED"
 
         # Check budget spent
@@ -272,7 +272,7 @@ def test_5_retry_after_failed_job(tmp_path):
 
         # Simulate provider failure containing a sensitive Google API key and server path
         raw_sensitive_error = "Provider API error with key AIzaSyD4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9 at /home/leevawn/secret/token.json"
-        job_manager.fail_job(session, job.id, raw_sensitive_error)
+        job_manager.fail_job(session, job.id, raw_sensitive_error, fencing_token=job.fencing_token)
         
         session.refresh(job)
         assert job.status == "FAILED"
@@ -290,7 +290,7 @@ def test_5_retry_after_failed_job(tmp_path):
         assert job_retried.error_message == ""
 
         # 3. Successful retry completion
-        job_manager.complete_job(session, job_retried.id, {"status": "success", "frames": 120})
+        job_manager.complete_job(session, job_retried.id, {"status": "success", "frames": 120}, fencing_token=job_retried.fencing_token)
         session.refresh(job_retried)
         assert job_retried.status == "COMPLETED"
 

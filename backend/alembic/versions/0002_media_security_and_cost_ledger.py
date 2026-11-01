@@ -15,6 +15,11 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
+    # Widen alembic_version.version_num in PostgreSQL to support long revision IDs
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        op.execute(sa.text("ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(128)"))
+
     # 1. Add checksum to media_assets
     with op.batch_alter_table('media_assets') as batch_op:
         batch_op.add_column(sa.Column('checksum', sa.String(length=64), nullable=True))

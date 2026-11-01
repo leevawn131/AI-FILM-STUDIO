@@ -106,10 +106,10 @@ def run_ai_assembly_cut(project_id: str, db: Session = Depends(get_db)):
 
     try:
         assembly = editor_agent.create_assembly_cut(shots_data)
-        job_manager.complete_job(db, job.id, assembly, worker_id=job.worker_id, lease_token=job.lease_token)
+        job_manager.complete_job(db, job.id, assembly, worker_id=job.worker_id, fencing_token=job.fencing_token, lease_token=job.lease_token)
         return assembly
     except Exception as e:
-        job_manager.fail_job(db, job.id, e, worker_id=job.worker_id, lease_token=job.lease_token)
+        job_manager.fail_job(db, job.id, e, worker_id=job.worker_id, fencing_token=job.fencing_token, lease_token=job.lease_token)
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail=sanitize_error_message(e))

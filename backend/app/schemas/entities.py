@@ -308,6 +308,9 @@ class UploadOperationResponse(BaseModel):
     status: str
     checksum: Optional[str] = None
     file_size_bytes: int = 0
+    worker_id: Optional[str] = None
+    lease_expires_at: Optional[datetime] = None
+    fencing_token: int = 1
     error_message: Optional[str] = ""
     created_at: datetime
     updated_at: datetime

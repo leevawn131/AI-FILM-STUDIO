@@ -214,10 +214,10 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
         db.commit()
         db.refresh(scene)
 
-        job_manager.complete_job(db, job.id, {"id": scene.id, "scene_number": scene.scene_number}, worker_id=job.worker_id, lease_token=job.lease_token)
+        job_manager.complete_job(db, job.id, {"id": scene.id, "scene_number": scene.scene_number}, worker_id=job.worker_id, fencing_token=job.fencing_token, lease_token=job.lease_token)
         return scene
     except Exception as e:
-        job_manager.fail_job(db, job.id, e, worker_id=job.worker_id, lease_token=job.lease_token)
+        job_manager.fail_job(db, job.id, e, worker_id=job.worker_id, fencing_token=job.fencing_token, lease_token=job.lease_token)
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail=sanitize_error_message(e))

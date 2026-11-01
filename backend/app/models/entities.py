@@ -271,6 +271,9 @@ class UploadOperation(Base):
     status = Column(String(32), nullable=False, default="STAGED", index=True) # STAGED, DB_COMMITTED, FINALIZED, FAILED
     checksum = Column(String(64), nullable=True)
     file_size_bytes = Column(Integer, default=0)
+    worker_id = Column(String(64), nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
+    fencing_token = Column(Integer, nullable=False, default=1)
     error_message = Column(Text, default="")
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
