@@ -7,6 +7,7 @@ from backend.app.models.entities import Project, Scene, Character, Location, Sho
 from backend.app.schemas.entities import SceneCreate, SceneUpdate, SceneResponse
 from backend.app.agents.screenwriter_agent import screenwriter_agent
 from backend.app.services.cost_controller import cost_controller
+from backend.app.services.job_manager import job_manager, sanitize_error_message
 
 router = APIRouter(prefix="/api/scenes", tags=["screenplay"])
 
@@ -114,77 +115,98 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Authorize & charge with duplicate detection
-    cost_controller.authorize_and_charge(
+    job_payload = {
+        "project_id": data.project_id,
+        "prompt": data.prompt,
+        "character_ids": data.character_ids,
+        "location_id": data.location_id
+    }
+    job, action = job_manager.prepare_or_claim_job(
         db=db,
         project_id=data.project_id,
-        action_type="script_generation",
-        payload={"project_id": data.project_id, "prompt": data.prompt},
-        details=f"AI Screenwriter: {data.prompt[:50] if data.prompt else 'Dramatic sequence'}"
+        job_type="screenplay_generate",
+        payload=job_payload
     )
 
-    last_scene = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
-    next_num = (last_scene.scene_number + 1) if last_scene else 1
-    next_order = (last_scene.order_index + 1) if last_scene else 1
+    if action == "REUSE" and job.result:
+        try:
+            cached_res = json.loads(job.result)
+            existing_scene = db.query(Scene).filter(Scene.id == cached_res.get("id")).first()
+            if existing_scene:
+                return existing_scene
+        except Exception:
+            pass
 
-    # Gather character details
-    characters_data = []
-    if data.character_ids:
-        chars = db.query(Character).filter(Character.id.in_(data.character_ids)).all()
-        for c in chars:
-            characters_data.append({"name": c.name, "role": c.role, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics})
-    else:
-        chars = db.query(Character).filter(Character.project_id == data.project_id).limit(2).all()
-        for c in chars:
-            characters_data.append({"name": c.name, "role": c.role, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics})
+    if action == "IN_PROGRESS":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Screenplay generation job is already in progress (job_id: {job.id}). Please wait for completion."
+        )
 
-    # Location details
-    loc_data = None
-    if data.location_id:
-        loc = db.query(Location).filter(Location.id == data.location_id).first()
-        if loc:
-            loc_data = {"name": loc.name, "time_of_day": loc.time_of_day, "lighting_setup": loc.lighting_setup}
+    try:
+        # Authorize & charge with duplicate detection
+        cost_controller.authorize_and_charge(
+            db=db,
+            project_id=data.project_id,
+            action_type="script_generation",
+            payload=job_payload,
+            details=f"AI Screenwriter: {data.prompt[:50] if data.prompt else 'Dramatic sequence'}"
+        )
 
-    generated = screenwriter_agent.write_scene(
-        project_title=project.name,
-        genre=project.genre,
-        scene_number=next_num,
-        prompt=data.prompt,
-        characters=characters_data,
-        location=loc_data
-    )
+        last_scene = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
+        next_num = (last_scene.scene_number + 1) if last_scene else 1
+        next_order = (last_scene.order_index + 1) if last_scene else 1
 
-    scene = Scene(
-        project_id=data.project_id,
-        scene_number=next_num,
-        slugline=generated.get("slugline", "INT. UNKNOWN SET - NIGHT"),
-        title=generated.get("title", f"Scene {next_num}"),
-        summary=generated.get("summary", ""),
-        script_content=generated.get("script_content", ""),
-        location_id=data.location_id,
-        estimated_duration=generated.get("estimated_duration", 20),
-        budget_limit=25.0,
-        order_index=next_order
-    )
-    db.add(scene)
-    db.commit()
-    db.refresh(scene)
+        # Gather character details
+        characters_data = []
+        if data.character_ids:
+            chars = db.query(Character).filter(Character.id.in_(data.character_ids)).all()
+            for c in chars:
+                characters_data.append({"name": c.name, "role": c.role, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics})
+        else:
+            chars = db.query(Character).filter(Character.project_id == data.project_id).limit(2).all()
+            for c in chars:
+                characters_data.append({"name": c.name, "role": c.role, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics})
 
-    return {
-        "id": scene.id,
-        "project_id": scene.project_id,
-        "scene_number": scene.scene_number,
-        "slugline": scene.slugline,
-        "title": scene.title,
-        "summary": scene.summary,
-        "script_content": scene.script_content,
-        "location_id": scene.location_id,
-        "estimated_duration": scene.estimated_duration,
-        "budget_limit": scene.budget_limit,
-        "order_index": scene.order_index,
-        "created_at": scene.created_at,
-        "shots_count": 0
-    }
+        # Location details
+        loc_data = None
+        if data.location_id:
+            loc = db.query(Location).filter(Location.id == data.location_id).first()
+            if loc:
+                loc_data = {"name": loc.name, "time_of_day": loc.time_of_day, "lighting_setup": loc.lighting_setup}
+
+        generated = screenwriter_agent.write_scene(
+            project_title=project.name,
+            genre=project.genre,
+            scene_number=next_num,
+            prompt=data.prompt,
+            characters=characters_data,
+            location=loc_data
+        )
+
+        scene = Scene(
+            project_id=data.project_id,
+            scene_number=next_num,
+            slugline=generated.get("slugline", "INT. UNKNOWN SET - NIGHT"),
+            title=generated.get("title", f"Scene {next_num}"),
+            summary=generated.get("summary", ""),
+            script_content=generated.get("script_content", ""),
+            location_id=data.location_id,
+            estimated_duration=generated.get("estimated_duration", 20),
+            budget_limit=25.0,
+            order_index=next_order
+        )
+        db.add(scene)
+        db.commit()
+        db.refresh(scene)
+
+        job_manager.complete_job(db, job.id, {"id": scene.id, "scene_number": scene.scene_number})
+        return scene
+    except Exception as e:
+        job_manager.fail_job(db, job.id, e)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 @router.patch("/{scene_id}", response_model=SceneResponse)
 def update_scene(scene_id: str, data: SceneUpdate, db: Session = Depends(get_db)):

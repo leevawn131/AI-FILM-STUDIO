@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.app.config import settings
 from backend.app.database import init_db, SessionLocal
 from backend.app.models.entities import Project, Character, Location, Scene, Shot
-from backend.app.routers import projects, dashboard, cost, screenplay, storyboard, characters, locations, flow_handoff, media, editor, audio, export, system
+from backend.app.routers import projects, dashboard, cost, screenplay, storyboard, characters, locations, flow_handoff, media, editor, audio, export, system, jobs
 
 def seed_initial_demo_if_empty(force: bool = False):
     if not settings.seed_demo_data and not force:
@@ -138,10 +138,20 @@ FADE TO BLACK.
     finally:
         db.close()
 
+from backend.app.services.job_manager import job_manager
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize database tables via migrations and scaffold folders
     init_db()
+    
+    # Reconcile any interrupted background jobs from prior runs
+    db = SessionLocal()
+    try:
+        recovered = job_manager.reconcile_interrupted_jobs(db)
+    finally:
+        db.close()
+
     seed_initial_demo_if_empty()
     yield
 
@@ -177,6 +187,7 @@ app.include_router(editor.router)
 app.include_router(audio.router)
 app.include_router(export.router)
 app.include_router(system.router)
+app.include_router(jobs.router)
 
 @app.get("/api/health")
 def health_check():

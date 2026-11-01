@@ -37,6 +37,7 @@ class Project(Base):
     audio_tracks = relationship("AudioTrack", back_populates="project", cascade="all, delete-orphan")
     cost_records = relationship("CostRecord", back_populates="project", cascade="all, delete-orphan")
     export_jobs = relationship("ExportJob", back_populates="project", cascade="all, delete-orphan")
+    studio_jobs = relationship("StudioJob", back_populates="project", cascade="all, delete-orphan")
 
 
 class Character(Base):
@@ -88,6 +89,7 @@ class Scene(Base):
     location_id = Column(String(36), ForeignKey("locations.id", ondelete="SET NULL"), nullable=True)
     estimated_duration = Column(Integer, default=15) # seconds
     budget_limit = Column(Float, default=20.0) # per-scene budget limit
+    budget_spent = Column(Float, default=0.0) # per-scene actual tracked expenditure
     order_index = Column(Integer, default=0)
     created_at = Column(DateTime, default=utc_now)
 
@@ -115,6 +117,8 @@ class Shot(Base):
     generation_status = Column(String(32), default="pending") # pending, ready_for_flow, generating, imported, approved
     video_asset_id = Column(String(36), ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True)
     thumbnail_path = Column(String(512), default="")
+    flow_credits_spent = Column(Float, default=0.0) # Flow subscription credits recorded for this shot
+    generation_attempts = Column(Integer, default=0) # count of Flow generation / regeneration attempts
     order_index = Column(Integer, default=0)
     created_at = Column(DateTime, default=utc_now)
 
@@ -218,3 +222,23 @@ class ExportJob(Base):
     completed_at = Column(DateTime, nullable=True)
 
     project = relationship("Project", back_populates="export_jobs")
+
+
+class StudioJob(Base):
+    __tablename__ = "studio_jobs"
+
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    job_type = Column(String(64), nullable=False, index=True)
+    idempotency_key = Column(String(64), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="PENDING", index=True) # PENDING, RUNNING, COMPLETED, FAILED, CANCELLED
+    payload = Column(Text, default="{}")
+    result = Column(Text, default="{}")
+    error_message = Column(Text, default="")
+    internal_error = Column(Text, default="")
+    retry_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+    completed_at = Column(DateTime, nullable=True)
+
+    project = relationship("Project", back_populates="studio_jobs")

@@ -95,39 +95,56 @@ def validate_extension(filename: str, allowed_extensions: Sequence[str]) -> str:
         )
     return ext
 
-def verify_magic_bytes(file_path: Path, expected_type: str = "media") -> bool:
+def verify_magic_bytes(file_path: Path, expected_type: str = "media", filename: Optional[str] = None) -> bool:
     """
     Verifies initial magic bytes of the file to protect against extension spoofing.
+    Never trusts browser-supplied MIME types.
     """
     if not file_path.exists() or file_path.stat().st_size == 0:
         return False
         
-    ext = file_path.suffix.lower().lstrip(".")
+    target_name = filename if filename else file_path.name
+    p = Path(target_name)
+    if p.suffix.lower() == ".tmp":
+        ext = Path(p.stem).suffix.lower().lstrip(".")
+    else:
+        ext = p.suffix.lower().lstrip(".")
+
     with open(file_path, "rb") as f:
         header = f.read(32)
 
+    # 1. Images
     if ext in ["jpg", "jpeg"]:
         return header.startswith(b"\xff\xd8\xff")
     elif ext == "png":
         return header.startswith(b"\x89PNG\r\n\x1a\n")
     elif ext == "webp":
         return header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WEBP"
+
+    # 2. Videos
     elif ext in ["mp4", "mov"]:
-        # ISO Base Media / MP4 / QuickTime: 'ftyp' at offset 4..8
+        # ISO Base Media / MP4 / QuickTime: 'ftyp' or 'moov'
         return len(header) >= 8 and (b"ftyp" in header[:16] or b"moov" in header[:16])
     elif ext in ["mkv", "webm"]:
         return header.startswith(b"\x1a\x45\xdf\xa3")
+    elif ext == "avi":
+        return header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"AVI "
+
+    # 3. Audio
     elif ext == "wav":
         return header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WAVE"
     elif ext == "ogg":
         return header.startswith(b"OggS")
     elif ext == "mp3":
         return header.startswith(b"ID3") or header[:2] in [b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"]
-    elif ext in ["aac", "m4a"]:
-        return True # AAC frames or MP4 container
+    elif ext == "flac":
+        return header.startswith(b"fLaC")
+    elif ext == "m4a":
+        return len(header) >= 8 and b"ftyp" in header[:16]
+    elif ext == "aac":
+        return header[:2] in [b"\xff\xf1", b"\xff\xf9"] or header.startswith(b"ID3") or b"ftyp" in header[:16]
 
-    # If extension is not strictly categorized, allow if ffprobe validates it
-    return True
+    return False
 
 def compute_file_sha256(file_path: Path) -> str:
     """
@@ -243,7 +260,7 @@ async def save_upload_file_securely(
             raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes)")
 
         # 3. Verify magic bytes / headers
-        if validate_content and not verify_magic_bytes(temp_path, expected_type=expected_type):
+        if validate_content and not verify_magic_bytes(temp_path, expected_type=expected_type, filename=upload_file.filename):
             raise HTTPException(status_code=400, detail="Invalid file header: content does not match extension")
 
         # 4. Atomic move to destination

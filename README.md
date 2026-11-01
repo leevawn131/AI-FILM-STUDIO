@@ -159,19 +159,46 @@ Visit **http://localhost:5173** in your browser.
 
 ## 🧪 Testing
 
-The studio features an automated test suite covering all 6 phases:
+The studio features an automated test suite covering all 6 phases and core stabilization requirements:
 
 ```bash
 PYTHONPATH=. backend/venv/bin/pytest backend/tests/ -v
 ```
 
 Tests verify:
-- `test_phase1.py`: Project management, SQLite initialization, dashboard metrics, cost controller.
-- `test_phase2.py`: Screenwriter scene creation, Director Agent breakdown, Cinematographer prompt optimization, Continuity Supervisor audit.
-- `test_phase3.py`: Character Designer Agent profiles, reference image upload, Location set atmospheric anchors.
-- `test_phase4.py`: Google Flow handoff package generation, ZIP download, Watched folder scanner, FFprobe video validation, and auto-matching.
-- `test_phase5.py`: Film Editor Agent assembly cut, timeline normalization, FFmpeg sequence stitching.
-- `test_phase6.py`: Procedural BGM synthesis, scratch voiceover generation, multi-track audio ducking, and master MP4 export.
+- `test_database_integrity.py`: Alembic migration lifecycle, strict legacy schema compatibility verification, automatic pre-migration backups, unknown/partial DB rejection, and configurable demo seeding.
+- `test_cost_controller.py`: Provider-aware ledger, separation of monetary costs from Flow credits, unknown costs support, idempotent hash deduplication, and atomic conditional budget limits.
+- `test_media_security.py`: Filename sanitization, secure unique filename generation, streaming size validation, path traversal prevention, magic-byte header inspection, duplicate asset rejection (409 Conflict), and temp file cleanup.
+- `test_integration_sprints.py`: 10 comprehensive cross-cutting scenarios covering fresh database initialization, legacy data preservation, crash/interrupted migration safety, duplicate job submission, job retryability, concurrent multi-threaded budget updates, upload traversal defense, audio/image header validation, and application restart state persistence.
+- `test_phase1.py` - `test_phase6.py`: Full end-to-end filmmaking workflow tests (screenplay, storyboard, characters, locations, Google Flow handoff, FFmpeg assembly cut, procedural audio, and MP4 master rendering).
+
+---
+
+## 🔒 Enterprise Stabilization & Architecture Hardening
+
+### 1. Legacy Database Migration Safety
+- **Strict Compatibility Validation**: Verifies all 9 legacy tables and required columns before stamping unversioned databases to `0001_initial_schema`. Unversioned databases with incomplete or unknown schemas raise `IncompatibleLegacySchemaError` to prevent corruption.
+- **Automatic Pre-Migration Backups**: Unversioned legacy databases are automatically backed up to `backend/data/backups/studio_backup_*.db` using SQLite's online backup API before running migrations.
+- **Schema Management**: Managed via Alembic (`0001_initial_schema`, `0002_media_security_and_cost_ledger`, `0003_jobs_and_scene_budget`).
+
+### 2. Persistent Idempotent Job Lifecycle
+- **Execution States**: Dedicated `StudioJob` entities separate execution lifecycle (`PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`) from financial ledger records (`CostRecord`).
+- **Result Reuse & Concurrency**: Completed requests reuse cached outputs without re-running or charging. In-progress jobs return HTTP 409 Conflict to prevent concurrent duplicate execution.
+- **Retryability & Error Sanitization**: Failed jobs transition cleanly and can be retried. Sensitive provider credentials (API keys, authorization tokens, system paths) are redacted before storage or exposure to users.
+- **Crash Reconciliation**: Unfinished jobs from unexpected server shutdowns are reconciled on startup into retryable `FAILED` states.
+
+### 3. Database-Level Atomic Budget Enforcement
+- Conditional SQL updates (`UPDATE ... WHERE budget_spent + charge <= budget_total`) eliminate race conditions across concurrent requests and threads.
+- Automatic transactional rollbacks guarantee neither project nor scene budget limits can ever be exceeded.
+
+### 4. Unified Secure Upload Pipeline
+- Shared streaming upload validation (`save_upload_file_securely`) across all media, audio, character, and location endpoints.
+- Verifies true binary magic-byte signatures (JPEG, PNG, WebP, MP4, MOV, MKV, AVI, WAV, MP3, OGG, FLAC, AAC, M4A) to defeat browser MIME-type spoofing.
+- Writes to temporary `.tmp` files in `settings.temp_dir`, calculates SHA-256 checksums in-stream, prevents duplicate imports with HTTP 409, and ensures atomic moves and temp cleanup on failure.
+
+### 5. Google Flow Credit Accounting
+- **Local Preparation vs Platform Generation**: Local prompt pack generation and opening Google Flow are accounted at 0 Flow credits.
+- **Shot-Level Tracking**: Actual Google Flow credits consumed are recorded explicitly via `POST /api/flow-handoff/record-usage/{project_id}`, capturing generation attempts and regeneration tracking.
 
 ---
 

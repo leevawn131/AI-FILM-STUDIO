@@ -5,7 +5,9 @@ from sqlalchemy.orm import Session
 from backend.app.database import get_db
 from backend.app.config import settings
 from backend.app.models.entities import Project
+from backend.app.schemas.entities import RecordFlowUsageRequest
 from backend.app.services.flow_handoff import flow_handoff_service
+from backend.app.services.cost_controller import cost_controller
 from backend.app.services.security import validate_safe_path
 
 router = APIRouter(prefix="/api/flow-handoff", tags=["flow_handoff"])
@@ -57,3 +59,32 @@ def download_flow_package(project_id: str, db: Session = Depends(get_db)):
         filename=pkg["zip_filename"],
         media_type="application/zip"
     )
+
+@router.post("/record-usage/{project_id}")
+def record_actual_flow_usage(project_id: str, data: RecordFlowUsageRequest, db: Session = Depends(get_db)):
+    """
+    Explicitly records actual Google Flow credits spent on video generation or regeneration for a shot.
+    Does NOT invent prices or conflate estimated package prep with actual platform video generation.
+    """
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    record, shot = cost_controller.record_flow_credit_usage(
+        db=db,
+        project_id=project_id,
+        shot_id=data.shot_id,
+        flow_credits=data.flow_credits,
+        is_regeneration=data.is_regeneration,
+        notes=data.notes
+    )
+
+    return {
+        "status": "success",
+        "shot_id": shot.id,
+        "shot_code": shot.shot_code,
+        "flow_credits_charged": data.flow_credits,
+        "total_shot_flow_credits": shot.flow_credits_spent,
+        "generation_attempts": shot.generation_attempts,
+        "ledger_record_id": record.id
+    }

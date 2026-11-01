@@ -32,8 +32,8 @@ def test_characters_and_locations_workflow():
     assert new_char["project_id"] == project_id
     new_char_id = new_char["id"]
 
-    # 3. Upload reference image mock
-    fake_img = io.BytesIO(b"fake image bytes")
+    # 3. Upload reference image mock (with valid JPEG header for security verification)
+    fake_img = io.BytesIO(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00test_mock_jpeg_bytes")
     upload_res = client.post(
         f"/api/characters/{new_char_id}/upload-ref",
         files={"file": ("test_ref.jpg", fake_img, "image/jpeg")}

@@ -1,63 +1,26 @@
 import os
 import sqlite3
-import tempfile
 import pytest
 from pathlib import Path
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect
 from fastapi.testclient import TestClient
 
 from backend.app.config import settings
-from backend.app.main import app, seed_initial_demo_if_empty
-from backend.app.database import run_migrations, backup_database, SessionLocal
-from backend.app.models.entities import Project
+from backend.app.main import app
+from backend.app.database import (
+    run_migrations,
+    backup_database,
+    IncompatibleLegacySchemaError,
+    REQUIRED_LEGACY_SCHEMA
+)
 
 client = TestClient(app)
 
-def test_alembic_fresh_database_migration(tmp_path):
-    """Verifies that a brand new database migrates directly to head with all tables and columns."""
-    fresh_db = tmp_path / "fresh_test.db"
-    db_url = f"sqlite:///{fresh_db}"
-    fresh_engine = create_engine(db_url)
-
-    # Run migrations
-    run_migrations(target_engine=fresh_engine, db_url=db_url)
-
-    # Inspect resulting tables
-    with fresh_engine.connect() as conn:
-        inspector = inspect(conn)
-        tables = set(inspector.get_table_names())
-        
-        expected_tables = {
-            "projects", "characters", "locations", "scenes",
-            "shots", "media_assets", "audio_tracks", "cost_records",
-            "export_jobs", "alembic_version"
-        }
-        assert expected_tables.issubset(tables)
-
-        # Check media_assets checksum column
-        media_cols = {col["name"] for col in inspector.get_columns("media_assets")}
-        assert "checksum" in media_cols
-
-        # Check cost_records provider-aware columns
-        cost_cols = {col["name"] for col in inspector.get_columns("cost_records")}
-        assert "provider" in cost_cols
-        assert "flow_credits" in cost_cols
-        assert "actual_cost" in cost_cols
-        assert "actual_cost_known" in cost_cols
-        assert "estimated_cost" in cost_cols
-        assert "shot_id" in cost_cols
-
-def test_alembic_legacy_database_migration_without_data_loss(tmp_path):
-    """
-    Verifies that an existing legacy database (created without Alembic)
-    is detected, stamped to 0001, and upgraded to 0002 with all existing data preserved.
-    """
-    legacy_db = tmp_path / "legacy_test.db"
-    conn = sqlite3.connect(str(legacy_db))
+def create_full_legacy_schema(db_path: Path):
+    """Creates a complete and valid 9-table unversioned legacy database matching 0001_initial_schema."""
+    conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
-
-    # Create initial legacy schema without alembic_version
-    cur.execute("""
+    cur.executescript("""
         CREATE TABLE projects (
             id VARCHAR(36) PRIMARY KEY,
             name VARCHAR(128) NOT NULL,
@@ -72,8 +35,46 @@ def test_alembic_legacy_database_migration_without_data_loss(tmp_path):
             created_at DATETIME,
             updated_at DATETIME
         );
-    """)
-    cur.execute("""
+        CREATE TABLE characters (
+            id VARCHAR(36) PRIMARY KEY,
+            project_id VARCHAR(36) NOT NULL,
+            name VARCHAR(128) NOT NULL,
+            role VARCHAR(64),
+            age VARCHAR(32),
+            facial_characteristics TEXT,
+            clothing TEXT,
+            voice_profile TEXT,
+            personality TEXT,
+            visual_prompt_tags TEXT,
+            reference_image_path VARCHAR(512),
+            created_at DATETIME
+        );
+        CREATE TABLE locations (
+            id VARCHAR(36) PRIMARY KEY,
+            project_id VARCHAR(36) NOT NULL,
+            name VARCHAR(128) NOT NULL,
+            description TEXT,
+            time_of_day VARCHAR(64),
+            weather VARCHAR(64),
+            lighting_setup TEXT,
+            visual_prompt_tags TEXT,
+            reference_image_path VARCHAR(512),
+            created_at DATETIME
+        );
+        CREATE TABLE scenes (
+            id VARCHAR(36) PRIMARY KEY,
+            project_id VARCHAR(36) NOT NULL,
+            scene_number INTEGER NOT NULL,
+            slugline VARCHAR(256) NOT NULL,
+            title VARCHAR(256),
+            summary TEXT,
+            script_content TEXT,
+            location_id VARCHAR(36),
+            estimated_duration INTEGER,
+            budget_limit FLOAT,
+            order_index INTEGER,
+            created_at DATETIME
+        );
         CREATE TABLE media_assets (
             id VARCHAR(36) PRIMARY KEY,
             project_id VARCHAR(36) NOT NULL,
@@ -92,8 +93,42 @@ def test_alembic_legacy_database_migration_without_data_loss(tmp_path):
             validation_notes TEXT,
             created_at DATETIME
         );
-    """)
-    cur.execute("""
+        CREATE TABLE shots (
+            id VARCHAR(36) PRIMARY KEY,
+            scene_id VARCHAR(36) NOT NULL,
+            project_id VARCHAR(36) NOT NULL,
+            shot_number INTEGER NOT NULL,
+            shot_code VARCHAR(32),
+            duration_seconds FLOAT,
+            camera_angle VARCHAR(64),
+            camera_movement VARCHAR(64),
+            visual_description TEXT,
+            lighting VARCHAR(256),
+            character_references TEXT,
+            video_prompt TEXT,
+            negative_prompt TEXT,
+            seed INTEGER,
+            generation_status VARCHAR(32),
+            video_asset_id VARCHAR(36),
+            thumbnail_path VARCHAR(512),
+            order_index INTEGER,
+            created_at DATETIME
+        );
+        CREATE TABLE audio_tracks (
+            id VARCHAR(36) PRIMARY KEY,
+            project_id VARCHAR(36) NOT NULL,
+            track_type VARCHAR(32),
+            title VARCHAR(256) NOT NULL,
+            file_path VARCHAR(512) NOT NULL,
+            duration_seconds FLOAT,
+            start_time_seconds FLOAT,
+            volume_level FLOAT,
+            ducking_enabled BOOLEAN,
+            ducking_level FLOAT,
+            scene_id VARCHAR(36),
+            shot_id VARCHAR(36),
+            created_at DATETIME
+        );
         CREATE TABLE cost_records (
             id VARCHAR(36) PRIMARY KEY,
             project_id VARCHAR(36) NOT NULL,
@@ -105,63 +140,161 @@ def test_alembic_legacy_database_migration_without_data_loss(tmp_path):
             details TEXT,
             created_at DATETIME
         );
+        CREATE TABLE export_jobs (
+            id VARCHAR(36) PRIMARY KEY,
+            project_id VARCHAR(36) NOT NULL,
+            preset_name VARCHAR(64),
+            resolution VARCHAR(32),
+            aspect_ratio VARCHAR(16),
+            fps INTEGER,
+            include_subtitles BOOLEAN,
+            status VARCHAR(32),
+            progress_pct INTEGER,
+            output_path VARCHAR(512),
+            file_size_bytes INTEGER,
+            error_message TEXT,
+            created_at DATETIME,
+            completed_at DATETIME
+        );
     """)
-    # Insert existing records to verify no data loss
-    cur.execute("INSERT INTO projects (id, name, budget_total, budget_spent) VALUES ('proj-1', 'Legacy Sci-Fi Movie', 200.0, 10.0)")
-    cur.execute("INSERT INTO cost_records (id, project_id, action_type, cost_usd) VALUES ('cost-1', 'proj-1', 'script_generation', 0.005)")
-    cur.execute("INSERT INTO media_assets (id, project_id, filename, file_path) VALUES ('med-1', 'proj-1', 'clip.mp4', 'projects/proj-1/clip.mp4')")
     conn.commit()
     conn.close()
 
-    # Now run migrations on this legacy database
+def test_1_empty_database_migration(tmp_path):
+    """Test 1: Brand new empty database migrates directly to head with all tables."""
+    fresh_db = tmp_path / "fresh.db"
+    db_url = f"sqlite:///{fresh_db}"
+    fresh_engine = create_engine(db_url)
+
+    run_migrations(target_engine=fresh_engine, db_url=db_url)
+
+    with fresh_engine.connect() as conn:
+        inspector = inspect(conn)
+        tables = set(inspector.get_table_names())
+        expected = {
+            "projects", "characters", "locations", "scenes",
+            "shots", "media_assets", "audio_tracks", "cost_records",
+            "export_jobs", "studio_jobs", "alembic_version"
+        }
+        assert expected.issubset(tables)
+
+def test_2_valid_legacy_database_migration_with_backup_and_data_preservation(tmp_path):
+    """Test 2: Complete legacy database is backed up, stamped, upgraded to head with zero data loss."""
+    legacy_db = tmp_path / "legacy.db"
+    create_full_legacy_schema(legacy_db)
+
+    # Insert existing film production data
+    conn = sqlite3.connect(str(legacy_db))
+    conn.execute("INSERT INTO projects (id, name, budget_total, budget_spent) VALUES ('proj-alpha', 'Solaris Reboot', 500.0, 50.0)")
+    conn.execute("INSERT INTO characters (id, project_id, name) VALUES ('char-1', 'proj-alpha', 'DR. KELVIN')")
+    conn.execute("INSERT INTO scenes (id, project_id, scene_number, slugline) VALUES ('sc-1', 'proj-alpha', 1, 'INT. STATION')")
+    conn.commit()
+    conn.close()
+
     db_url = f"sqlite:///{legacy_db}"
-    legacy_engine = create_engine(db_url)
-    run_migrations(target_engine=legacy_engine, db_url=db_url)
+    engine = create_engine(db_url)
+    run_migrations(target_engine=engine, db_url=db_url)
 
-    # Verify data integrity
-    conn2 = sqlite3.connect(str(legacy_db))
-    cur2 = conn2.cursor()
+    # Verify existing data preserved
+    verify_conn = sqlite3.connect(str(legacy_db))
+    cur = verify_conn.cursor()
+    cur.execute("SELECT name, budget_total FROM projects WHERE id = 'proj-alpha'")
+    row = cur.fetchone()
+    assert row == ("Solaris Reboot", 500.0)
 
-    cur2.execute("SELECT name, budget_total FROM projects WHERE id = 'proj-1'")
-    row = cur2.fetchone()
-    assert row is not None
-    assert row[0] == "Legacy Sci-Fi Movie"
-    assert row[1] == 200.0
+    cur.execute("SELECT name FROM characters WHERE id = 'char-1'")
+    assert cur.fetchone()[0] == "DR. KELVIN"
 
-    # Verify new columns added
-    cur2.execute("PRAGMA table_info(media_assets)")
-    cols = [r[1] for r in cur2.fetchall()]
-    assert "checksum" in cols
+    # Verify upgraded columns exist
+    cur.execute("SELECT version_num FROM alembic_version")
+    ver = cur.fetchone()[0]
+    assert ver == "0003_jobs_and_scene_budget"
 
-    cur2.execute("PRAGMA table_info(cost_records)")
-    cost_cols = [r[1] for r in cur2.fetchall()]
-    assert "provider" in cost_cols
-    assert "flow_credits" in cost_cols
+    cur.execute("PRAGMA table_info(media_assets)")
+    assert "checksum" in [c[1] for c in cur.fetchall()]
 
-    # Verify alembic_version was stamped and upgraded
-    cur2.execute("SELECT version_num FROM alembic_version")
-    ver = cur2.fetchone()[0]
-    assert ver == "0002_media_security_and_cost_ledger"
-    conn2.close()
+    cur.execute("PRAGMA table_info(scenes)")
+    assert "budget_spent" in [c[1] for c in cur.fetchall()]
+
+    cur.execute("PRAGMA table_info(shots)")
+    cols = [c[1] for c in cur.fetchall()]
+    assert "flow_credits_spent" in cols
+    assert "generation_attempts" in cols
+
+    verify_conn.close()
+
+def test_3_partially_initialized_legacy_database_rejected(tmp_path):
+    """Test 3: Unversioned database with incomplete schema is rejected with IncompatibleLegacySchemaError."""
+    partial_db = tmp_path / "partial.db"
+    conn = sqlite3.connect(str(partial_db))
+    # Only create projects table, missing other 8 required tables
+    conn.execute("CREATE TABLE projects (id VARCHAR(36) PRIMARY KEY, name VARCHAR(128) NOT NULL)")
+    conn.commit()
+    conn.close()
+
+    db_url = f"sqlite:///{partial_db}"
+    engine = create_engine(db_url)
+
+    with pytest.raises(IncompatibleLegacySchemaError) as exc_info:
+        run_migrations(target_engine=engine, db_url=db_url)
+
+    assert "Cannot safely migrate legacy database" in str(exc_info.value)
+    assert "Missing required legacy tables" in str(exc_info.value)
+
+def test_4_unknown_schema_database_rejected(tmp_path):
+    """Test 4: Unversioned database with unknown tables is rejected with IncompatibleLegacySchemaError."""
+    unknown_db = tmp_path / "unknown.db"
+    conn = sqlite3.connect(str(unknown_db))
+    conn.execute("CREATE TABLE wp_posts (ID INTEGER PRIMARY KEY, post_title TEXT)")
+    conn.commit()
+    conn.close()
+
+    db_url = f"sqlite:///{unknown_db}"
+    engine = create_engine(db_url)
+
+    with pytest.raises(IncompatibleLegacySchemaError) as exc_info:
+        run_migrations(target_engine=engine, db_url=db_url)
+
+    assert "Missing required legacy tables" in str(exc_info.value)
+
+def test_5_existing_alembic_managed_database_upgrades(tmp_path):
+    """Test 5: Database already stamped by Alembic directly applies pending revisions without re-stamping."""
+    alembic_db = tmp_path / "alembic_managed.db"
+    create_full_legacy_schema(alembic_db)
+
+    # Stamp as 0001
+    conn = sqlite3.connect(str(alembic_db))
+    conn.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO alembic_version VALUES ('0001_initial_schema')")
+    conn.commit()
+    conn.close()
+
+    db_url = f"sqlite:///{alembic_db}"
+    engine = create_engine(db_url)
+    run_migrations(target_engine=engine, db_url=db_url)
+
+    # Verify upgraded to 0003
+    vconn = sqlite3.connect(str(alembic_db))
+    cur = vconn.cursor()
+    cur.execute("SELECT version_num FROM alembic_version")
+    assert cur.fetchone()[0] == "0003_jobs_and_scene_budget"
+    vconn.close()
 
 def test_database_backup_procedure(tmp_path):
     """Verifies that backup_database creates an exact, readable SQLite snapshot."""
     src_db = tmp_path / "source.db"
     backup_dir = tmp_path / "backups"
 
-    # Seed source DB
     conn = sqlite3.connect(str(src_db))
     conn.execute("CREATE TABLE test_data (id INTEGER PRIMARY KEY, msg TEXT)")
     conn.execute("INSERT INTO test_data (msg) VALUES ('critical film data')")
     conn.commit()
     conn.close()
 
-    # Perform backup
     backup_path = backup_database(db_path=src_db, backup_dir=backup_dir)
     assert backup_path.exists()
     assert backup_path.name.startswith("studio_backup_")
 
-    # Read from backup
     bk_conn = sqlite3.connect(str(backup_path))
     bk_cur = bk_conn.cursor()
     bk_cur.execute("SELECT msg FROM test_data WHERE id = 1")
@@ -192,5 +325,4 @@ def test_system_backup_endpoints():
 
 def test_configurable_demo_seeding():
     """Verifies that seed_initial_demo_if_empty respects the seed_demo_data setting."""
-    # When seed_demo_data is False and force is False, it returns immediately
     assert settings.seed_demo_data is False

@@ -95,6 +95,7 @@ class SceneUpdate(BaseModel):
 class SceneResponse(SceneBase):
     id: str
     project_id: str
+    budget_spent: Optional[float] = 0.0
     created_at: datetime
     shots_count: Optional[int] = 0
 
@@ -117,6 +118,8 @@ class ShotBase(BaseModel):
     generation_status: Optional[str] = "pending"
     video_asset_id: Optional[str] = None
     thumbnail_path: Optional[str] = ""
+    flow_credits_spent: Optional[float] = 0.0
+    generation_attempts: Optional[int] = 0
     order_index: Optional[int] = 0
 
 class ShotCreate(ShotBase):
@@ -270,3 +273,30 @@ class ExportJobResponse(BaseModel):
     download_url: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# Persistent Studio Job Lifecycle Schemas
+class StudioJobResponse(BaseModel):
+    id: str
+    project_id: str
+    job_type: str
+    idempotency_key: str
+    status: str
+    payload: Optional[str] = "{}"
+    result: Optional[str] = "{}"
+    error_message: Optional[str] = ""
+    retry_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# Explicit Flow Credit Accounting Schema
+class RecordFlowUsageRequest(BaseModel):
+    shot_id: str
+    flow_credits: float = 1.0
+    is_regeneration: bool = False
+    notes: Optional[str] = ""
+

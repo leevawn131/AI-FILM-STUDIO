@@ -10,6 +10,7 @@ from backend.app.models.entities import Project, AudioTrack
 from backend.app.schemas.entities import AudioTrackCreate, AudioTrackUpdate, AudioTrackResponse
 from backend.app.services.audio_service import audio_service
 from backend.app.services.ffmpeg_service import ffmpeg_service
+from backend.app.services.security import save_upload_file_securely, validate_safe_path, sanitize_filename
 
 router = APIRouter(prefix="/api/audio", tags=["audio"])
 
@@ -58,20 +59,38 @@ async def upload_audio_track(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    dest_dir = settings.projects_dir / project_id / "audio"
+    safe_pid = sanitize_filename(project_id)
+    dest_dir = validate_safe_path(settings.projects_dir / safe_pid / "audio", settings.projects_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = dest_dir / file.filename
 
-    with open(dest_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    max_bytes = settings.max_upload_size_mb * 1024 * 1024
+    saved_path, checksum, size_bytes = await save_upload_file_securely(
+        upload_file=file,
+        dest_dir=dest_dir,
+        allowed_extensions=settings.allowed_audio_extensions,
+        max_size_bytes=max_bytes,
+        prefix="audio",
+        expected_type="audio",
+        validate_content=True
+    )
 
-    meta = ffmpeg_service.inspect_media(dest_path)
-    rel_path = f"projects/{project_id}/audio/{dest_path.name}"
+    try:
+        meta = ffmpeg_service.inspect_media(saved_path)
+    except Exception as e:
+        if saved_path.exists():
+            try:
+                saved_path.unlink()
+            except OSError:
+                pass
+        raise HTTPException(status_code=400, detail=f"Invalid or unreadable audio media: {str(e)}")
+
+    rel_path = f"projects/{safe_pid}/audio/{saved_path.name}"
+    display_title = sanitize_filename(title or file.filename)
 
     track = AudioTrack(
         project_id=project_id,
         track_type=track_type,
-        title=title or file.filename,
+        title=display_title,
         file_path=rel_path,
         duration_seconds=meta["duration"],
         start_time_seconds=0.0,
@@ -225,9 +244,13 @@ def delete_audio_track(track_id: str, db: Session = Depends(get_db)):
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
 
-    real_file = settings.data_dir / track.file_path
-    if real_file.exists():
-        real_file.unlink()
+    if track.file_path:
+        try:
+            real_file = validate_safe_path(settings.data_dir / track.file_path, settings.data_dir)
+            if real_file.exists():
+                real_file.unlink()
+        except Exception:
+            pass
 
     db.delete(track)
     db.commit()

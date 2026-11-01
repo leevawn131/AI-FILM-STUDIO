@@ -1,3 +1,4 @@
+import json
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -7,6 +8,7 @@ from backend.app.models.entities import Project, Scene, Shot, MediaAsset
 from backend.app.agents.editor_agent import editor_agent
 from backend.app.services.timeline_editor import timeline_editor_service
 from backend.app.services.cost_controller import cost_controller
+from backend.app.services.job_manager import job_manager, sanitize_error_message
 
 router = APIRouter(prefix="/api/editor", tags=["editor"])
 
@@ -82,8 +84,35 @@ def run_ai_assembly_cut(project_id: str, db: Session = Depends(get_db)):
         for s in shots
     ]
 
-    assembly = editor_agent.create_assembly_cut(shots_data)
-    return assembly
+    job_payload = {"shot_ids": [s.id for s in shots]}
+    job, action = job_manager.prepare_or_claim_job(
+        db=db,
+        project_id=project_id,
+        job_type="editor_assembly_cut",
+        payload=job_payload
+    )
+
+    if action == "REUSE" and job.result:
+        try:
+            return json.loads(job.result)
+        except Exception:
+            pass
+
+    if action == "IN_PROGRESS":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Assembly cut job is already in progress (job_id: {job.id}). Please wait for completion."
+        )
+
+    try:
+        assembly = editor_agent.create_assembly_cut(shots_data)
+        job_manager.complete_job(db, job.id, assembly)
+        return assembly
+    except Exception as e:
+        job_manager.fail_job(db, job.id, e)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 @router.post("/reorder/{project_id}")
 def reorder_timeline_shots(project_id: str, req: ReorderRequest, db: Session = Depends(get_db)):

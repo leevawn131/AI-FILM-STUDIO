@@ -9,7 +9,8 @@ from backend.app.schemas.entities import (
     MediaAssetResponse,
     AudioTrackBase, AudioTrackCreate, AudioTrackUpdate, AudioTrackResponse,
     CostRecordResponse, BudgetSummary,
-    ExportJobCreate, ExportJobResponse
+    ExportJobCreate, ExportJobResponse,
+    StudioJobResponse, RecordFlowUsageRequest
 )
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "MediaAssetResponse",
     "AudioTrackBase", "AudioTrackCreate", "AudioTrackUpdate", "AudioTrackResponse",
     "CostRecordResponse", "BudgetSummary",
-    "ExportJobCreate", "ExportJobResponse"
+    "ExportJobCreate", "ExportJobResponse",
+    "StudioJobResponse", "RecordFlowUsageRequest"
 ]

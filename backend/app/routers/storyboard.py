@@ -1,3 +1,4 @@
+import json
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -9,6 +10,7 @@ from backend.app.agents.director_agent import director_agent
 from backend.app.agents.cinematographer_agent import cinematographer_agent
 from backend.app.agents.continuity_agent import continuity_agent
 from backend.app.services.cost_controller import cost_controller
+from backend.app.services.job_manager import job_manager, sanitize_error_message
 
 router = APIRouter(prefix="/api/storyboard", tags=["storyboard"])
 
@@ -103,59 +105,90 @@ def generate_shots_for_scene(scene_id: str, req: GenerateShotsRequest, db: Sessi
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Authorize & charge
-    cost_controller.authorize_and_charge(
+    job_payload = {"scene_id": scene.id, "count": req.shot_count}
+    job, action = job_manager.prepare_or_claim_job(
         db=db,
         project_id=project.id,
-        scene_id=scene.id,
-        action_type="storyboard_generation",
-        payload={"scene_id": scene.id, "count": req.shot_count},
-        details=f"Director Agent: {req.shot_count} shots breakdown for Scene {scene.scene_number}"
+        job_type="storyboard_generate",
+        payload=job_payload
     )
 
-    characters = db.query(Character).filter(Character.project_id == project.id).all()
-    char_list = [{"name": c.name, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics} for c in characters]
+    if action == "REUSE" and job.result:
+        try:
+            cached = json.loads(job.result)
+            cached_ids = cached.get("shot_ids", [])
+            existing_shots = db.query(Shot).filter(Shot.id.in_(cached_ids)).order_by(Shot.order_index).all()
+            if existing_shots and len(existing_shots) == len(cached_ids):
+                return existing_shots
+        except Exception:
+            pass
 
-    shots_data = director_agent.breakdown_scene_to_shots(
-        scene_slugline=scene.slugline,
-        scene_summary=scene.summary or scene.script_content[:200],
-        genre=project.genre,
-        characters=char_list,
-        visual_style=project.visual_style,
-        shot_count=req.shot_count or 4
-    )
-
-    created_shots = []
-    base_order = db.query(Shot).filter(Shot.scene_id == scene.id).count()
-
-    for idx, s in enumerate(shots_data):
-        shot_num = idx + 1
-        shot_code = f"SC{scene.scene_number:02d}_SH{shot_num:02d}"
-        shot = Shot(
-            scene_id=scene.id,
-            project_id=project.id,
-            shot_number=shot_num,
-            shot_code=shot_code,
-            duration_seconds=s.get("duration_seconds", 4.0),
-            camera_angle=s.get("camera_angle", "Eye Level"),
-            camera_movement=s.get("camera_movement", "Slow Dolly In"),
-            visual_description=s.get("visual_description", ""),
-            lighting=s.get("lighting", "Volumetric cinema lighting"),
-            character_references=str(s.get("character_references", "[]")),
-            video_prompt=s.get("video_prompt", ""),
-            negative_prompt=s.get("negative_prompt", "blurry, distorted, low quality"),
-            seed=s.get("seed"),
-            generation_status="ready_for_flow",
-            order_index=base_order + idx + 1
+    if action == "IN_PROGRESS":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Storyboard generation job is already in progress (job_id: {job.id}). Please wait for completion."
         )
-        db.add(shot)
-        created_shots.append(shot)
 
-    db.commit()
-    for s in created_shots:
-        db.refresh(s)
+    try:
+        # Authorize & charge
+        cost_controller.authorize_and_charge(
+            db=db,
+            project_id=project.id,
+            scene_id=scene.id,
+            action_type="storyboard_generation",
+            payload=job_payload,
+            details=f"Director Agent: {req.shot_count} shots breakdown for Scene {scene.scene_number}"
+        )
 
-    return created_shots
+        characters = db.query(Character).filter(Character.project_id == project.id).all()
+        char_list = [{"name": c.name, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics} for c in characters]
+
+        shots_data = director_agent.breakdown_scene_to_shots(
+            scene_slugline=scene.slugline,
+            scene_summary=scene.summary or scene.script_content[:200],
+            genre=project.genre,
+            characters=char_list,
+            visual_style=project.visual_style,
+            shot_count=req.shot_count or 4
+        )
+
+        created_shots = []
+        base_order = db.query(Shot).filter(Shot.scene_id == scene.id).count()
+
+        for idx, s in enumerate(shots_data):
+            shot_num = idx + 1
+            shot_code = f"SC{scene.scene_number:02d}_SH{shot_num:02d}"
+            shot = Shot(
+                scene_id=scene.id,
+                project_id=project.id,
+                shot_number=shot_num,
+                shot_code=shot_code,
+                duration_seconds=s.get("duration_seconds", 4.0),
+                camera_angle=s.get("camera_angle", "Eye Level"),
+                camera_movement=s.get("camera_movement", "Slow Dolly In"),
+                visual_description=s.get("visual_description", ""),
+                lighting=s.get("lighting", "Volumetric cinema lighting"),
+                character_references=str(s.get("character_references", "[]")),
+                video_prompt=s.get("video_prompt", ""),
+                negative_prompt=s.get("negative_prompt", "blurry, distorted, low quality"),
+                seed=s.get("seed"),
+                generation_status="ready_for_flow",
+                order_index=base_order + idx + 1
+            )
+            db.add(shot)
+            created_shots.append(shot)
+
+        db.commit()
+        for s in created_shots:
+            db.refresh(s)
+
+        job_manager.complete_job(db, job.id, {"shot_ids": [s.id for s in created_shots]})
+        return created_shots
+    except Exception as e:
+        job_manager.fail_job(db, job.id, e)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 @router.patch("/{shot_id}", response_model=ShotResponse)
 def update_shot(shot_id: str, data: ShotUpdate, db: Session = Depends(get_db)):
