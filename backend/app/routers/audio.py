@@ -159,9 +159,9 @@ def generate_cinematic_bgm(project_id: str, req: GenerateBgmRequest, db: Session
         db.refresh(track)
     except Exception:
         db.rollback()
-        if saved_path.exists():
+        if out_path.exists():
             try:
-                saved_path.unlink()
+                out_path.unlink()
             except OSError:
                 pass
         raise
@@ -213,9 +213,9 @@ def generate_voiceover(project_id: str, req: GenerateVoiceoverRequest, db: Sessi
         db.refresh(track)
     except Exception:
         db.rollback()
-        if saved_path.exists():
+        if out_path.exists():
             try:
-                saved_path.unlink()
+                out_path.unlink()
             except OSError:
                 pass
         raise

@@ -120,11 +120,20 @@ class UploadManager:
                 op.status = "FAILED"
                 op.error_message = f"Staged file missing at {temp_p} before finalization"
                 op.updated_at = datetime.now(timezone.utc)
+                self._revert_entity_reference(db, op)
                 db.commit()
                 raise FileNotFoundError(f"Staged file missing at {temp_p}")
 
             dest_p.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(temp_p), str(dest_p))
+            try:
+                shutil.move(str(temp_p), str(dest_p))
+            except Exception as move_err:
+                op.status = "FAILED"
+                op.error_message = f"Filesystem move failed: {move_err}"
+                op.updated_at = datetime.now(timezone.utc)
+                self._revert_entity_reference(db, op)
+                db.commit()
+                raise
 
         # Only delete old asset after destination is firmly in place on disk
         if old_p and old_p != dest_p and old_p.exists():
@@ -140,9 +149,11 @@ class UploadManager:
         db.refresh(op)
         return dest_p
 
-    def fail_upload(self, db: Session, op_id: str, error: Any) -> UploadOperation:
+    def fail_upload(self, db: Session, op_id: str, error: Any) -> Optional[UploadOperation]:
         """
-        Marks upload as FAILED and unlinks staged temp file. Preserves previous asset.
+        Marks upload as FAILED and unlinks staged temp file.
+        If the upload had reached DB_COMMITTED status, reverts the entity reference to old_asset_path.
+        Preserves previous asset file on disk.
         """
         op = db.query(UploadOperation).filter(UploadOperation.id == op_id).first()
         if not op:
@@ -150,7 +161,13 @@ class UploadManager:
 
         temp_p = Path(op.temp_path)
         if temp_p.exists():
-            temp_p.unlink(missing_ok=True)
+            try:
+                temp_p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if op.status == "DB_COMMITTED":
+            self._revert_entity_reference(db, op)
 
         op.status = "FAILED"
         op.error_message = str(error)[:512]
@@ -252,9 +269,12 @@ class UploadManager:
             old_p = Path(op.old_asset_path)
             if old_p.exists():
                 try:
-                    fallback_path = str(old_p.relative_to(settings.data_dir))
+                    fallback_path = str(old_p.relative_to(self.storage_root))
                 except ValueError:
-                    fallback_path = op.old_asset_path
+                    try:
+                        fallback_path = str(old_p.relative_to(settings.data_dir))
+                    except ValueError:
+                        fallback_path = op.old_asset_path
 
         if op.entity_type == "character_reference":
             char = db.query(Character).filter(Character.id == op.entity_id).first()

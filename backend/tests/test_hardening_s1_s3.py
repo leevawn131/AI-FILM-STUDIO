@@ -296,26 +296,26 @@ def test_task2_idempotent_flow_credit_recording_and_concurrency():
     # 4. Validations: credits <= 0, finite, <= 100.0, shot ownership
     res_zero = client.post(
         f"/api/flow-handoff/record-usage/{project_id}",
-        json={"shot_id": shot_id, "flow_credits": 0.0}
+        json={"shot_id": shot_id, "flow_credits": 0.0, "generation_attempt_id": str(uuid.uuid4())}
     )
     assert res_zero.status_code == 400
     assert "positive" in res_zero.json()["detail"].lower()
 
     res_negative = client.post(
         f"/api/flow-handoff/record-usage/{project_id}",
-        json={"shot_id": shot_id, "flow_credits": -5.0}
+        json={"shot_id": shot_id, "flow_credits": -5.0, "generation_attempt_id": str(uuid.uuid4())}
     )
     assert res_negative.status_code == 400
 
     res_huge = client.post(
         f"/api/flow-handoff/record-usage/{project_id}",
-        json={"shot_id": shot_id, "flow_credits": 999.0}
+        json={"shot_id": shot_id, "flow_credits": 999.0, "generation_attempt_id": str(uuid.uuid4())}
     )
     assert res_huge.status_code == 400
 
     res_bad_shot = client.post(
         f"/api/flow-handoff/record-usage/{project_id}",
-        json={"shot_id": "non-existent-shot-id", "flow_credits": 1.0}
+        json={"shot_id": "non-existent-shot-id", "flow_credits": 1.0, "generation_attempt_id": str(uuid.uuid4())}
     )
     assert res_bad_shot.status_code == 404
 

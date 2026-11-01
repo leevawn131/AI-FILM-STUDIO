@@ -1,6 +1,7 @@
+import uuid
 from typing import Optional, List, Dict
 from datetime import datetime
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # Character Schemas
 class CharacterBase(BaseModel):
@@ -283,6 +284,7 @@ class StudioJobResponse(BaseModel):
     idempotency_key: str
     status: str
     worker_id: Optional[str] = None
+    fencing_token: Optional[int] = 1
     lease_token: Optional[int] = 1
     payload: Optional[str] = "{}"
     result: Optional[str] = "{}"
@@ -319,6 +321,17 @@ class RecordFlowUsageRequest(BaseModel):
     shot_id: str
     flow_credits: float = 1.0
     is_regeneration: bool = False
-    generation_attempt_id: Optional[str] = None
+    generation_attempt_id: str
     notes: Optional[str] = ""
+
+    @field_validator("generation_attempt_id")
+    @classmethod
+    def validate_uuid_format(cls, v: str) -> str:
+        if not v or not isinstance(v, str):
+            raise ValueError("generation_attempt_id is mandatory and must be a valid UUID string.")
+        try:
+            val = uuid.UUID(v.strip())
+            return str(val)
+        except (ValueError, AttributeError):
+            raise ValueError("generation_attempt_id must be a valid UUID string.")
 

@@ -174,6 +174,10 @@ class AudioTrack(Base):
 
 class CostRecord(Base):
     __tablename__ = "cost_records"
+    __table_args__ = (
+        UniqueConstraint("operation_identity", name="uq_cost_records_operation_identity"),
+        UniqueConstraint("generation_attempt_id", name="uq_cost_records_gen_attempt"),
+    )
 
     id = Column(String(36), primary_key=True, default=gen_uuid)
     project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
@@ -239,6 +243,7 @@ class StudioJob(Base):
     idempotency_key = Column(String(64), nullable=False, index=True)
     status = Column(String(32), nullable=False, default="PENDING", index=True) # PENDING, RUNNING, COMPLETED, FAILED, CANCELLED
     worker_id = Column(String(64), nullable=True, index=True)
+    fencing_token = Column(Integer, nullable=False, default=1)
     lease_token = Column(Integer, nullable=False, default=1)
     lease_expires_at = Column(DateTime, nullable=True)
     payload = Column(Text, default="{}")

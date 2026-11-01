@@ -30,9 +30,10 @@ from backend.app.models.entities import StudioJob
 CURRENT_WORKER_ID = f"worker-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 DEFAULT_LEASE_SECONDS = 300  # 5 minutes
 
-class JobOwnershipLostError(Exception):
+class JobOwnershipLostError(HTTPException):
     """Raised when an operation attempts to renew, complete, or fail a job whose lease or token has expired or been reclaimed."""
-    pass
+    def __init__(self, detail: str = "Worker lease ownership lost or preempted by another worker."):
+        super().__init__(status_code=409, detail=detail)
 
 # Regex patterns for stripping sensitive tokens from error outputs
 SENSITIVE_PATTERNS = [
@@ -60,9 +61,11 @@ def sanitize_error_message(error: Any) -> str:
 
 def _is_lease_expired(lease_dt: Optional[datetime], now_dt: datetime) -> bool:
     if lease_dt is None:
-        return False
-    if lease_dt.tzinfo is None:
-        return lease_dt.replace(tzinfo=timezone.utc) < now_dt
+        return True
+    if lease_dt.tzinfo is not None:
+        lease_dt = lease_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    if now_dt.tzinfo is not None:
+        now_dt = now_dt.astimezone(timezone.utc).replace(tzinfo=None)
     return lease_dt < now_dt
 
 def compute_idempotency_key(project_id: str, job_type: str, payload: Any) -> str:
@@ -95,7 +98,7 @@ class JobManager:
         """
         key = compute_idempotency_key(project_id, job_type, payload)
         payload_str = json.dumps(payload, default=str) if payload else "{}"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         lease_expires = now + timedelta(seconds=lease_seconds)
 
         job = db.query(StudioJob).filter(
@@ -109,19 +112,36 @@ class JobManager:
                 return job, "REUSE"
             elif job.status in ("RUNNING", "PENDING"):
                 # Check if lease expired (dead worker recovery)
-                if job.lease_expires_at and _is_lease_expired(job.lease_expires_at, now):
-                    current_token = job.lease_token or 1
+                if job.lease_expires_at is None or _is_lease_expired(job.lease_expires_at, now):
+                    current_token = job.fencing_token or job.lease_token or 1
+                    # Conditional atomic UPDATE:
+                    # 1. Job must still be RUNNING or PENDING
+                    # 2. Lease must be expired (lease_expires_at < now or lease_expires_at is NULL)
+                    # 3. fencing_token must match current_token
                     stmt = (
                         update(StudioJob)
                         .where(StudioJob.id == job.id)
                         .where(StudioJob.status.in_(["RUNNING", "PENDING"]))
-                        .where(StudioJob.lease_token == current_token)
+                        .where(
+                            or_(
+                                StudioJob.lease_expires_at == None,
+                                StudioJob.lease_expires_at < now
+                            )
+                        )
+                        .where(
+                            or_(
+                                StudioJob.fencing_token == current_token,
+                                StudioJob.lease_token == current_token
+                            )
+                        )
                         .values(
                             worker_id=self.worker_id,
+                            fencing_token=current_token + 1,
                             lease_token=current_token + 1,
                             lease_expires_at=lease_expires,
                             updated_at=now
                         )
+                        .execution_options(synchronize_session=False)
                     )
                     res = db.execute(stmt)
                     db.commit()
@@ -131,22 +151,29 @@ class JobManager:
                 return job, "IN_PROGRESS"
             elif job.status in ("FAILED", "CANCELLED"):
                 # Atomic conditional retry transition without inserting a second row
-                current_token = job.lease_token or 1
+                current_token = job.fencing_token or job.lease_token or 1
                 stmt = (
                     update(StudioJob)
                     .where(StudioJob.id == job.id)
                     .where(StudioJob.status.in_(["FAILED", "CANCELLED"]))
-                    .where(StudioJob.lease_token == current_token)
+                    .where(
+                        or_(
+                            StudioJob.fencing_token == current_token,
+                            StudioJob.lease_token == current_token
+                        )
+                    )
                     .values(
                         status="RUNNING",
                         retry_count=StudioJob.retry_count + 1,
                         worker_id=self.worker_id,
+                        fencing_token=current_token + 1,
                         lease_token=current_token + 1,
                         lease_expires_at=lease_expires,
                         error_message="",
                         internal_error="",
                         updated_at=now
                     )
+                    .execution_options(synchronize_session=False)
                 )
                 res = db.execute(stmt)
                 db.commit()
@@ -166,6 +193,7 @@ class JobManager:
             idempotency_key=key,
             status="RUNNING",
             worker_id=self.worker_id,
+            fencing_token=1,
             lease_token=1,
             lease_expires_at=lease_expires,
             payload=payload_str,
@@ -203,17 +231,19 @@ class JobManager:
         db: Session,
         job_id: str,
         worker_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
         lease_token: Optional[int] = None,
         extend_seconds: int = DEFAULT_LEASE_SECONDS
     ) -> bool:
         """
         Heartbeat renewal during long-running tasks.
-        Extends lease_expires_at ONLY IF worker_id and lease_token match the current owner.
+        Extends lease_expires_at ONLY IF worker_id and fencing_token match the current owner.
         Returns True if renewed, False if ownership was lost.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         target_worker = worker_id or self.worker_id
         new_expires = now + timedelta(seconds=extend_seconds)
+        expected_token = fencing_token if fencing_token is not None else lease_token
 
         stmt = (
             update(StudioJob)
@@ -221,13 +251,18 @@ class JobManager:
             .where(StudioJob.status.in_(["RUNNING", "PENDING"]))
             .where(StudioJob.worker_id == target_worker)
         )
-        if lease_token is not None:
-            stmt = stmt.where(StudioJob.lease_token == lease_token)
+        if expected_token is not None:
+            stmt = stmt.where(
+                or_(
+                    StudioJob.fencing_token == expected_token,
+                    StudioJob.lease_token == expected_token
+                )
+            )
 
         stmt = stmt.values(
             lease_expires_at=new_expires,
             updated_at=now
-        )
+        ).execution_options(synchronize_session=False)
         res = db.execute(stmt)
         db.commit()
         return res.rowcount > 0
@@ -237,15 +272,32 @@ class JobManager:
         db: Session,
         job_id: str,
         worker_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
         lease_token: Optional[int] = None
     ) -> None:
         """
         Verifies that current worker still owns the lease.
-        Raises JobOwnershipLostError immediately if lease was lost.
+        Raises JobOwnershipLostError (HTTP 409) immediately if lease was lost.
         """
-        if not self.renew_lease(db, job_id, worker_id=worker_id, lease_token=lease_token):
+        target_worker = worker_id or self.worker_id
+        expected_token = fencing_token if fencing_token is not None else lease_token
+
+        job = db.query(StudioJob).filter(StudioJob.id == job_id).first()
+        if not job:
+            raise JobOwnershipLostError(f"Job '{job_id}' no longer exists.")
+
+        if job.status not in ("RUNNING", "PENDING"):
             raise JobOwnershipLostError(
-                f"Worker '{worker_id or self.worker_id}' lost lease on job '{job_id}'. Halting execution."
+                f"Job '{job_id}' is no longer active (status: {job.status}). Worker '{target_worker}' must abort."
+            )
+        if job.worker_id != target_worker:
+            raise JobOwnershipLostError(
+                f"Worker '{target_worker}' lost ownership of job '{job_id}' to worker '{job.worker_id}'."
+            )
+        current_token = job.fencing_token or job.lease_token
+        if expected_token is not None and current_token != expected_token:
+            raise JobOwnershipLostError(
+                f"Fencing token mismatch for job '{job_id}': expected {expected_token}, found {current_token}."
             )
 
     def complete_job(
@@ -254,16 +306,18 @@ class JobManager:
         job_id: str,
         result: Any,
         worker_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
         lease_token: Optional[int] = None
     ) -> StudioJob:
         """
         Marks a job as COMPLETED and stores its serialized output.
-        Enforces worker fencing: conditional SQL update checks worker_id and lease_token.
-        Raises JobOwnershipLostError if lease ownership was lost or superseded by a newer token.
+        Enforces worker fencing: conditional SQL update checks worker_id and fencing_token.
+        Raises JobOwnershipLostError (HTTP 409) if lease ownership was lost or superseded by a newer token.
         """
         target_worker = worker_id or self.worker_id
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         result_str = json.dumps(result, default=str) if result is not None else "{}"
+        expected_token = fencing_token if fencing_token is not None else lease_token
 
         stmt = (
             update(StudioJob)
@@ -271,15 +325,20 @@ class JobManager:
             .where(StudioJob.status == "RUNNING")
             .where(StudioJob.worker_id == target_worker)
         )
-        if lease_token is not None:
-            stmt = stmt.where(StudioJob.lease_token == lease_token)
+        if expected_token is not None:
+            stmt = stmt.where(
+                or_(
+                    StudioJob.fencing_token == expected_token,
+                    StudioJob.lease_token == expected_token
+                )
+            )
 
         stmt = stmt.values(
             status="COMPLETED",
             result=result_str,
             completed_at=now,
             updated_at=now
-        )
+        ).execution_options(synchronize_session=False)
         res = db.execute(stmt)
         db.commit()
 
@@ -287,10 +346,11 @@ class JobManager:
             current = db.query(StudioJob).filter(StudioJob.id == job_id).first()
             if not current:
                 raise ValueError(f"Job {job_id} not found")
+            token_val = current.fencing_token or current.lease_token
             raise JobOwnershipLostError(
-                f"Worker '{target_worker}' (token {lease_token}) cannot complete job '{job_id}': "
+                f"Worker '{target_worker}' (token {expected_token}) cannot complete job '{job_id}': "
                 f"ownership was lost or superseded. Current state: worker='{current.worker_id}', "
-                f"token={current.lease_token}, status='{current.status}'."
+                f"token={token_val}, status='{current.status}'."
             )
 
         job = db.query(StudioJob).filter(StudioJob.id == job_id).first()
@@ -303,17 +363,19 @@ class JobManager:
         error: Any,
         user_facing_error: Optional[str] = None,
         worker_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
         lease_token: Optional[int] = None
     ) -> StudioJob:
         """
         Marks a job as FAILED, storing safe user message while preserving internal diagnostics.
         Enforces worker fencing: only the active lease holder can fail the job.
-        Raises JobOwnershipLostError if lease ownership was lost or superseded by a newer token.
+        Raises JobOwnershipLostError (HTTP 409) if lease ownership was lost or superseded by a newer token.
         """
         target_worker = worker_id or self.worker_id
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         raw_internal = traceback.format_exc() if isinstance(error, Exception) else str(error)
         safe_msg = user_facing_error or sanitize_error_message(error)
+        expected_token = fencing_token if fencing_token is not None else lease_token
 
         stmt = (
             update(StudioJob)
@@ -321,15 +383,20 @@ class JobManager:
             .where(StudioJob.status == "RUNNING")
             .where(StudioJob.worker_id == target_worker)
         )
-        if lease_token is not None:
-            stmt = stmt.where(StudioJob.lease_token == lease_token)
+        if expected_token is not None:
+            stmt = stmt.where(
+                or_(
+                    StudioJob.fencing_token == expected_token,
+                    StudioJob.lease_token == expected_token
+                )
+            )
 
         stmt = stmt.values(
             status="FAILED",
             error_message=safe_msg,
             internal_error=raw_internal[:2048],
             updated_at=now
-        )
+        ).execution_options(synchronize_session=False)
         res = db.execute(stmt)
         db.commit()
 
@@ -337,10 +404,11 @@ class JobManager:
             current = db.query(StudioJob).filter(StudioJob.id == job_id).first()
             if not current:
                 raise ValueError(f"Job {job_id} not found")
+            token_val = current.fencing_token or current.lease_token
             raise JobOwnershipLostError(
-                f"Worker '{target_worker}' (token {lease_token}) cannot fail job '{job_id}': "
+                f"Worker '{target_worker}' (token {expected_token}) cannot fail job '{job_id}': "
                 f"ownership was lost or superseded. Current state: worker='{current.worker_id}', "
-                f"token={current.lease_token}, status='{current.status}'."
+                f"token={token_val}, status='{current.status}'."
             )
 
         job = db.query(StudioJob).filter(StudioJob.id == job_id).first()
@@ -357,7 +425,7 @@ class JobManager:
         - Jobs owned by this worker (from prior run), OR
         - Jobs with expired leases (dead workers).
         Active jobs with valid leases on other workers are preserved.
-        Increments lease_token to fence off any late zombie workers.
+        Increments fencing_token and lease_token to fence off any late zombie workers.
         """
         now = datetime.now(timezone.utc)
         target_worker = current_worker_id or self.worker_id
@@ -376,7 +444,9 @@ class JobManager:
         count = len(interrupted)
         for job in interrupted:
             job.status = "FAILED"
-            job.lease_token = (job.lease_token or 1) + 1  # Fence off zombie worker
+            new_token = (job.fencing_token or job.lease_token or 1) + 1
+            job.fencing_token = new_token
+            job.lease_token = new_token
             job.error_message = "Job execution was interrupted by server restart or worker lease expiration. Ready to retry."
             job.internal_error = "Server terminated or lease expired while job was in active state."
             job.updated_at = now

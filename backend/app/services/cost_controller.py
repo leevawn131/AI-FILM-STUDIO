@@ -170,116 +170,128 @@ class CostController:
         - Separates subscription Flow credits from currency costs.
         - Rolls back transactions completely on limit violation.
         """
-        with _budget_lock:
-            # 1. Determine provider and operation mapping
-            op_name = operation or action_type
-            op_meta = ACCOUNTING_OPERATIONS.get(op_name, {})
+        # 1. Determine provider and operation mapping
+        op_name = operation or action_type
+        op_meta = ACCOUNTING_OPERATIONS.get(op_name, {})
 
-            resolved_provider = provider or op_meta.get("provider", "offline_engine")
-            resolved_model = model or op_meta.get("default_model")
+        resolved_provider = provider or op_meta.get("provider", "offline_engine")
+        resolved_model = model or op_meta.get("default_model")
 
-            # 2. Composite deduplication check (Idempotency)
-            p_hash = CostController.compute_hash(payload) if payload else ""
+        # 2. Composite deduplication check (Database-enforced Idempotency)
+        p_hash = CostController.compute_hash(payload) if payload else ""
+        if payload and not allow_duplicate:
             op_id = CostController.compute_operation_identity(
                 project_id=project_id,
                 action_type=action_type,
                 provider=resolved_provider,
                 operation=op_name,
                 payload=payload
-            ) if payload else ""
+            )
+            # Fast-path query check
+            existing = db.query(CostRecord).filter(
+                CostRecord.operation_identity == op_id
+            ).first()
+            if existing:
+                return existing
+        else:
+            op_id = None
 
-            if payload and not allow_duplicate and op_id:
+        # Flow credits separation
+        resolved_flow_credits = flow_credits if flow_credits is not None else (
+            op_meta.get("default_flow_credits", 0.0) if op_meta.get("consumes_flow_credits") else 0.0
+        )
+
+        # Determine cost to deduct from monetary budget
+        if actual_cost is not None and actual_cost_known:
+            monetary_charge = max(0.0, float(actual_cost))
+        elif estimated_cost is not None:
+            monetary_charge = max(0.0, float(estimated_cost))
+        else:
+            monetary_charge = op_meta.get("default_estimated_cost", 0.0)
+
+        # 3. Database-Level Atomic Budget Enforcement
+        if monetary_charge > 0:
+            # Conditional atomic UPDATE on Project budget
+            stmt_proj = (
+                update(Project)
+                .where(Project.id == project_id)
+                .where((Project.budget_spent + monetary_charge) <= Project.budget_total)
+                .values(budget_spent=Project.budget_spent + monetary_charge)
+            )
+            res_proj = db.execute(stmt_proj)
+            if res_proj.rowcount == 0:
+                db.rollback()
+                proj = db.query(Project.id, Project.budget_spent, Project.budget_total).filter(Project.id == project_id).first()
+                if not proj:
+                    raise HTTPException(status_code=404, detail="Project not found")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Project budget limit reached! Spent: ${proj.budget_spent:.2f}, Limit: ${proj.budget_total:.2f}. Increase budget to continue."
+                )
+
+            # Conditional atomic UPDATE on Scene budget if scene_id is provided
+            if scene_id:
+                scene = db.query(Scene.id, Scene.budget_limit, Scene.budget_spent).filter(Scene.id == scene_id).first()
+                if scene and scene.budget_limit and scene.budget_limit > 0:
+                    stmt_scene = (
+                        update(Scene)
+                        .where(Scene.id == scene_id)
+                        .where((Scene.budget_spent + monetary_charge) <= Scene.budget_limit)
+                        .values(budget_spent=Scene.budget_spent + monetary_charge)
+                    )
+                    res_scene = db.execute(stmt_scene)
+                    if res_scene.rowcount == 0:
+                        db.rollback()
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Scene budget limit exceeded! (${scene.budget_spent:.2f} + ${monetary_charge:.3f} > limit ${scene.budget_limit:.2f})"
+                        )
+        else:
+            # Ensure project exists
+            exists = db.query(Project.id).filter(Project.id == project_id).first()
+            if not exists:
+                raise HTTPException(status_code=404, detail="Project not found")
+
+        # 4. Create ledger record in the same atomic transaction
+        record = CostRecord(
+            project_id=project_id,
+            scene_id=scene_id,
+            shot_id=shot_id,
+            provider=resolved_provider,
+            model=resolved_model,
+            operation=op_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            flow_credits=resolved_flow_credits,
+            actual_cost=actual_cost if actual_cost_known else None,
+            currency=currency,
+            estimated_cost=estimated_cost if estimated_cost is not None else monetary_charge,
+            actual_cost_known=actual_cost_known,
+            # Legacy compatibility fields
+            action_type=action_type,
+            credits_used=resolved_flow_credits if resolved_flow_credits > 0 else 1.0,
+            cost_usd=monetary_charge,
+            prompt_hash=p_hash,
+            operation_identity=op_id,
+            details=details or f"Provider: {resolved_provider} | Op: {op_name}"
+        )
+
+        db.add(record)
+        try:
+            db.commit()
+            db.refresh(record)
+            return record
+        except IntegrityError:
+            db.rollback()
+            # If concurrent race condition occurred with identical operation_identity,
+            # the speculative budget increment was cleanly rolled back. Return the committed winner.
+            if op_id:
                 existing = db.query(CostRecord).filter(
-                    CostRecord.project_id == project_id,
                     CostRecord.operation_identity == op_id
                 ).first()
                 if existing:
                     return existing
-
-            # Flow credits separation
-            resolved_flow_credits = flow_credits if flow_credits is not None else (
-                op_meta.get("default_flow_credits", 0.0) if op_meta.get("consumes_flow_credits") else 0.0
-            )
-
-            # Determine cost to deduct from monetary budget
-            if actual_cost is not None and actual_cost_known:
-                monetary_charge = max(0.0, float(actual_cost))
-            elif estimated_cost is not None:
-                monetary_charge = max(0.0, float(estimated_cost))
-            else:
-                monetary_charge = op_meta.get("default_estimated_cost", 0.0)
-
-            # 3. Database-Level Atomic Budget Enforcement
-            if monetary_charge > 0:
-                # Conditional atomic UPDATE on Project budget
-                stmt_proj = (
-                    update(Project)
-                    .where(Project.id == project_id)
-                    .where((Project.budget_spent + monetary_charge) <= Project.budget_total)
-                    .values(budget_spent=Project.budget_spent + monetary_charge)
-                )
-                res_proj = db.execute(stmt_proj)
-                if res_proj.rowcount == 0:
-                    db.rollback()
-                    proj = db.query(Project.id, Project.budget_spent, Project.budget_total).filter(Project.id == project_id).first()
-                    if not proj:
-                        raise HTTPException(status_code=404, detail="Project not found")
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Project budget limit reached! Spent: ${proj.budget_spent:.2f}, Limit: ${proj.budget_total:.2f}. Increase budget to continue."
-                    )
-
-                # Conditional atomic UPDATE on Scene budget if scene_id is provided
-                if scene_id:
-                    scene = db.query(Scene.id, Scene.budget_limit, Scene.budget_spent).filter(Scene.id == scene_id).first()
-                    if scene and scene.budget_limit and scene.budget_limit > 0:
-                        stmt_scene = (
-                            update(Scene)
-                            .where(Scene.id == scene_id)
-                            .where((Scene.budget_spent + monetary_charge) <= Scene.budget_limit)
-                            .values(budget_spent=Scene.budget_spent + monetary_charge)
-                        )
-                        res_scene = db.execute(stmt_scene)
-                        if res_scene.rowcount == 0:
-                            db.rollback()
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Scene budget limit exceeded! (${scene.budget_spent:.2f} + ${monetary_charge:.3f} > limit ${scene.budget_limit:.2f})"
-                            )
-            else:
-                # Ensure project exists
-                exists = db.query(Project.id).filter(Project.id == project_id).first()
-                if not exists:
-                    raise HTTPException(status_code=404, detail="Project not found")
-
-            # 4. Create ledger record in the same atomic transaction
-            record = CostRecord(
-                project_id=project_id,
-                scene_id=scene_id,
-                shot_id=shot_id,
-                provider=resolved_provider,
-                model=resolved_model,
-                operation=op_name,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                flow_credits=resolved_flow_credits,
-                actual_cost=actual_cost if actual_cost_known else None,
-                currency=currency,
-                estimated_cost=estimated_cost if estimated_cost is not None else monetary_charge,
-                actual_cost_known=actual_cost_known,
-                # Legacy compatibility fields
-                action_type=action_type,
-                credits_used=resolved_flow_credits if resolved_flow_credits > 0 else 1.0,
-                cost_usd=monetary_charge,
-                prompt_hash=p_hash,
-                operation_identity=op_id,
-                details=details or f"Provider: {resolved_provider} | Op: {op_name}"
-            )
-
-            db.add(record)
-            db.commit()
-            db.refresh(record)
-            return record
+            raise
 
     @staticmethod
     def record_flow_credit_usage(
@@ -293,24 +305,37 @@ class CostController:
     ) -> Tuple[CostRecord, Shot, bool]:
         """
         Explicitly records actual external Google Flow video generation credits idempotently.
+        - Validates generation_attempt_id is mandatory and a valid UUID. Never silently generates a random UUID.
         - Validates flow_credits > 0, finite, reasonable upper bound <= 100.0.
         - Validates shot belongs to project.
-        - If generation_attempt_id already recorded, returns existing ledger record without charging or incrementing.
+        - Same ID + identical payload returns existing ledger record without charging or incrementing.
+        - Same ID + different shot_id or flow_credits returns HTTP 409 conflict.
         - Updates shot.flow_credits_spent and increments shot.generation_attempts only for new attempts.
         - Returns (record, shot, is_new).
         """
+        if not generation_attempt_id:
+            raise HTTPException(
+                status_code=400,
+                detail="generation_attempt_id is mandatory for recording Google Flow usage"
+            )
+
+        try:
+            attempt_uuid = str(uuid.UUID(str(generation_attempt_id).strip()))
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=400,
+                detail="generation_attempt_id must be a valid UUID string"
+            )
+
         if not math.isfinite(flow_credits) or flow_credits <= 0.0 or flow_credits > 100.0:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid flow_credits '{flow_credits}': must be a finite positive number <= 100.0"
             )
 
-        attempt_id = generation_attempt_id or str(uuid.uuid4())
-
         # Check for idempotent duplicate by generation_attempt_id
         existing = db.query(CostRecord).filter(
-            CostRecord.project_id == project_id,
-            CostRecord.generation_attempt_id == attempt_id
+            CostRecord.generation_attempt_id == attempt_uuid
         ).first()
 
         shot = db.query(Shot).filter(Shot.id == shot_id, Shot.project_id == project_id).first()
@@ -321,6 +346,16 @@ class CostController:
             )
 
         if existing:
+            # Check payload consistency
+            if existing.shot_id != shot_id or not math.isclose(existing.flow_credits or 0.0, flow_credits, abs_tol=1e-5):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"generation_attempt_id '{attempt_uuid}' conflict: existing attempt recorded for "
+                        f"shot '{existing.shot_id}' with {existing.flow_credits} credits, but request specified "
+                        f"shot '{shot_id}' with {flow_credits} credits."
+                    )
+                )
             return existing, shot, False
 
         # Atomically increment shot attempts and credits
@@ -334,7 +369,7 @@ class CostController:
 
         p_hash = CostController.compute_hash({
             "shot_id": shot_id,
-            "attempt_id": attempt_id,
+            "attempt_id": attempt_uuid,
             "credits": flow_credits
         })
         op_id = CostController.compute_operation_identity(
@@ -342,7 +377,7 @@ class CostController:
             action_type="flow_video_generation",
             provider="google_flow",
             operation="flow_video_generation",
-            payload={"attempt_id": attempt_id}
+            payload={"attempt_id": attempt_uuid}
         )
 
         record = CostRecord(
@@ -364,7 +399,7 @@ class CostController:
             cost_usd=0.0,
             prompt_hash=p_hash,
             operation_identity=op_id,
-            generation_attempt_id=attempt_id,
+            generation_attempt_id=attempt_uuid,
             details=detail_msg
         )
         db.add(record)
@@ -377,10 +412,17 @@ class CostController:
             db.rollback()
             # Handle concurrent race condition with identical generation_attempt_id
             existing = db.query(CostRecord).filter(
-                CostRecord.project_id == project_id,
-                CostRecord.generation_attempt_id == attempt_id
+                CostRecord.generation_attempt_id == attempt_uuid
             ).first()
             if existing:
+                if existing.shot_id != shot_id or not math.isclose(existing.flow_credits or 0.0, flow_credits, abs_tol=1e-5):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"generation_attempt_id '{attempt_uuid}' conflict: concurrent attempt recorded with "
+                            f"different shot_id or credits."
+                        )
+                    )
                 db.refresh(shot)
                 return existing, shot, False
             raise
