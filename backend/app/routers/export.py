@@ -9,6 +9,7 @@ from backend.app.models.entities import Project, ExportJob
 from backend.app.schemas.entities import ExportJobCreate, ExportJobResponse
 from backend.app.services.export_manager import export_manager, PRESET_CONFIGS
 from backend.app.services.cost_controller import cost_controller
+from backend.app.services.security import validate_safe_path
 
 router = APIRouter(prefix="/api/export", tags=["export"])
 
@@ -102,7 +103,7 @@ def download_export_film(job_id: str, db: Session = Depends(get_db)):
     if not job or not job.output_path:
         raise HTTPException(status_code=404, detail="Export job or output file not found")
 
-    file_path = settings.data_dir / job.output_path
+    file_path = validate_safe_path(settings.data_dir / job.output_path, settings.data_dir)
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found on disk")
 

@@ -6,9 +6,12 @@ from fastapi.staticfiles import StaticFiles
 from backend.app.config import settings
 from backend.app.database import init_db, SessionLocal
 from backend.app.models.entities import Project, Character, Location, Scene, Shot
-from backend.app.routers import projects, dashboard, cost, screenplay, storyboard, characters, locations, flow_handoff, media, editor, audio, export
+from backend.app.routers import projects, dashboard, cost, screenplay, storyboard, characters, locations, flow_handoff, media, editor, audio, export, system
 
-def seed_initial_demo_if_empty():
+def seed_initial_demo_if_empty(force: bool = False):
+    if not settings.seed_demo_data and not force:
+        return
+
     db = SessionLocal()
     try:
         count = db.query(Project).count()
@@ -137,7 +140,7 @@ FADE TO BLACK.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize database tables and scaffold folders
+    # Initialize database tables via migrations and scaffold folders
     init_db()
     seed_initial_demo_if_empty()
     yield
@@ -148,10 +151,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS configuration
+# CORS configuration with explicit trusted origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -173,6 +176,7 @@ app.include_router(media.router)
 app.include_router(editor.router)
 app.include_router(audio.router)
 app.include_router(export.router)
+app.include_router(system.router)
 
 @app.get("/api/health")
 def health_check():

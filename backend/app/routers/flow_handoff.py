@@ -6,6 +6,7 @@ from backend.app.database import get_db
 from backend.app.config import settings
 from backend.app.models.entities import Project
 from backend.app.services.flow_handoff import flow_handoff_service
+from backend.app.services.security import validate_safe_path
 
 router = APIRouter(prefix="/api/flow-handoff", tags=["flow_handoff"])
 
@@ -47,7 +48,7 @@ def download_flow_package(project_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Project not found")
 
     pkg = flow_handoff_service.generate_package(db, project_id)
-    zip_path = Path(pkg["zip_path"])
+    zip_path = validate_safe_path(Path(pkg["zip_path"]), settings.data_dir)
     if not zip_path.exists():
         raise HTTPException(status_code=404, detail="Package zip not generated")
 

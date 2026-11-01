@@ -138,6 +138,7 @@ class MediaAsset(Base):
     codec = Column(String(64), default="h264")
     file_size_bytes = Column(Integer, default=0)
     thumbnail_path = Column(String(512), default="")
+    checksum = Column(String(64), nullable=True, index=True)
     auto_matched_shot_id = Column(String(36), nullable=True)
     is_validated = Column(Boolean, default=True)
     validation_notes = Column(Text, default="Validated via FFprobe")
@@ -172,7 +173,22 @@ class CostRecord(Base):
     id = Column(String(36), primary_key=True, default=gen_uuid)
     project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     scene_id = Column(String(36), nullable=True)
-    action_type = Column(String(64), nullable=False)
+    shot_id = Column(String(36), ForeignKey("shots.id", ondelete="SET NULL"), nullable=True)
+    
+    # Provider-aware usage ledger fields
+    provider = Column(String(64), nullable=False, default="offline_engine") # gemini, google_flow, offline_engine, local_ffmpeg
+    model = Column(String(64), nullable=True)
+    operation = Column(String(64), nullable=False, default="unknown") # screenplay_generation, video_generation, voiceover, etc.
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    flow_credits = Column(Float, default=0.0) # Flow subscription credits separate from currency cost
+    actual_cost = Column(Float, nullable=True) # None when unknown
+    currency = Column(String(8), default="USD")
+    estimated_cost = Column(Float, default=0.0)
+    actual_cost_known = Column(Boolean, default=False)
+    
+    # Legacy compatibility fields
+    action_type = Column(String(64), nullable=False, default="unknown")
     credits_used = Column(Float, default=1.0)
     cost_usd = Column(Float, default=0.0)
     prompt_hash = Column(String(64), default="") # for duplicate detection
@@ -180,6 +196,7 @@ class CostRecord(Base):
     created_at = Column(DateTime, default=utc_now)
 
     project = relationship("Project", back_populates="cost_records")
+    shot = relationship("Shot")
 
 
 class ExportJob(Base):

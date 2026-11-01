@@ -11,9 +11,12 @@ backend/data/*.db-journal
 backend/data/watched_import/*
 backend/data/projects/*
 backend/data/exports/*
+backend/data/backups/*
+backend/data/temp/*
 !backend/data/projects/.gitkeep
 !backend/data/watched_import/.gitkeep
 !backend/data/exports/.gitkeep
+!backend/data/backups/.gitkeep
 
 # Node
 frontend/node_modules/

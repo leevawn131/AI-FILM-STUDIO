@@ -10,6 +10,7 @@ from backend.app.models.entities import Project, MediaAsset, Shot
 from backend.app.schemas.entities import MediaAssetResponse
 from backend.app.services.media_watcher import media_watcher_service, VIDEO_EXTENSIONS
 from backend.app.services.ffmpeg_service import ffmpeg_service
+from backend.app.services.security import save_upload_file_securely, validate_safe_path, compute_file_sha256
 
 router = APIRouter(prefix="/api/media", tags=["media"])
 
@@ -34,6 +35,7 @@ def list_project_media(project_id: str, db: Session = Depends(get_db)):
             "codec": a.codec,
             "file_size_bytes": a.file_size_bytes,
             "thumbnail_path": a.thumbnail_path,
+            "checksum": a.checksum,
             "auto_matched_shot_id": a.auto_matched_shot_id,
             "is_validated": a.is_validated,
             "validation_notes": a.validation_notes,
@@ -48,20 +50,45 @@ async def upload_media_file(project_id: str, file: UploadFile = File(...), db: S
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    temp_path = settings.watched_dir / file.filename
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    max_bytes = settings.max_upload_size_mb * 1024 * 1024
+    temp_path, checksum, total_bytes = await save_upload_file_securely(
+        upload_file=file,
+        dest_dir=settings.temp_dir,
+        allowed_extensions=settings.allowed_video_extensions,
+        max_size_bytes=max_bytes,
+        prefix="upload",
+        expected_type="video",
+        validate_content=True
+    )
 
     try:
+        # Check duplicate import
+        existing = db.query(MediaAsset).filter(
+            MediaAsset.project_id == project_id,
+            MediaAsset.checksum == checksum
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Duplicate media asset detected: this file was already imported as '{existing.filename}'"
+            )
+
         asset = media_watcher_service.process_and_ingest_video(
             db=db,
             project_id=project_id,
             source_file_path=temp_path,
-            auto_link=True
+            auto_link=True,
+            checksum=checksum,
+            original_filename=file.filename
         )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     finally:
         if temp_path.exists():
-            temp_path.unlink()
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
     return {
         "id": asset.id,
@@ -76,6 +103,7 @@ async def upload_media_file(project_id: str, file: UploadFile = File(...), db: S
         "codec": asset.codec,
         "file_size_bytes": asset.file_size_bytes,
         "thumbnail_path": asset.thumbnail_path,
+        "checksum": asset.checksum,
         "auto_matched_shot_id": asset.auto_matched_shot_id,
         "is_validated": asset.is_validated,
         "validation_notes": asset.validation_notes,
@@ -135,13 +163,14 @@ def delete_media_asset(asset_id: str, db: Session = Depends(get_db)):
         s.video_asset_id = None
         s.generation_status = "pending"
 
-    # Delete physical files
-    real_file = settings.data_dir / asset.file_path
-    if real_file.exists():
-        real_file.unlink()
+    # Delete physical files safely within storage root
+    if asset.file_path:
+        real_file = validate_safe_path(settings.data_dir / asset.file_path, settings.data_dir)
+        if real_file.exists():
+            real_file.unlink()
 
     if asset.thumbnail_path:
-        real_thumb = settings.data_dir / asset.thumbnail_path
+        real_thumb = validate_safe_path(settings.data_dir / asset.thumbnail_path, settings.data_dir)
         if real_thumb.exists():
             real_thumb.unlink()
 
@@ -169,12 +198,33 @@ def generate_synthetic_test_clip(
     )
 
     # Ingest it immediately
-    asset = media_watcher_service.process_and_ingest_video(
-        db=db,
-        project_id=project_id,
-        source_file_path=test_file,
-        auto_link=True
-    )
+    try:
+        asset = media_watcher_service.process_and_ingest_video(
+            db=db,
+            project_id=project_id,
+            source_file_path=test_file,
+            auto_link=True
+        )
+    except ValueError as e:
+        if "Duplicate media asset" in str(e):
+            checksum = compute_file_sha256(test_file)
+            asset = db.query(MediaAsset).filter(
+                MediaAsset.project_id == project_id,
+                MediaAsset.checksum == checksum
+            ).first()
+            if not asset:
+                raise HTTPException(status_code=400, detail=str(e))
+            # Ensure shot is linked if not already
+            shots = db.query(Shot).filter(Shot.project_id == project_id).all()
+            matched = media_watcher_service.match_shot_code(shot_code, shots)
+            if matched:
+                asset.auto_matched_shot_id = matched.id
+                matched.video_asset_id = asset.id
+                matched.generation_status = "imported"
+                matched.thumbnail_path = asset.thumbnail_path
+                db.commit()
+        else:
+            raise HTTPException(status_code=400, detail=str(e))
 
     if test_file.exists():
         test_file.unlink()

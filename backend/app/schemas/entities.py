@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -164,6 +164,7 @@ class MediaAssetResponse(BaseModel):
     codec: str
     file_size_bytes: int
     thumbnail_path: Optional[str] = ""
+    checksum: Optional[str] = None
     auto_matched_shot_id: Optional[str] = None
     is_validated: bool
     validation_notes: Optional[str] = ""
@@ -210,6 +211,17 @@ class CostRecordResponse(BaseModel):
     id: str
     project_id: str
     scene_id: Optional[str] = None
+    shot_id: Optional[str] = None
+    provider: Optional[str] = "offline_engine"
+    model: Optional[str] = None
+    operation: Optional[str] = "unknown"
+    input_tokens: Optional[int] = 0
+    output_tokens: Optional[int] = 0
+    flow_credits: Optional[float] = 0.0
+    actual_cost: Optional[float] = None
+    currency: Optional[str] = "USD"
+    estimated_cost: Optional[float] = 0.0
+    actual_cost_known: Optional[bool] = False
     action_type: str
     credits_used: float
     cost_usd: float
@@ -226,7 +238,9 @@ class BudgetSummary(BaseModel):
     budget_remaining: float
     percent_used: float
     total_actions: int
+    total_flow_credits: Optional[float] = 0.0
     records: List[CostRecordResponse]
+    provider_breakdown: Optional[Dict[str, int]] = None
 
 
 # Export Job Schemas

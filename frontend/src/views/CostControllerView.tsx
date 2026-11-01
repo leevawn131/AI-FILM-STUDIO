@@ -167,70 +167,117 @@ export const CostControllerView: React.FC<CostControllerViewProps> = ({
         </div>
       </div>
 
-      {/* Transparent Rate Card */}
+      {/* Provider-Aware Architecture Breakdown */}
       <div className="p-6 rounded-xl bg-studio-900 border border-studio-800 space-y-4">
-        <h3 className="text-sm font-bold text-white uppercase tracking-wider">Local Rate & Credit Structure</h3>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-center">
-            <span className="text-[10px] text-slate-400 block">Screenplay Scene</span>
-            <span className="text-xs font-bold text-white font-mono">1.0 Credit</span>
-            <span className="text-[10px] text-emerald-400 font-mono block">$0.005</span>
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-bold text-white uppercase tracking-wider">Provider & Architecture Cost Engine</h3>
+          <span className="text-[10px] text-slate-400 font-mono">No vendor pricing assumptions • Transparent accounting</span>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-left space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-bold text-cinema-amber uppercase">Google Flow</span>
+              <span className="text-[10px] bg-studio-800 text-slate-300 px-1.5 py-0.5 rounded font-mono">Credits</span>
+            </div>
+            <span className="text-xs font-bold text-white block">Flow Handoff Package</span>
+            <span className="text-[10px] text-slate-400 block">Uses subscription credits. Direct API expense: $0.00</span>
           </div>
-          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-center">
-            <span className="text-[10px] text-slate-400 block">Storyboard (4 shots)</span>
-            <span className="text-xs font-bold text-white font-mono">2.0 Credits</span>
-            <span className="text-[10px] text-emerald-400 font-mono block">$0.010</span>
+
+          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-left space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-bold text-blue-400 uppercase">Google Gemini</span>
+              <span className="text-[10px] bg-studio-800 text-slate-300 px-1.5 py-0.5 rounded font-mono">Tokens</span>
+            </div>
+            <span className="text-xs font-bold text-white block">Screenplay & Storyboard</span>
+            <span className="text-[10px] text-slate-400 block">Tracks prompt & completion tokens. Distinguishes est. vs actual</span>
           </div>
-          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-center">
-            <span className="text-[10px] text-slate-400 block">Flow Prompt Pack</span>
-            <span className="text-xs font-bold text-white font-mono">1.0 Credit</span>
-            <span className="text-[10px] text-emerald-400 font-mono block">$0.002</span>
+
+          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-left space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-bold text-emerald-400 uppercase">Local FFmpeg</span>
+              <span className="text-[10px] bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded font-mono">Local Host</span>
+            </div>
+            <span className="text-xs font-bold text-white block">Editing & Concatenation</span>
+            <span className="text-[10px] text-slate-400 block">Zero cloud charges ($0.00). Unlimited local processing</span>
           </div>
-          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-center">
-            <span className="text-[10px] text-slate-400 block">Continuity Check</span>
-            <span className="text-xs font-bold text-white font-mono">0.5 Credit</span>
-            <span className="text-[10px] text-emerald-400 font-mono block">$0.001</span>
-          </div>
-          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-center">
-            <span className="text-[10px] text-slate-400 block">FFmpeg Edit Cut</span>
-            <span className="text-xs font-bold text-white font-mono">3.0 Credits</span>
-            <span className="text-[10px] text-emerald-400 font-mono block">$0.020</span>
-          </div>
-          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-center">
-            <span className="text-[10px] text-slate-400 block">Audio Synthesis</span>
-            <span className="text-xs font-bold text-white font-mono">1.5 Credits</span>
-            <span className="text-[10px] text-emerald-400 font-mono block">$0.015</span>
+
+          <div className="p-3 bg-studio-950 rounded-lg border border-studio-800 text-left space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-bold text-purple-400 uppercase">Offline Engine</span>
+              <span className="text-[10px] bg-purple-500/10 text-purple-400 px-1.5 py-0.5 rounded font-mono">On-Device</span>
+            </div>
+            <span className="text-xs font-bold text-white block">Audio & Synthesis</span>
+            <span className="text-[10px] text-slate-400 block">No recurring API fees. Fallback synthesis is 100% free</span>
           </div>
         </div>
       </div>
 
       {/* Transaction Ledger Table */}
       <div className="p-6 rounded-xl bg-studio-900 border border-studio-800 space-y-4">
-        <h3 className="text-sm font-bold text-white uppercase tracking-wider">Transaction & Action Ledger</h3>
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-bold text-white uppercase tracking-wider">Provider-Aware Usage Ledger</h3>
+          {summary?.total_flow_credits !== undefined && (
+            <span className="text-xs font-mono text-cinema-gold">
+              Total Flow Credits Used: <strong>{summary.total_flow_credits}</strong>
+            </span>
+          )}
+        </div>
         {summary && summary.records.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="bg-studio-950 text-slate-400 uppercase font-mono text-[10px] border-b border-studio-800">
                 <tr>
                   <th className="py-2.5 px-3">Timestamp</th>
-                  <th className="py-2.5 px-3">Action Type</th>
-                  <th className="py-2.5 px-3">Credits</th>
-                  <th className="py-2.5 px-3">Cost ($ USD)</th>
+                  <th className="py-2.5 px-3">Provider</th>
+                  <th className="py-2.5 px-3">Operation</th>
+                  <th className="py-2.5 px-3">Flow Credits</th>
+                  <th className="py-2.5 px-3">Cost Accounting</th>
+                  <th className="py-2.5 px-3">Tokens</th>
                   <th className="py-2.5 px-3">Details</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-studio-800">
-                {summary.records.map((r) => (
-                  <tr key={r.id} className="hover:bg-studio-850/50">
-                    <td className="py-2.5 px-3 font-mono text-slate-400">
-                      {new Date(r.created_at).toLocaleTimeString()}
-                    </td>
-                    <td className="py-2.5 px-3 font-semibold text-white">{r.action_type}</td>
-                    <td className="py-2.5 px-3 font-mono text-cinema-gold">{r.credits_used}</td>
-                    <td className="py-2.5 px-3 font-mono text-emerald-400">${r.cost_usd.toFixed(3)}</td>
-                    <td className="py-2.5 px-3 text-slate-300 font-mono text-[11px] truncate max-w-xs">{r.details}</td>
-                  </tr>
-                ))}
+                {summary.records.map((r) => {
+                  const prov = r.provider || 'offline_engine';
+                  const provColor =
+                    prov === 'gemini'
+                      ? 'text-blue-400 bg-blue-500/10 border-blue-500/30'
+                      : prov === 'google_flow'
+                      ? 'text-cinema-amber bg-cinema-amber/10 border-cinema-amber/30'
+                      : prov === 'local_ffmpeg'
+                      ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30'
+                      : 'text-purple-400 bg-purple-500/10 border-purple-500/30';
+
+                  const costDisplay = r.actual_cost_known && r.actual_cost !== null
+                    ? `$${Number(r.actual_cost).toFixed(3)} (Actual)`
+                    : r.cost_usd > 0
+                    ? `$${Number(r.cost_usd).toFixed(3)} (Est.)`
+                    : 'Free / Local';
+
+                  const tokenCount = (r.input_tokens || 0) + (r.output_tokens || 0);
+
+                  return (
+                    <tr key={r.id} className="hover:bg-studio-850/50">
+                      <td className="py-2.5 px-3 font-mono text-slate-400">
+                        {new Date(r.created_at).toLocaleTimeString()}
+                      </td>
+                      <td className="py-2.5 px-3">
+                        <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-mono border ${provColor}`}>
+                          {prov.toUpperCase()}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 font-semibold text-white">{r.operation || r.action_type}</td>
+                      <td className="py-2.5 px-3 font-mono text-cinema-gold">
+                        {(r.flow_credits || 0) > 0 ? `${r.flow_credits} Cr` : '-'}
+                      </td>
+                      <td className="py-2.5 px-3 font-mono text-emerald-400">{costDisplay}</td>
+                      <td className="py-2.5 px-3 font-mono text-slate-400">
+                        {tokenCount > 0 ? `${tokenCount.toLocaleString()} tkn` : '-'}
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-300 font-mono text-[11px] truncate max-w-xs">{r.details}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

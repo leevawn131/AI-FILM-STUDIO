@@ -9,6 +9,7 @@ from backend.app.models.entities import Project, Scene, Shot, MediaAsset, CostRe
 from backend.app.schemas.project import (
     ProjectCreate, ProjectUpdate, ProjectResponse, DashboardStats
 )
+from backend.app.services.security import validate_safe_path, sanitize_filename
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -149,8 +150,9 @@ def delete_project(project_id: str, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Delete local project folder
-    project_dir = settings.projects_dir / project_id
+    # Delete local project folder safely
+    safe_pid = sanitize_filename(project_id)
+    project_dir = validate_safe_path(settings.projects_dir / safe_pid, settings.projects_dir)
     if project_dir.exists():
         shutil.rmtree(project_dir, ignore_errors=True)
 

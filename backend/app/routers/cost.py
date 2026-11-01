@@ -23,6 +23,12 @@ def get_budget_summary(project_id: str, db: Session = Depends(get_db)):
     remaining = max(0.0, total - spent)
     pct = round((spent / total * 100), 1) if total > 0 else 0.0
 
+    total_flow_credits = sum([r.flow_credits or 0.0 for r in records])
+    provider_counts = {}
+    for r in records:
+        prov = r.provider or "offline_engine"
+        provider_counts[prov] = provider_counts.get(prov, 0) + 1
+
     return {
         "project_id": project_id,
         "budget_total": round(total, 2),
@@ -30,16 +36,18 @@ def get_budget_summary(project_id: str, db: Session = Depends(get_db)):
         "budget_remaining": round(remaining, 3),
         "percent_used": pct,
         "total_actions": len(records),
-        "records": records
+        "total_flow_credits": round(total_flow_credits, 2),
+        "records": records,
+        "provider_breakdown": provider_counts
     }
 
 @router.get("/rates")
 def get_cost_rates():
-    """Returns the cost table and credit structure."""
+    """Returns the accounting rates and credit ledger structure."""
     return {
         "rates": COST_RATES,
         "currency": "USD",
-        "description": "Transparent local studio credit and budget estimation table."
+        "description": "Provider-aware accounting ledger. Distinguishes Flow subscription credits from API expenses and unknown costs."
     }
 
 @router.post("/top-up/{project_id}")

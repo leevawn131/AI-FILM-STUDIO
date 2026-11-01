@@ -99,6 +99,7 @@ export interface MediaAsset {
   codec: string;
   file_size_bytes: number;
   thumbnail_path: string;
+  checksum?: string | null;
   auto_matched_shot_id: string | null;
   is_validated: boolean;
   validation_notes: string;
@@ -225,6 +226,28 @@ export interface DashboardStats {
   }>;
 }
 
+export interface CostRecordItem {
+  id: string;
+  project_id?: string;
+  scene_id?: string | null;
+  shot_id?: string | null;
+  provider?: string;
+  model?: string | null;
+  operation?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  flow_credits?: number;
+  actual_cost?: number | null;
+  currency?: string;
+  estimated_cost?: number;
+  actual_cost_known?: boolean;
+  action_type: string;
+  credits_used: number;
+  cost_usd: number;
+  details: string;
+  created_at: string;
+}
+
 export interface BudgetSummary {
   project_id: string;
   budget_total: number;
@@ -232,14 +255,9 @@ export interface BudgetSummary {
   budget_remaining: number;
   percent_used: number;
   total_actions: number;
-  records: Array<{
-    id: string;
-    action_type: string;
-    credits_used: number;
-    cost_usd: number;
-    details: string;
-    created_at: string;
-  }>;
+  total_flow_credits?: number;
+  provider_breakdown?: Record<string, number>;
+  records: CostRecordItem[];
 }
 
 const API_BASE = '/api';

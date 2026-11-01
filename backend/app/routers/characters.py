@@ -9,6 +9,7 @@ from backend.app.config import settings
 from backend.app.models.entities import Project, Character
 from backend.app.schemas.entities import CharacterCreate, CharacterUpdate, CharacterResponse
 from backend.app.agents.character_agent import character_designer_agent
+from backend.app.services.security import save_upload_file_securely, validate_safe_path, sanitize_filename
 
 router = APIRouter(prefix="/api/characters", tags=["characters"])
 
@@ -112,17 +113,31 @@ async def upload_character_ref(character_id: str, file: UploadFile = File(...), 
     if not char:
         raise HTTPException(status_code=404, detail="Character not found")
 
-    dest_dir = settings.projects_dir / char.project_id / "references"
+    safe_pid = sanitize_filename(char.project_id)
+    dest_dir = validate_safe_path(settings.projects_dir / safe_pid / "references", settings.projects_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    
-    file_ext = Path(file.filename or "ref.jpg").suffix or ".jpg"
-    dest_path = dest_dir / f"char_{char.id}{file_ext}"
 
-    with open(dest_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    max_bytes = settings.max_image_upload_size_mb * 1024 * 1024
+    saved_path, checksum, size_bytes = await save_upload_file_securely(
+        upload_file=file,
+        dest_dir=dest_dir,
+        allowed_extensions=settings.allowed_image_extensions,
+        max_size_bytes=max_bytes,
+        prefix=f"char_{char.id[:8]}",
+        expected_type="image",
+        validate_content=True
+    )
 
-    # Store relative path for frontend /media access
-    rel_path = f"projects/{char.project_id}/references/char_{char.id}{file_ext}"
+    # Remove old reference file if present
+    if char.reference_image_path:
+        try:
+            old_path = validate_safe_path(settings.data_dir / char.reference_image_path, settings.data_dir)
+            if old_path.exists() and old_path != saved_path:
+                old_path.unlink()
+        except Exception:
+            pass
+
+    rel_path = f"projects/{safe_pid}/references/{saved_path.name}"
     char.reference_image_path = rel_path
     db.commit()
 

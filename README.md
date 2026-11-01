@@ -72,11 +72,38 @@ Designed to automate the entire cinematic filmmaking workflow—from scriptwriti
 - **Location Database**: Set manager specifying atmosphere, weather, time-of-day, and lighting profiles.
 - **Storyboard Generator**: Shot cards with camera angles, movements, durations, and Google Flow prompts with 1-click clipboard copy.
 - **Flow Handoff Generator**: Exportable prompt sheets, character packets, and downloadable ZIP archives.
-- **Media Import Manager**: Ingestion monitor with FFprobe validation, auto-matching to shots, and local test clip synthesizer.
+- **Media Import Manager**: Ingestion monitor with FFprobe validation, SHA-256 duplicate detection, auto-matching to shots, and local test clip synthesizer.
 - **Audio Manager**: Multi-track mixer with procedural atmospheric synth BGM synthesis, scratch radio-comm voiceover generation, and automatic sidechain ducking (-14 LUFS target).
 - **Automatic Film Editor**: Multi-track timeline (Video, Dialogue/Subtitles, BGM), clip inspector, transport scrubber, and FFmpeg preview compilation.
 - **Export Center**: Master export console with presets (1080p Cinema Master, 4K Master, 9:16 Mobile, 720p Fast), progress tracking, and MP4 downloads.
-- **Cost Controller**: Transparent credit ledger, per-scene budget limiter, and SHA-256 duplicate job cache.
+- **Cost Controller & Usage Ledger**: Provider-aware accounting ledger distinguishing Google Flow subscription credits, Gemini token metrics, and local free FFmpeg processing, with budget caps and idempotent caching.
+- **Database & System Manager**: Alembic schema migrations, atomic SQLite online backups (`/api/system/backup`), and configurable demo data seeding.
+
+---
+
+## 🛡️ Production Hardening & System Stability
+
+### 1. Database Integrity (Sprint S1)
+- **Alembic Schema Migrations**: Migration versioning (`backend/alembic/versions`) with SQLite batch alteration (`render_as_batch=True`).
+- **Zero Data Loss Upgrades**: Programmatic migration runner (`run_migrations`) automatically detects unversioned legacy databases, stamps revision `0001_initial_schema`, and upgrades to head without dropping tables or losing project data.
+- **Configurable Demo Seeding**: `SEED_DEMO_DATA` defaults to `false` in production. Demo data is never injected unexpectedly into production databases and can be manually seeded on demand (`POST /api/system/seed-demo`).
+- **Atomic Online Backups**: SQLite online backup API (`backup_database`) creates consistent database snapshots in `backend/data/backups/studio_backup_<timestamp>.db` without database locks or write interruption (`POST /api/system/backup`).
+
+### 2. Storage & Media Security (Sprint S2)
+- **Path Traversal Protection**: All file path access, downloads, uploads, and deletions pass through strict boundary validation (`validate_safe_path`) asserting paths are strictly within the storage root (`settings.data_dir`).
+- **Filename Sanitization & Unique IDs**: Untrusted upload filenames are sanitized against path separators and special characters, and stored using collision-resistant unique tokens (`generate_secure_filename`).
+- **Media Header & Magic Byte Validation**: Protects against extension spoofing by inspecting binary magic signatures (PNG, JPEG, WebP, MP4/QuickTime, Matroska/WebM, MP3, WAV, OGG) combined with FFprobe stream inspection.
+- **Configurable File Size Limits**: Streaming uploads enforce maximum size limits (`MAX_UPLOAD_SIZE_MB`, `MAX_IMAGE_UPLOAD_SIZE_MB`) in 64KB chunks, terminating with HTTP 413 if exceeded.
+- **SHA-256 Checksums & Duplicate Import Prevention**: Checksums are computed during streaming and indexed in `media_assets.checksum`. Duplicate video uploads or imports into the same project are blocked with HTTP 409.
+- **Atomic Writes & Safe Failure Cleanup**: Uploads are written to `.tmp` files in `backend/data/temp` and atomically moved upon validation; any validation or extraction failure cleans up temporary files immediately.
+
+### 3. Provider-Aware Cost Accounting (Sprint S3)
+- **Separation of Credits vs Currency**: Google Flow subscription credits (`flow_credits`) are recorded independently from monetary currency costs (`actual_cost`, `estimated_cost`, `currency`).
+- **Transparent Ledger**: Replaces fake constant vendor price lists with honest ledger entries (`provider`, `model`, `operation`, `input_tokens`, `output_tokens`, `actual_cost_known`).
+- **Support for Unknown Costs**: When exact vendor pricing is unknown, `actual_cost=None` and `actual_cost_known=False`.
+- **Budget Limit Enforcement**: Enforces project-level (`budget_total`) and per-scene (`budget_limit`) caps atomically.
+- **Idempotency & Concurrency Safety**: Cryptographic SHA-256 payload hashing ensures identical workflow requests are returned from the ledger without duplicate deductions. Thread re-entrant locking (`threading.RLock`) prevents race conditions under concurrent requests.
+- **CORS Hardening**: Unrestricted wildcard CORS is replaced with explicit trusted origin whitelisting (`CORS_ORIGINS`).
 
 ---
 
