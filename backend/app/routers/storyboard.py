@@ -130,16 +130,6 @@ def generate_shots_for_scene(scene_id: str, req: GenerateShotsRequest, db: Sessi
         )
 
     try:
-        # Authorize & charge
-        cost_controller.authorize_and_charge(
-            db=db,
-            project_id=project.id,
-            scene_id=scene.id,
-            action_type="storyboard_generation",
-            payload=job_payload,
-            details=f"Director Agent: {req.shot_count} shots breakdown for Scene {scene.scene_number}"
-        )
-
         characters = db.query(Character).filter(Character.project_id == project.id).all()
         char_list = [{"name": c.name, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics} for c in characters]
 
@@ -150,6 +140,29 @@ def generate_shots_for_scene(scene_id: str, req: GenerateShotsRequest, db: Sessi
             characters=char_list,
             visual_style=project.visual_style,
             shot_count=req.shot_count or 4
+        )
+
+        # Extract genuine usage metadata (Gemini token counts or offline engine attribution)
+        first_shot_meta = (shots_data[0].get("_generation_metadata") if (shots_data and isinstance(shots_data[0], dict)) else None) or {}
+        provider = first_shot_meta.get("provider", "offline_engine")
+        model = first_shot_meta.get("model", "offline-heuristic-v1")
+        input_tokens = first_shot_meta.get("input_tokens", 0)
+        output_tokens = first_shot_meta.get("output_tokens", 0)
+        engine_label = "Google Gemini" if provider == "gemini" else "Offline Studio Engine"
+        cost_details = f"{engine_label} Director: {req.shot_count} shots breakdown for Scene {scene.scene_number}"
+
+        # Authorize & charge with duplicate detection and accurate provider/model attribution
+        cost_controller.authorize_and_charge(
+            db=db,
+            project_id=project.id,
+            scene_id=scene.id,
+            action_type="storyboard_generation",
+            provider=provider,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            payload=job_payload,
+            details=cost_details
         )
 
         created_shots = []

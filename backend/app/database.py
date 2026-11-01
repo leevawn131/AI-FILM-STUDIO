@@ -115,6 +115,26 @@ def backup_database(db_path: Optional[Path] = None, backup_dir: Optional[Path] =
 
     return backup_file
 
+def verify_database_integrity(db_path: Path) -> bool:
+    """
+    Verifies that an SQLite file exists and passes PRAGMA integrity_check.
+    Returns True if healthy, False otherwise.
+    """
+    p = Path(db_path)
+    if not p.exists() or p.stat().st_size == 0:
+        return False
+    try:
+        conn = sqlite3.connect(str(p))
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA integrity_check")
+            res = cur.fetchone()
+            return bool(res and res[0] == "ok")
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
 def validate_legacy_schema(inspector) -> Tuple[bool, str]:
     """
     Validates whether an unversioned database matches the exact legacy baseline schema (0001).
@@ -137,6 +157,26 @@ def validate_legacy_schema(inspector) -> Tuple[bool, str]:
         missing_cols = expected_cols - actual_cols
         if missing_cols:
             return False, f"Table '{table_name}' is missing expected legacy columns: {sorted(list(missing_cols))}"
+
+    # Verify primary keys on all tables
+    for table_name in REQUIRED_LEGACY_SCHEMA.keys():
+        pk = inspector.get_pk_constraint(table_name)
+        pk_cols = pk.get("constrained_columns", []) if pk else []
+        if not pk_cols or "id" not in pk_cols:
+            return False, f"Table '{table_name}' is missing expected primary key constraint on 'id'"
+
+    # Verify relevant foreign keys on child tables
+    child_tables = ["characters", "locations", "scenes", "media_assets", "shots", "audio_tracks", "cost_records", "export_jobs"]
+    for table_name in child_tables:
+        fks = inspector.get_foreign_keys(table_name)
+        has_proj_fk = any(fk.get("referred_table") == "projects" and "project_id" in fk.get("constrained_columns", []) for fk in fks)
+        if not has_proj_fk:
+            return False, f"Table '{table_name}' is missing required foreign key constraint referencing 'projects.id'"
+
+    shot_fks = inspector.get_foreign_keys("shots")
+    has_scene_fk = any(fk.get("referred_table") == "scenes" and "scene_id" in fk.get("constrained_columns", []) for fk in shot_fks)
+    if not has_scene_fk:
+        return False, "Table 'shots' is missing required foreign key constraint referencing 'scenes.id'"
 
     return True, "valid_legacy"
 
@@ -194,9 +234,27 @@ def run_migrations(target_engine=None, db_url: Optional[str] = None) -> None:
             # Create an automatic pre-migration backup before modifying any legacy database
             if db_file_path and db_file_path.exists():
                 try:
-                    backup_database(db_path=db_file_path)
+                    backup_file = backup_database(db_path=db_file_path)
+                    if not backup_file.exists() or backup_file.stat().st_size == 0:
+                        raise MigrationError(f"Pre-migration backup file is missing or empty at {backup_file}")
+                    
+                    # Validate that the backup file can be reopened and queried before continuing
+                    bk_conn = sqlite3.connect(str(backup_file))
+                    try:
+                        cur = bk_conn.cursor()
+                        cur.execute("PRAGMA integrity_check")
+                        res = cur.fetchone()
+                        if not res or res[0] != "ok":
+                            raise MigrationError(f"Backup verification failed: integrity check returned {res}")
+                        cur.execute("SELECT count(*) FROM sqlite_master")
+                    finally:
+                        bk_conn.close()
                 except Exception as b_err:
-                    logger.warning(f"Pre-migration backup warning: {b_err}")
+                    if isinstance(b_err, MigrationError):
+                        raise
+                    raise MigrationError(
+                        f"Pre-migration backup failed: {b_err}. Migration aborted to protect legacy data."
+                    ) from b_err
 
             # Stamping valid legacy database to 0001_initial_schema
             with active_engine.connect() as stamp_conn:

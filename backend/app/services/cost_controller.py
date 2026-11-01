@@ -11,12 +11,15 @@ Implements:
 - Explicit tracking of external Google Flow video generations and regenerations
 """
 
+import math
+import uuid
 import json
 import hashlib
 import threading
 from typing import Optional, Any, Dict, Tuple
 from sqlalchemy import update, or_
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException
 from backend.app.config import settings
 from backend.app.models.entities import Project, Scene, Shot, CostRecord
@@ -97,14 +100,45 @@ class CostController:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def check_and_deduplicate(db: Session, project_id: str, action_type: str, payload: Any) -> Optional[CostRecord]:
-        """Checks if an identical job was already recorded to prevent duplicate expenditure."""
+    def compute_operation_identity(
+        project_id: str,
+        action_type: str,
+        provider: str,
+        operation: str,
+        payload: Any
+    ) -> str:
+        """
+        Builds a unique composite operation identity from:
+        project_id + action_type + provider + operation + payload hash.
+        Ensures two distinct operations with identical payloads do not share the same CostRecord.
+        """
         p_hash = CostController.compute_hash(payload)
-        if not p_hash:
-            return None
+        raw = f"{project_id}:{action_type}:{provider}:{operation}:{p_hash}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def check_and_deduplicate(
+        db: Session,
+        project_id: str,
+        action_type: str,
+        payload: Any,
+        provider: Optional[str] = None,
+        operation: Optional[str] = None
+    ) -> Optional[CostRecord]:
+        """Checks if an identical operation was already recorded to prevent duplicate expenditure."""
+        op_name = operation or action_type
+        op_meta = ACCOUNTING_OPERATIONS.get(op_name, {})
+        resolved_provider = provider or op_meta.get("provider", "offline_engine")
+        op_id = CostController.compute_operation_identity(
+            project_id=project_id,
+            action_type=action_type,
+            provider=resolved_provider,
+            operation=op_name,
+            payload=payload
+        )
         return db.query(CostRecord).filter(
             CostRecord.project_id == project_id,
-            CostRecord.prompt_hash == p_hash
+            CostRecord.operation_identity == op_id
         ).first()
 
     @staticmethod
@@ -131,27 +165,36 @@ class CostController:
         """
         Database-level atomic budget enforcement and provider-aware ledger recording.
         - Uses conditional atomic SQL UPDATE to enforce project and scene budget limits.
-        - Checks duplicate hash; returns existing record idempotently without charging again.
+        - Composite operation identity deduplication prevents distinct operations with identical payloads from colliding.
+        - Checks duplicate operation identity; returns existing record idempotently without charging again.
         - Separates subscription Flow credits from currency costs.
         - Rolls back transactions completely on limit violation.
         """
         with _budget_lock:
-            # 1. Deduplication check (Idempotency)
-            p_hash = CostController.compute_hash(payload) if payload else ""
-            if payload and not allow_duplicate and p_hash:
-                existing = db.query(CostRecord).filter(
-                    CostRecord.project_id == project_id,
-                    CostRecord.prompt_hash == p_hash
-                ).first()
-                if existing:
-                    return existing
-
-            # 2. Determine provider and operation mapping
+            # 1. Determine provider and operation mapping
             op_name = operation or action_type
             op_meta = ACCOUNTING_OPERATIONS.get(op_name, {})
 
             resolved_provider = provider or op_meta.get("provider", "offline_engine")
             resolved_model = model or op_meta.get("default_model")
+
+            # 2. Composite deduplication check (Idempotency)
+            p_hash = CostController.compute_hash(payload) if payload else ""
+            op_id = CostController.compute_operation_identity(
+                project_id=project_id,
+                action_type=action_type,
+                provider=resolved_provider,
+                operation=op_name,
+                payload=payload
+            ) if payload else ""
+
+            if payload and not allow_duplicate and op_id:
+                existing = db.query(CostRecord).filter(
+                    CostRecord.project_id == project_id,
+                    CostRecord.operation_identity == op_id
+                ).first()
+                if existing:
+                    return existing
 
             # Flow credits separation
             resolved_flow_credits = flow_credits if flow_credits is not None else (
@@ -229,6 +272,7 @@ class CostController:
                 credits_used=resolved_flow_credits if resolved_flow_credits > 0 else 1.0,
                 cost_usd=monetary_charge,
                 prompt_hash=p_hash,
+                operation_identity=op_id,
                 details=details or f"Provider: {resolved_provider} | Op: {op_name}"
             )
 
@@ -244,58 +288,102 @@ class CostController:
         shot_id: str,
         flow_credits: float = 1.0,
         is_regeneration: bool = False,
+        generation_attempt_id: Optional[str] = None,
         notes: str = ""
-    ) -> Tuple[CostRecord, Shot]:
+    ) -> Tuple[CostRecord, Shot, bool]:
         """
-        Explicitly records actual external Google Flow video generation credits.
-        - Updates shot.flow_credits_spent
-        - Increments shot.generation_attempts
-        - Creates a confirmed ledger entry (actual_cost_known=True)
+        Explicitly records actual external Google Flow video generation credits idempotently.
+        - Validates flow_credits > 0, finite, reasonable upper bound <= 100.0.
+        - Validates shot belongs to project.
+        - If generation_attempt_id already recorded, returns existing ledger record without charging or incrementing.
+        - Updates shot.flow_credits_spent and increments shot.generation_attempts only for new attempts.
+        - Returns (record, shot, is_new).
         """
-        with _budget_lock:
-            shot = db.query(Shot).filter(Shot.id == shot_id, Shot.project_id == project_id).first()
-            if not shot:
-                raise HTTPException(status_code=404, detail="Shot not found")
-
-            shot.flow_credits_spent = (shot.flow_credits_spent or 0.0) + flow_credits
-            shot.generation_attempts = (shot.generation_attempts or 0) + 1
-
-            attempt_label = f"Regeneration #{shot.generation_attempts}" if is_regeneration else f"Generation #{shot.generation_attempts}"
-            detail_msg = f"Flow Video: {shot.shot_code} ({attempt_label})"
-            if notes:
-                detail_msg += f" - {notes}"
-
-            p_hash = CostController.compute_hash({
-                "shot_id": shot_id,
-                "attempt": shot.generation_attempts,
-                "credits": flow_credits
-            })
-
-            record = CostRecord(
-                project_id=project_id,
-                scene_id=shot.scene_id,
-                shot_id=shot.id,
-                provider="google_flow",
-                model="google-flow-v1",
-                operation="flow_video_generation",
-                input_tokens=0,
-                output_tokens=0,
-                flow_credits=flow_credits,
-                actual_cost=None,
-                currency="USD",
-                estimated_cost=0.0,
-                actual_cost_known=True,
-                action_type="flow_video_generation",
-                credits_used=flow_credits,
-                cost_usd=0.0,
-                prompt_hash=p_hash,
-                details=detail_msg
+        if not math.isfinite(flow_credits) or flow_credits <= 0.0 or flow_credits > 100.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid flow_credits '{flow_credits}': must be a finite positive number <= 100.0"
             )
-            db.add(record)
+
+        attempt_id = generation_attempt_id or str(uuid.uuid4())
+
+        # Check for idempotent duplicate by generation_attempt_id
+        existing = db.query(CostRecord).filter(
+            CostRecord.project_id == project_id,
+            CostRecord.generation_attempt_id == attempt_id
+        ).first()
+
+        shot = db.query(Shot).filter(Shot.id == shot_id, Shot.project_id == project_id).first()
+        if not shot:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Shot {shot_id} not found or does not belong to project {project_id}"
+            )
+
+        if existing:
+            return existing, shot, False
+
+        # Atomically increment shot attempts and credits
+        shot.flow_credits_spent = (shot.flow_credits_spent or 0.0) + flow_credits
+        shot.generation_attempts = (shot.generation_attempts or 0) + 1
+
+        attempt_label = f"Regeneration #{shot.generation_attempts}" if is_regeneration else f"Generation #{shot.generation_attempts}"
+        detail_msg = f"Flow Video: {shot.shot_code} ({attempt_label})"
+        if notes:
+            detail_msg += f" - {notes}"
+
+        p_hash = CostController.compute_hash({
+            "shot_id": shot_id,
+            "attempt_id": attempt_id,
+            "credits": flow_credits
+        })
+        op_id = CostController.compute_operation_identity(
+            project_id=project_id,
+            action_type="flow_video_generation",
+            provider="google_flow",
+            operation="flow_video_generation",
+            payload={"attempt_id": attempt_id}
+        )
+
+        record = CostRecord(
+            project_id=project_id,
+            scene_id=shot.scene_id,
+            shot_id=shot.id,
+            provider="google_flow",
+            model="google-flow-v1",
+            operation="flow_video_generation",
+            input_tokens=0,
+            output_tokens=0,
+            flow_credits=flow_credits,
+            actual_cost=None,
+            currency="USD",
+            estimated_cost=0.0,
+            actual_cost_known=True,
+            action_type="flow_video_generation",
+            credits_used=flow_credits,
+            cost_usd=0.0,
+            prompt_hash=p_hash,
+            operation_identity=op_id,
+            generation_attempt_id=attempt_id,
+            details=detail_msg
+        )
+        db.add(record)
+        try:
             db.commit()
             db.refresh(record)
             db.refresh(shot)
-            return record, shot
+            return record, shot, True
+        except IntegrityError:
+            db.rollback()
+            # Handle concurrent race condition with identical generation_attempt_id
+            existing = db.query(CostRecord).filter(
+                CostRecord.project_id == project_id,
+                CostRecord.generation_attempt_id == attempt_id
+            ).first()
+            if existing:
+                db.refresh(shot)
+                return existing, shot, False
+            raise
 
     @staticmethod
     def get_project_usage_summary(db: Session, project_id: str) -> Dict[str, Any]:

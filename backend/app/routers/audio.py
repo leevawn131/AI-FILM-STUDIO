@@ -99,8 +99,17 @@ async def upload_audio_track(
         ducking_level=0.3
     )
     db.add(track)
-    db.commit()
-    db.refresh(track)
+    try:
+        db.commit()
+        db.refresh(track)
+    except Exception:
+        db.rollback()
+        if saved_path.exists():
+            try:
+                saved_path.unlink()
+            except OSError:
+                pass
+        raise
 
     return {
         "id": track.id,
@@ -145,8 +154,17 @@ def generate_cinematic_bgm(project_id: str, req: GenerateBgmRequest, db: Session
         ducking_level=0.25
     )
     db.add(track)
-    db.commit()
-    db.refresh(track)
+    try:
+        db.commit()
+        db.refresh(track)
+    except Exception:
+        db.rollback()
+        if saved_path.exists():
+            try:
+                saved_path.unlink()
+            except OSError:
+                pass
+        raise
 
     return {
         "id": track.id,
@@ -190,8 +208,17 @@ def generate_voiceover(project_id: str, req: GenerateVoiceoverRequest, db: Sessi
         ducking_enabled=False
     )
     db.add(track)
-    db.commit()
-    db.refresh(track)
+    try:
+        db.commit()
+        db.refresh(track)
+    except Exception:
+        db.rollback()
+        if saved_path.exists():
+            try:
+                saved_path.unlink()
+            except OSError:
+                pass
+        raise
 
     return {
         "id": track.id,

@@ -1,5 +1,6 @@
 import io
 import pytest
+from PIL import Image
 from fastapi.testclient import TestClient
 from backend.app.main import app
 
@@ -32,11 +33,13 @@ def test_characters_and_locations_workflow():
     assert new_char["project_id"] == project_id
     new_char_id = new_char["id"]
 
-    # 3. Upload reference image mock (with valid JPEG header for security verification)
-    fake_img = io.BytesIO(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00test_mock_jpeg_bytes")
+    # 3. Upload reference image mock (with valid JPEG for security verification)
+    img_buf = io.BytesIO()
+    Image.new("RGB", (64, 64), color="green").save(img_buf, format="JPEG")
+    valid_img = io.BytesIO(img_buf.getvalue())
     upload_res = client.post(
         f"/api/characters/{new_char_id}/upload-ref",
-        files={"file": ("test_ref.jpg", fake_img, "image/jpeg")}
+        files={"file": ("test_ref.jpg", valid_img, "image/jpeg")}
     )
     assert upload_res.status_code == 200
     assert "reference_url" in upload_res.json()

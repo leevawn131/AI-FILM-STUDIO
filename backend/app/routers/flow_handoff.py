@@ -65,26 +65,30 @@ def record_actual_flow_usage(project_id: str, data: RecordFlowUsageRequest, db: 
     """
     Explicitly records actual Google Flow credits spent on video generation or regeneration for a shot.
     Does NOT invent prices or conflate estimated package prep with actual platform video generation.
+    Idempotent by generation_attempt_id.
     """
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    record, shot = cost_controller.record_flow_credit_usage(
+    record, shot, is_new = cost_controller.record_flow_credit_usage(
         db=db,
         project_id=project_id,
         shot_id=data.shot_id,
         flow_credits=data.flow_credits,
         is_regeneration=data.is_regeneration,
+        generation_attempt_id=data.generation_attempt_id,
         notes=data.notes
     )
 
     return {
-        "status": "success",
+        "status": "success" if is_new else "idempotent_duplicate",
         "shot_id": shot.id,
         "shot_code": shot.shot_code,
-        "flow_credits_charged": data.flow_credits,
+        "flow_credits_charged": data.flow_credits if is_new else 0.0,
         "total_shot_flow_credits": shot.flow_credits_spent,
         "generation_attempts": shot.generation_attempts,
+        "generation_attempt_id": record.generation_attempt_id,
+        "is_regeneration": data.is_regeneration,
         "ledger_record_id": record.id
     }

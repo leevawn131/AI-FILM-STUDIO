@@ -1,3 +1,4 @@
+import json
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
@@ -144,15 +145,6 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
         )
 
     try:
-        # Authorize & charge with duplicate detection
-        cost_controller.authorize_and_charge(
-            db=db,
-            project_id=data.project_id,
-            action_type="script_generation",
-            payload=job_payload,
-            details=f"AI Screenwriter: {data.prompt[:50] if data.prompt else 'Dramatic sequence'}"
-        )
-
         last_scene = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
         next_num = (last_scene.scene_number + 1) if last_scene else 1
         next_order = (last_scene.order_index + 1) if last_scene else 1
@@ -182,6 +174,28 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
             prompt=data.prompt,
             characters=characters_data,
             location=loc_data
+        )
+
+        # Extract genuine usage metadata (Gemini token counts or offline engine attribution)
+        gen_meta = (generated.get("_generation_metadata") if isinstance(generated, dict) else None) or {}
+        provider = gen_meta.get("provider", "offline_engine")
+        model = gen_meta.get("model", "offline-heuristic-v1")
+        input_tokens = gen_meta.get("input_tokens", 0)
+        output_tokens = gen_meta.get("output_tokens", 0)
+        engine_label = "Google Gemini" if provider == "gemini" else "Offline Studio Engine"
+        cost_details = f"{engine_label} Screenwriter: {data.prompt[:50] if data.prompt else 'Dramatic sequence'}"
+
+        # Authorize & charge with duplicate detection and accurate provider/model attribution
+        cost_controller.authorize_and_charge(
+            db=db,
+            project_id=data.project_id,
+            action_type="script_generation",
+            provider=provider,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            payload=job_payload,
+            details=cost_details
         )
 
         scene = Scene(

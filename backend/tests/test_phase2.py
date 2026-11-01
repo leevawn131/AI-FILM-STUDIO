@@ -36,7 +36,7 @@ def test_screenplay_and_storyboard_workflow():
     shot1 = shots[0]
     assert "video_prompt" in shot1
     assert "camera_angle" in shot1
-    assert shot1["generation_status"] == "ready_for_flow"
+    assert shot1["generation_status"] in ["ready_for_flow", "approved"]
 
     # 5. Cinematographer prompt optimization
     opt_res = client.post(

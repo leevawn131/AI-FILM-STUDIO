@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import threading
 from pathlib import Path
+from PIL import Image
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -33,7 +34,7 @@ from backend.app.database import (
     REQUIRED_LEGACY_SCHEMA,
     IncompatibleLegacySchemaError
 )
-from backend.app.models.entities import Project, Scene, Shot, Character, Location, StudioJob, CostRecord
+from backend.app.models.entities import Project, Scene, Shot, Character, Location, StudioJob, CostRecord, MediaAsset
 from backend.app.services.job_manager import job_manager, sanitize_error_message
 from backend.app.services.cost_controller import cost_controller
 from backend.app.services.security import (
@@ -70,29 +71,43 @@ def test_1_fresh_database_startup_without_demo_data(tmp_path):
         engine.dispose()
 
 
+from backend.tests.test_database_integrity import create_full_legacy_schema
+
 def test_2_legacy_database_migration_with_existing_film_data(tmp_path):
     """Scenario 2: Legacy database migration with existing film data preserves data and creates backup."""
     legacy_file = tmp_path / "legacy_production.db"
-    conn = sqlite3.connect(legacy_file)
+    create_full_legacy_schema(legacy_file)
+
+    # Seed realistic legacy film data across all entities
+    conn = sqlite3.connect(str(legacy_file))
     cur = conn.cursor()
-
-    # Create full 9 legacy tables
-    for table_name, cols in REQUIRED_LEGACY_SCHEMA.items():
-        col_defs = ", ".join([f'"{c}" TEXT' for c in cols])
-        cur.execute(f'CREATE TABLE "{table_name}" ({col_defs})')
-
-    # Seed legacy film data
     cur.execute(
-        'INSERT INTO "projects" (id, name, budget_total, budget_spent) VALUES (?, ?, ?, ?)',
+        "INSERT INTO projects (id, name, budget_total, budget_spent) VALUES (?, ?, ?, ?)",
         ("proj-legacy-1", "Legacy Feature Film", 200.0, 15.0)
     )
     cur.execute(
-        'INSERT INTO "scenes" (id, project_id, scene_number, title) VALUES (?, ?, ?, ?)',
-        ("scene-legacy-1", "proj-legacy-1", 1, "Opening Dawn Sequence")
+        "INSERT INTO characters (id, project_id, name, role) VALUES (?, ?, ?, ?)",
+        ("char-legacy-1", "proj-legacy-1", "Commander Vance", "Protagonist")
     )
     cur.execute(
-        'INSERT INTO "shots" (id, scene_id, project_id, shot_number, shot_code) VALUES (?, ?, ?, ?, ?)',
+        "INSERT INTO locations (id, project_id, name, time_of_day) VALUES (?, ?, ?, ?)",
+        ("loc-legacy-1", "proj-legacy-1", "Deep Space Station", "Midnight")
+    )
+    cur.execute(
+        "INSERT INTO scenes (id, project_id, scene_number, slugline, title) VALUES (?, ?, ?, ?, ?)",
+        ("scene-legacy-1", "proj-legacy-1", 1, "INT. DOCK - NIGHT", "Opening Dawn Sequence")
+    )
+    cur.execute(
+        "INSERT INTO shots (id, scene_id, project_id, shot_number, shot_code) VALUES (?, ?, ?, ?, ?)",
         ("shot-legacy-1", "scene-legacy-1", "proj-legacy-1", 1, "SC01_SH01")
+    )
+    cur.execute(
+        "INSERT INTO media_assets (id, project_id, filename, file_path) VALUES (?, ?, ?, ?)",
+        ("media-legacy-1", "proj-legacy-1", "legacy_clip.mp4", "projects/proj-legacy-1/imported_videos/clip.mp4")
+    )
+    cur.execute(
+        "INSERT INTO cost_records (id, project_id, action_type, cost_usd) VALUES (?, ?, ?, ?)",
+        ("cost-legacy-1", "proj-legacy-1", "script_generation", 2.50)
     )
     conn.commit()
     conn.close()
@@ -111,8 +126,14 @@ def test_2_legacy_database_migration_with_existing_film_data(tmp_path):
         p = session.query(Project).filter(Project.id == "proj-legacy-1").first()
         assert p is not None
         assert p.name == "Legacy Feature Film"
-        assert float(p.budget_total) == 200.0
-        assert float(p.budget_spent) == 15.0
+        assert p.budget_total == 200.0
+        assert p.budget_spent == 15.0
+
+        c = session.query(Character).filter(Character.id == "char-legacy-1").first()
+        assert c is not None and c.name == "Commander Vance"
+
+        loc = session.query(Location).filter(Location.id == "loc-legacy-1").first()
+        assert loc is not None and loc.name == "Deep Space Station"
 
         sc = session.query(Scene).filter(Scene.id == "scene-legacy-1").first()
         assert sc is not None
@@ -124,6 +145,12 @@ def test_2_legacy_database_migration_with_existing_film_data(tmp_path):
         assert sh.shot_code == "SC01_SH01"
         assert sh.flow_credits_spent == 0.0 # New column
         assert sh.generation_attempts == 0 # New column
+
+        ma = session.query(MediaAsset).filter(MediaAsset.id == "media-legacy-1").first()
+        assert ma is not None and ma.filename == "legacy_clip.mp4"
+
+        cr = session.query(CostRecord).filter(CostRecord.id == "cost-legacy-1").first()
+        assert cr is not None and cr.action_type == "script_generation"
     finally:
         session.close()
         engine.dispose()
@@ -406,7 +433,9 @@ def test_9_audio_and_image_upload_validation(tmp_path):
     assert "Invalid file header" in res_spoof.json()["detail"]
 
     # 2. Attempt uploading valid JPEG
-    valid_jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00valid_jpeg_sample"
+    img_buf = io.BytesIO()
+    Image.new("RGB", (64, 64), color="blue").save(img_buf, format="JPEG")
+    valid_jpeg_bytes = img_buf.getvalue()
     res_valid = client.post(
         f"/api/characters/{char_id}/upload-ref",
         files={"file": ("valid.jpg", io.BytesIO(valid_jpeg_bytes), "image/jpeg")}

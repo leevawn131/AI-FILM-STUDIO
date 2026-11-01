@@ -298,5 +298,6 @@ class RecordFlowUsageRequest(BaseModel):
     shot_id: str
     flow_credits: float = 1.0
     is_regeneration: bool = False
+    generation_attempt_id: Optional[str] = None
     notes: Optional[str] = ""
 

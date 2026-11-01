@@ -7,7 +7,15 @@ import subprocess
 from pathlib import Path
 from typing import Sequence, Optional, Tuple, Dict, Any
 from fastapi import UploadFile, HTTPException
+from PIL import Image, UnidentifiedImageError
+from PIL.Image import DecompressionBombError
+
 from backend.app.config import settings
+
+# Enforce decompression bomb limits
+MAX_IMAGE_DIMENSION = 8192
+MAX_IMAGE_PIXELS = 50_000_000
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 # Whitelist safe characters for filenames: alphanumeric, dot, hyphen, underscore
 SAFE_FILENAME_REGEX = re.compile(r"[^a-zA-Z0-9_.-]")
@@ -206,6 +214,108 @@ def probe_media_file(file_path: Path) -> Dict[str, Any]:
     except Exception as e:
         return {"valid": False, "error": str(e)}
 
+def validate_image_content(
+    file_path: Path,
+    expected_extension: Optional[str] = None,
+    max_dimension: int = MAX_IMAGE_DIMENSION,
+    max_pixels: int = MAX_IMAGE_PIXELS
+) -> Tuple[int, int, str]:
+    """
+    Validates actual image content using Pillow:
+    - Verifies image integrity and decodability (detects truncated or corrupt images)
+    - Validates format matches expected extension (e.g. rejects PNG renamed to JPEG)
+    - Enforces maximum dimensions and pixel counts (decompression bomb protection)
+    Returns (width, height, format_name).
+    Raises ValueError on any invalid, corrupt, spoofed, or oversized image.
+    """
+    if not file_path.exists() or file_path.stat().st_size == 0:
+        raise ValueError("Image file is empty or does not exist")
+
+    EXT_TO_FORMAT = {
+        "jpg": "JPEG",
+        "jpeg": "JPEG",
+        "png": "PNG",
+        "webp": "WEBP",
+    }
+
+    try:
+        # Pass 1: Structure verification
+        with Image.open(file_path) as im:
+            im.verify()
+
+        # Pass 2: Raster decode, format, and dimension verification
+        with Image.open(file_path) as im:
+            format_name = im.format # e.g. "JPEG", "PNG", "WEBP"
+
+            if expected_extension:
+                clean_ext = expected_extension.lower().lstrip(".")
+                canonical_format = EXT_TO_FORMAT.get(clean_ext)
+                if canonical_format and format_name != canonical_format:
+                    raise ValueError(
+                        f"Image format mismatch: file content is {format_name}, but extension is '.{clean_ext}'"
+                    )
+
+            width, height = im.size
+            if width <= 0 or height <= 0:
+                raise ValueError(f"Invalid image dimensions: {width}x{height}")
+
+            if width > max_dimension or height > max_dimension:
+                raise ValueError(
+                    f"Image dimension ({width}x{height}) exceeds maximum allowed dimension of {max_dimension}px"
+                )
+
+            total_pixels = width * height
+            if total_pixels > max_pixels:
+                raise ValueError(
+                    f"Image pixel count ({total_pixels}) exceeds maximum allowed ({max_pixels} pixels)"
+                )
+
+            # Raster decode test (catches truncated files)
+            im.load()
+
+            return width, height, format_name
+
+    except DecompressionBombError as dbe:
+        raise ValueError(f"Image rejected by decompression bomb protection: {dbe}") from dbe
+    except (UnidentifiedImageError, SyntaxError) as uie:
+        raise ValueError(f"Invalid or unreadable image file: {uie}") from uie
+    except OSError as ose:
+        raise ValueError(f"Corrupt or truncated image file: {ose}") from ose
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise
+        raise ValueError(f"Failed to validate image content: {e}") from e
+
+def finalize_staged_upload(
+    temp_path: Path,
+    dest_dir: Path,
+    secure_filename: str,
+    old_path_to_replace: Optional[Path] = None
+) -> Path:
+    """
+    Finalizes a staged upload by moving temp_path to dest_dir / secure_filename.
+    Only deletes old_path_to_replace AFTER the new file is successfully moved into place.
+    Cleans up temp_path on any filesystem failure and preserves old_path_to_replace.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    final_path = dest_dir / secure_filename
+
+    try:
+        shutil.move(str(temp_path), str(final_path))
+    except Exception as e:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise IOError(f"Failed to finalize uploaded file to destination: {e}") from e
+
+    # Now that the new file is safely in place, remove old asset if applicable
+    if old_path_to_replace and old_path_to_replace.exists() and old_path_to_replace != final_path:
+        try:
+            old_path_to_replace.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    return final_path
+
 async def save_upload_file_securely(
     upload_file: UploadFile,
     dest_dir: Path,
@@ -213,7 +323,8 @@ async def save_upload_file_securely(
     max_size_bytes: int,
     prefix: str = "",
     expected_type: str = "media",
-    validate_content: bool = True
+    validate_content: bool = True,
+    stage_only: bool = False
 ) -> Tuple[Path, str, int]:
     """
     Streams an uploaded file securely:
@@ -222,7 +333,9 @@ async def save_upload_file_securely(
     - Enforces maximum file size limit during streaming
     - Computes SHA-256 checksum in the same pass
     - Verifies magic byte headers
-    - Atomically moves to final dest_dir with a collision-resistant name
+    - For images, validates complete image integrity and dimensions using Pillow
+    - When stage_only=True, leaves file at temp_path for transactional DB staging
+    - When stage_only=False, atomically moves to final dest_dir with a collision-resistant name
     - Guarantees cleanup of temporary files on failure
     """
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -263,10 +376,20 @@ async def save_upload_file_securely(
         if validate_content and not verify_magic_bytes(temp_path, expected_type=expected_type, filename=upload_file.filename):
             raise HTTPException(status_code=400, detail="Invalid file header: content does not match extension")
 
-        # 4. Atomic move to destination
-        shutil.move(str(temp_path), str(final_path))
+        # 4. For images, validate complete image content and decode with Pillow
+        if validate_content and expected_type == "image":
+            try:
+                validate_image_content(temp_path, expected_extension=upload_file.filename)
+            except ValueError as ve:
+                raise HTTPException(status_code=400, detail=str(ve))
+
         checksum = hasher.hexdigest()
 
+        if stage_only:
+            return temp_path, checksum, total_bytes
+
+        # 5. Atomic move to destination
+        shutil.move(str(temp_path), str(final_path))
         return final_path, checksum, total_bytes
 
     except Exception:

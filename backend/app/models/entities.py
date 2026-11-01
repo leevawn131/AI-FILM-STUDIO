@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import (
-    Column, String, Integer, Float, Boolean, Text, ForeignKey, DateTime
+    Column, String, Integer, Float, Boolean, Text, ForeignKey, DateTime, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from backend.app.database import Base
@@ -196,6 +196,8 @@ class CostRecord(Base):
     credits_used = Column(Float, default=1.0)
     cost_usd = Column(Float, default=0.0)
     prompt_hash = Column(String(64), default="") # for duplicate detection
+    operation_identity = Column(String(64), nullable=True, index=True) # composite operation deduplication
+    generation_attempt_id = Column(String(36), unique=True, nullable=True, index=True) # unique external Flow generation attempt
     details = Column(Text, default="")
     created_at = Column(DateTime, default=utc_now)
 
@@ -226,12 +228,17 @@ class ExportJob(Base):
 
 class StudioJob(Base):
     __tablename__ = "studio_jobs"
+    __table_args__ = (
+        UniqueConstraint("project_id", "job_type", "idempotency_key", name="uq_studio_jobs_proj_type_key"),
+    )
 
     id = Column(String(36), primary_key=True, default=gen_uuid)
     project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     job_type = Column(String(64), nullable=False, index=True)
     idempotency_key = Column(String(64), nullable=False, index=True)
     status = Column(String(32), nullable=False, default="PENDING", index=True) # PENDING, RUNNING, COMPLETED, FAILED, CANCELLED
+    worker_id = Column(String(64), nullable=True, index=True)
+    lease_expires_at = Column(DateTime, nullable=True)
     payload = Column(Text, default="{}")
     result = Column(Text, default="{}")
     error_message = Column(Text, default="")

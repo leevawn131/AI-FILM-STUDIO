@@ -13,11 +13,44 @@ from backend.app.services.offline_ai_engine import offline_ai
 
 logger = logging.getLogger("gemini_service")
 
+def extract_gemini_usage(response: Any, model_name: str) -> Dict[str, Any]:
+    """Extracts actual token counts and metadata from a Gemini response object."""
+    prompt_tokens = 0
+    candidates_tokens = 0
+    total_tokens = 0
+    if hasattr(response, "usage_metadata") and response.usage_metadata:
+        prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+        candidates_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+        total_tokens = getattr(response.usage_metadata, "total_token_count", 0) or (prompt_tokens + candidates_tokens)
+
+    return {
+        "provider": "gemini",
+        "model": model_name,
+        "input_tokens": prompt_tokens,
+        "output_tokens": candidates_tokens,
+        "total_tokens": total_tokens,
+        "is_fallback": False,
+        "engine_label": "Google Gemini"
+    }
+
+def get_offline_usage() -> Dict[str, Any]:
+    """Returns explicit metadata for local offline heuristics."""
+    return {
+        "provider": "offline_engine",
+        "model": "offline-studio-engine",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "is_fallback": True,
+        "engine_label": "Offline Studio Engine"
+    }
+
 class GeminiService:
     def __init__(self):
         self.api_key = settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
         self.model = settings.gemini_model
         self._client = None
+        self.last_metadata = get_offline_usage()
         
         if self.api_key:
             try:
@@ -61,12 +94,17 @@ class GeminiService:
                     config={"response_mime_type": "application/json"}
                 )
                 data = json.loads(response.text)
+                meta = extract_gemini_usage(response, self.model)
+                self.last_metadata = meta
+                data["_generation_metadata"] = meta
                 return data
             except Exception as e:
                 logger.warning(f"Gemini API call failed ({e}). Using Offline Studio Engine.")
 
         # Fallback to local offline engine
-        return offline_ai.generate_screenplay_scene(
+        fallback_meta = get_offline_usage()
+        self.last_metadata = fallback_meta
+        data = offline_ai.generate_screenplay_scene(
             project_title=project_title,
             genre=genre,
             scene_number=scene_number,
@@ -74,6 +112,8 @@ class GeminiService:
             characters=characters,
             location=location
         )
+        data["_generation_metadata"] = fallback_meta
+        return data
 
     def generate_shots(
         self,
@@ -99,11 +139,17 @@ class GeminiService:
                 )
                 shots = json.loads(response.text)
                 if isinstance(shots, list) and len(shots) > 0:
+                    meta = extract_gemini_usage(response, self.model)
+                    self.last_metadata = meta
+                    for s in shots:
+                        s["_generation_metadata"] = meta
                     return shots
             except Exception as e:
                 logger.warning(f"Gemini shot generation failed ({e}). Using Offline Studio Engine.")
 
-        return offline_ai.generate_storyboard_shots(
+        fallback_meta = get_offline_usage()
+        self.last_metadata = fallback_meta
+        shots = offline_ai.generate_storyboard_shots(
             scene_slugline=scene_slugline,
             scene_summary=scene_summary,
             genre=genre,
@@ -111,6 +157,9 @@ class GeminiService:
             visual_style=visual_style,
             count=count
         )
+        for s in shots:
+            s["_generation_metadata"] = fallback_meta
+        return shots
 
     def check_continuity(self, shots: List[Dict[str, Any]], characters: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Checks continuity across storyboard shots."""

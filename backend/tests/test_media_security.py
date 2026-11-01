@@ -97,11 +97,13 @@ def test_duplicate_upload_rejection_and_cleanup(tmp_path):
 
     # 2. Create a minimal valid synthetic MP4 file using ffmpeg
     from backend.app.services.ffmpeg_service import ffmpeg_service
-    test_video = tmp_path / "security_test_clip.mp4"
+    import uuid
+    unique_tag = uuid.uuid4().hex[:8]
+    test_video = tmp_path / f"security_test_clip_{unique_tag}.mp4"
     ffmpeg_service.generate_synthetic_test_clip(
         output_path=test_video,
         duration=1.0,
-        text_label="SECURITY_TEST"
+        text_label=f"SEC_{unique_tag}"
     )
     video_bytes = test_video.read_bytes()
 

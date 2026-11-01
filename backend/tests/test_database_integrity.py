@@ -47,7 +47,8 @@ def create_full_legacy_schema(db_path: Path):
             personality TEXT,
             visual_prompt_tags TEXT,
             reference_image_path VARCHAR(512),
-            created_at DATETIME
+            created_at DATETIME,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE TABLE locations (
             id VARCHAR(36) PRIMARY KEY,
@@ -59,7 +60,8 @@ def create_full_legacy_schema(db_path: Path):
             lighting_setup TEXT,
             visual_prompt_tags TEXT,
             reference_image_path VARCHAR(512),
-            created_at DATETIME
+            created_at DATETIME,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE TABLE scenes (
             id VARCHAR(36) PRIMARY KEY,
@@ -73,7 +75,8 @@ def create_full_legacy_schema(db_path: Path):
             estimated_duration INTEGER,
             budget_limit FLOAT,
             order_index INTEGER,
-            created_at DATETIME
+            created_at DATETIME,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE TABLE media_assets (
             id VARCHAR(36) PRIMARY KEY,
@@ -91,7 +94,8 @@ def create_full_legacy_schema(db_path: Path):
             auto_matched_shot_id VARCHAR(36),
             is_validated BOOLEAN,
             validation_notes TEXT,
-            created_at DATETIME
+            created_at DATETIME,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE TABLE shots (
             id VARCHAR(36) PRIMARY KEY,
@@ -112,7 +116,9 @@ def create_full_legacy_schema(db_path: Path):
             video_asset_id VARCHAR(36),
             thumbnail_path VARCHAR(512),
             order_index INTEGER,
-            created_at DATETIME
+            created_at DATETIME,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY (scene_id) REFERENCES scenes(id) ON DELETE CASCADE
         );
         CREATE TABLE audio_tracks (
             id VARCHAR(36) PRIMARY KEY,
@@ -127,7 +133,8 @@ def create_full_legacy_schema(db_path: Path):
             ducking_level FLOAT,
             scene_id VARCHAR(36),
             shot_id VARCHAR(36),
-            created_at DATETIME
+            created_at DATETIME,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE TABLE cost_records (
             id VARCHAR(36) PRIMARY KEY,
@@ -138,7 +145,8 @@ def create_full_legacy_schema(db_path: Path):
             cost_usd FLOAT,
             prompt_hash VARCHAR(64),
             details TEXT,
-            created_at DATETIME
+            created_at DATETIME,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE TABLE export_jobs (
             id VARCHAR(36) PRIMARY KEY,
@@ -154,7 +162,8 @@ def create_full_legacy_schema(db_path: Path):
             file_size_bytes INTEGER,
             error_message TEXT,
             created_at DATETIME,
-            completed_at DATETIME
+            completed_at DATETIME,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
     """)
     conn.commit()
@@ -208,7 +217,7 @@ def test_2_valid_legacy_database_migration_with_backup_and_data_preservation(tmp
     # Verify upgraded columns exist
     cur.execute("SELECT version_num FROM alembic_version")
     ver = cur.fetchone()[0]
-    assert ver == "0003_jobs_and_scene_budget"
+    assert ver == "0004_job_idempotency_and_flow_attempt"
 
     cur.execute("PRAGMA table_info(media_assets)")
     assert "checksum" in [c[1] for c in cur.fetchall()]
@@ -273,11 +282,11 @@ def test_5_existing_alembic_managed_database_upgrades(tmp_path):
     engine = create_engine(db_url)
     run_migrations(target_engine=engine, db_url=db_url)
 
-    # Verify upgraded to 0003
+    # Verify upgraded to 0004
     vconn = sqlite3.connect(str(alembic_db))
     cur = vconn.cursor()
     cur.execute("SELECT version_num FROM alembic_version")
-    assert cur.fetchone()[0] == "0003_jobs_and_scene_budget"
+    assert cur.fetchone()[0] == "0004_job_idempotency_and_flow_attempt"
     vconn.close()
 
 def test_database_backup_procedure(tmp_path):
