@@ -27,7 +27,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 
 from sqlalchemy.orm import Session
-from sqlalchemy import update, or_
+from sqlalchemy import update, or_, and_
 from fastapi import HTTPException
 
 from backend.app.config import settings
@@ -238,8 +238,16 @@ class UploadManager:
         fencing_token: Optional[int] = None,
         extend_seconds: int = DEFAULT_UPLOAD_LEASE_SECONDS
     ) -> bool:
-        """Heartbeat renewal during long filesystem or transfer tasks."""
+        """
+        Heartbeat renewal during long filesystem or transfer tasks.
+        Requires explicit fencing_token and worker_id matching the active lease owner.
+        """
+        if fencing_token is None:
+            raise UploadOwnershipLostError("Explicit fencing_token is required for renew_upload_lease.")
         target_worker = worker_id or self.worker_id
+        if not target_worker:
+            raise UploadOwnershipLostError("Worker ID is required for renew_upload_lease.")
+
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         new_expires = now + timedelta(seconds=extend_seconds)
 
@@ -248,15 +256,14 @@ class UploadManager:
             .where(UploadOperation.id == op_id)
             .where(UploadOperation.status == "DB_COMMITTED")
             .where(UploadOperation.worker_id == target_worker)
+            .where(UploadOperation.fencing_token == fencing_token)
             .where(UploadOperation.lease_expires_at >= now)
+            .values(
+                lease_expires_at=new_expires,
+                updated_at=now
+            )
+            .execution_options(synchronize_session=False)
         )
-        if fencing_token is not None:
-            stmt = stmt.where(UploadOperation.fencing_token == fencing_token)
-
-        stmt = stmt.values(
-            lease_expires_at=new_expires,
-            updated_at=now
-        ).execution_options(synchronize_session=False)
         res = db.execute(stmt)
         db.commit()
         return res.rowcount > 0
@@ -271,8 +278,15 @@ class UploadManager:
         """
         Idempotently and atomically moves the staged file to its destination and cleans previous asset.
         Verifies destination file against checksum and file_size_bytes before marking FINALIZED.
-        Enforces atomic worker ownership and fencing token.
+        Enforces atomic worker ownership and strict fencing token.
+        Preserves old asset file until database state transition to FINALIZED has fully committed.
         """
+        if fencing_token is None:
+            raise UploadOwnershipLostError("Explicit fencing_token is required for finalize_upload.")
+        target_worker = worker_id or self.worker_id
+        if not target_worker:
+            raise UploadOwnershipLostError("Worker ID is required for finalize_upload.")
+
         op = db.query(UploadOperation).filter(UploadOperation.id == op_id).first()
         if not op:
             raise ValueError(f"Upload operation {op_id} not found")
@@ -280,7 +294,6 @@ class UploadManager:
         dest_p = Path(op.destination_path)
         temp_p = Path(op.temp_path)
         old_p = Path(op.old_asset_path) if op.old_asset_path else None
-        target_worker = worker_id or self.worker_id
 
         validate_safe_path(dest_p, self.storage_root)
 
@@ -290,127 +303,152 @@ class UploadManager:
                 return dest_p
             raise ValueError(f"Upload operation '{op_id}' is marked FINALIZED but destination file failed integrity check")
 
-        # Claim operation if not explicitly provided with a matching valid lease
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        if fencing_token is None:
-            if op.worker_id == target_worker and not _is_lease_expired(op.lease_expires_at, now):
-                expected_token = op.fencing_token
-            else:
-                claimed = self.claim_upload_operation(db, op_id, worker_id=target_worker)
-                if not claimed:
-                    raise UploadOwnershipLostError(
-                        f"Worker '{target_worker}' cannot finalize upload '{op_id}': claimed by another worker or lease lost."
-                    )
-                op = claimed
-                expected_token = op.fencing_token
-        else:
-            expected_token = fencing_token
+        if op.status != "DB_COMMITTED":
+            raise UploadOwnershipLostError(
+                f"Upload operation '{op_id}' is not in DB_COMMITTED status (current: '{op.status}')."
+            )
 
-        # DESTINATION INTEGRITY & REPLACEMENT WORKFLOW (TASK 3)
+        if op.worker_id != target_worker or op.fencing_token != fencing_token or _is_lease_expired(op.lease_expires_at, now):
+            raise UploadOwnershipLostError(
+                f"Worker '{target_worker}' (token {fencing_token}) cannot finalize upload '{op_id}': "
+                f"lease expired or preempted by another worker. Current state: worker='{op.worker_id}', "
+                f"token={op.fencing_token}, status='{op.status}'."
+            )
+
+        # Phase 1: Destination file placement & integrity verification
         dest_is_valid = _verify_file_integrity(dest_p, op.checksum, op.file_size_bytes)
         temp_is_valid = _verify_file_integrity(temp_p, op.checksum, op.file_size_bytes)
 
-        if dest_p.exists():
-            if dest_is_valid:
-                # Destination already contains the expected file
-                if temp_p.exists() and temp_p != dest_p:
-                    temp_p.unlink(missing_ok=True)
-            else:
-                # Destination exists but does NOT match expected checksum or size!
-                if temp_is_valid:
-                    # Safe atomic replacement using verified temp file
-                    try:
-                        _atomic_replace(temp_p, dest_p)
-                    except Exception as replace_err:
-                        self._fail_operation_with_revert(
-                            db, op, target_worker, expected_token,
-                            f"Atomic replacement of corrupt destination failed: {replace_err}"
-                        )
-                        raise
-                    # Re-verify destination
-                    if not _verify_file_integrity(dest_p, op.checksum, op.file_size_bytes):
-                        self._fail_operation_with_revert(
-                            db, op, target_worker, expected_token,
-                            "Destination file failed integrity verification immediately after atomic replacement."
-                        )
-                        raise ValueError("Destination file failed integrity check after replacement")
+        # In-place replacement safety: if destination matches old_asset_path, preserve backup until DB commit
+        in_place_backup: Optional[Path] = None
+        if old_p and old_p == dest_p and old_p.exists():
+            in_place_backup = dest_p.with_name(f"{dest_p.name}.bak_{uuid.uuid4().hex[:8]}")
+            shutil.copy2(str(dest_p), str(in_place_backup))
+
+        try:
+            if dest_p.exists():
+                if dest_is_valid:
+                    # Destination already in place with valid checksum and size
+                    pass
                 else:
-                    # Temp is missing or also invalid: cannot safely finalize!
+                    # Destination exists but checksum or size mismatch!
+                    if temp_is_valid:
+                        try:
+                            _atomic_replace(temp_p, dest_p)
+                        except Exception as replace_err:
+                            self._fail_operation_with_revert(
+                                db, op, target_worker, fencing_token,
+                                f"Atomic replacement of corrupt destination failed: {replace_err}"
+                            )
+                            raise
+                        if not _verify_file_integrity(dest_p, op.checksum, op.file_size_bytes):
+                            self._fail_operation_with_revert(
+                                db, op, target_worker, fencing_token,
+                                "Destination file failed integrity verification immediately after atomic replacement."
+                            )
+                            raise ValueError("Destination file failed integrity check after replacement")
+                    else:
+                        self._fail_operation_with_revert(
+                            db, op, target_worker, fencing_token,
+                            f"Destination file at {dest_p} exists but checksum/size mismatch; staged file is missing or invalid. Preserving old asset."
+                        )
+                        raise ValueError(f"Destination file at {dest_p} does not match expected upload checksum {op.checksum}")
+            else:
+                # Destination does not exist yet
+                if not temp_p.exists():
                     self._fail_operation_with_revert(
-                        db, op, target_worker, expected_token,
-                        f"Destination file at {dest_p} exists but checksum/size mismatch; staged file is missing or invalid. Preserving old asset."
+                        db, op, target_worker, fencing_token,
+                        f"Staged file missing at {temp_p} before finalization. Entity reference reverted."
                     )
-                    raise ValueError(f"Destination file at {dest_p} does not match expected upload checksum {op.checksum}")
-        else:
-            # Destination does not exist yet
-            if not temp_p.exists():
-                self._fail_operation_with_revert(
-                    db, op, target_worker, expected_token,
-                    f"Staged file missing at {temp_p} before finalization. Entity reference reverted."
+                    raise FileNotFoundError(f"Staged file missing at {temp_p}")
+
+                if not temp_is_valid:
+                    self._fail_operation_with_revert(
+                        db, op, target_worker, fencing_token,
+                        f"Staged file at {temp_p} failed integrity verification before move"
+                    )
+                    raise ValueError(f"Staged file failed integrity verification (expected {op.checksum})")
+
+                try:
+                    _atomic_replace(temp_p, dest_p)
+                except Exception as move_err:
+                    self._fail_operation_with_revert(
+                        db, op, target_worker, fencing_token,
+                        f"Filesystem move failed: {move_err}"
+                    )
+                    raise
+
+                if not _verify_file_integrity(dest_p, op.checksum, op.file_size_bytes):
+                    self._fail_operation_with_revert(
+                        db, op, target_worker, fencing_token,
+                        "Destination file failed integrity check after filesystem move"
+                    )
+                    raise ValueError("Destination file failed integrity check after filesystem move")
+
+            # Phase 2: Database state transition to FINALIZED (ENFORCES FENCING AND OWNERSHIP)
+            # NOTE: old_asset_path is STILL 100% PRESERVED on disk at this point!
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            stmt = (
+                update(UploadOperation)
+                .where(UploadOperation.id == op_id)
+                .where(UploadOperation.status == "DB_COMMITTED")
+                .where(UploadOperation.worker_id == target_worker)
+                .where(UploadOperation.fencing_token == fencing_token)
+                .where(UploadOperation.lease_expires_at >= now)
+                .values(
+                    status="FINALIZED",
+                    completed_at=now,
+                    updated_at=now
                 )
-                raise FileNotFoundError(f"Staged file missing at {temp_p}")
-
-            if not temp_is_valid:
-                self._fail_operation_with_revert(
-                    db, op, target_worker, expected_token,
-                    f"Staged file at {temp_p} failed integrity verification before move"
-                )
-                raise ValueError(f"Staged file failed integrity verification (expected {op.checksum})")
-
-            # Perform atomic move
-            try:
-                _atomic_replace(temp_p, dest_p)
-            except Exception as move_err:
-                self._fail_operation_with_revert(
-                    db, op, target_worker, expected_token,
-                    f"Filesystem move failed: {move_err}"
-                )
-                raise
-
-            # Post-move destination integrity verification
-            if not _verify_file_integrity(dest_p, op.checksum, op.file_size_bytes):
-                self._fail_operation_with_revert(
-                    db, op, target_worker, expected_token,
-                    "Destination file failed integrity check after filesystem move"
-                )
-                raise ValueError("Destination file failed integrity check after filesystem move")
-
-        # Destination is firmly verified on disk. Safely remove old asset.
-        if old_p and old_p != dest_p and old_p.exists():
-            try:
-                old_p.unlink(missing_ok=True)
-            except OSError as e:
-                logger.warning(f"Could not remove old asset {old_p}: {e}")
-
-        # Transition status to FINALIZED atomically checking worker_id and fencing_token
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        stmt = (
-            update(UploadOperation)
-            .where(UploadOperation.id == op_id)
-            .where(UploadOperation.status == "DB_COMMITTED")
-            .where(UploadOperation.worker_id == target_worker)
-            .where(UploadOperation.fencing_token == expected_token)
-            .where(UploadOperation.lease_expires_at >= now)
-            .values(
-                status="FINALIZED",
-                completed_at=now,
-                updated_at=now
+                .execution_options(synchronize_session=False)
             )
-            .execution_options(synchronize_session=False)
-        )
-        res = db.execute(stmt)
-        db.commit()
+            res = db.execute(stmt)
+            db.commit()
 
-        if res.rowcount == 0:
-            current = db.query(UploadOperation).filter(UploadOperation.id == op_id).first()
-            raise UploadOwnershipLostError(
-                f"Worker '{target_worker}' (token {expected_token}) cannot finalize upload '{op_id}': "
-                f"lease expired or preempted by another worker. Current state: worker='{current.worker_id if current else 'N/A'}', "
-                f"token={current.fencing_token if current else 'N/A'}, status='{current.status if current else 'N/A'}'."
-            )
+            if res.rowcount == 0:
+                # Ownership was lost before or during finalization commit!
+                if in_place_backup and in_place_backup.exists() and old_p:
+                    try:
+                        shutil.move(str(in_place_backup), str(old_p))
+                    except Exception:
+                        pass
+                current = db.query(UploadOperation).filter(UploadOperation.id == op_id).first()
+                raise UploadOwnershipLostError(
+                    f"Worker '{target_worker}' (token {fencing_token}) cannot finalize upload '{op_id}': "
+                    f"lease expired or preempted by another worker. Current state: worker='{current.worker_id if current else 'N/A'}', "
+                    f"token={current.fencing_token if current else 'N/A'}, status='{current.status if current else 'N/A'}'."
+                )
 
-        db.refresh(op)
-        return dest_p
+            # Phase 3: DB transition succeeded! NOW AND ONLY NOW clean up old asset and temporary files.
+            if in_place_backup and in_place_backup.exists():
+                try:
+                    in_place_backup.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            if old_p and old_p != dest_p and old_p.exists():
+                try:
+                    old_p.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.warning(f"Could not remove old asset {old_p}: {e}")
+
+            if temp_p.exists() and temp_p != dest_p:
+                try:
+                    temp_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            db.refresh(op)
+            return dest_p
+
+        except Exception:
+            if in_place_backup and in_place_backup.exists() and old_p and not old_p.exists():
+                try:
+                    shutil.move(str(in_place_backup), str(old_p))
+                except Exception:
+                    pass
+            raise
 
     def _fail_operation_with_revert(
         self,
@@ -430,6 +468,7 @@ class UploadManager:
             .where(UploadOperation.status == "DB_COMMITTED")
             .where(UploadOperation.worker_id == worker_id)
             .where(UploadOperation.fencing_token == fencing_token)
+            .where(UploadOperation.lease_expires_at >= now)
             .values(
                 status="FAILED",
                 error_message=error_message[:512],
@@ -437,8 +476,13 @@ class UploadManager:
             )
             .execution_options(synchronize_session=False)
         )
-        db.execute(stmt)
+        res = db.execute(stmt)
         db.commit()
+        if res.rowcount == 0:
+            db.rollback()
+            raise UploadOwnershipLostError(
+                f"Worker '{worker_id}' cannot fail upload '{op.id}': ownership lost or preempted."
+            )
 
     def fail_upload(
         self,
@@ -450,23 +494,21 @@ class UploadManager:
     ) -> Optional[UploadOperation]:
         """
         Marks upload as FAILED and unlinks staged temp file.
+        Requires explicit fencing_token and worker_id.
         If reached DB_COMMITTED status, conditionally updates with worker fencing and reverts entity reference.
         Preserves previous asset file on disk.
         """
+        if fencing_token is None:
+            raise UploadOwnershipLostError("Explicit fencing_token is required for fail_upload.")
+        target_worker = worker_id or self.worker_id
+        if not target_worker:
+            raise UploadOwnershipLostError("Worker ID is required for fail_upload.")
+
         op = db.query(UploadOperation).filter(UploadOperation.id == op_id).first()
         if not op:
             return None
 
-        temp_p = Path(op.temp_path)
-        if temp_p.exists():
-            try:
-                temp_p.unlink(missing_ok=True)
-            except OSError:
-                pass
-
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        target_worker = worker_id or self.worker_id
-        expected_token = fencing_token or op.fencing_token
 
         if op.status == "DB_COMMITTED":
             self._revert_entity_reference(db, op)
@@ -475,7 +517,8 @@ class UploadManager:
                 .where(UploadOperation.id == op_id)
                 .where(UploadOperation.status == "DB_COMMITTED")
                 .where(UploadOperation.worker_id == target_worker)
-                .where(UploadOperation.fencing_token == expected_token)
+                .where(UploadOperation.fencing_token == fencing_token)
+                .where(UploadOperation.lease_expires_at >= now)
                 .values(
                     status="FAILED",
                     error_message=str(error)[:512],
@@ -484,19 +527,100 @@ class UploadManager:
                 .execution_options(synchronize_session=False)
             )
             res = db.execute(stmt)
-            db.commit()
             if res.rowcount == 0:
+                db.rollback()
                 raise UploadOwnershipLostError(
                     f"Worker '{target_worker}' cannot fail upload '{op_id}': ownership lost or preempted."
                 )
-        else:
-            op.status = "FAILED"
-            op.error_message = str(error)[:512]
-            op.updated_at = now
             db.commit()
+        elif op.status == "STAGED":
+            stmt = (
+                update(UploadOperation)
+                .where(UploadOperation.id == op_id)
+                .where(UploadOperation.status == "STAGED")
+                .where(UploadOperation.worker_id == target_worker)
+                .where(UploadOperation.fencing_token == fencing_token)
+                .where(UploadOperation.lease_expires_at >= now)
+                .values(
+                    status="FAILED",
+                    error_message=str(error)[:512],
+                    updated_at=now
+                )
+                .execution_options(synchronize_session=False)
+            )
+            res = db.execute(stmt)
+            if res.rowcount == 0:
+                db.rollback()
+                raise UploadOwnershipLostError(
+                    f"Worker '{target_worker}' cannot fail upload '{op_id}': ownership lost or preempted."
+                )
+            db.commit()
+        else:
+            return op
+
+        temp_p = Path(op.temp_path)
+        if temp_p.exists():
+            try:
+                temp_p.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         db.refresh(op)
         return op
+
+    def claim_and_clean_staged_upload(
+        self,
+        db: Session,
+        op_id: str,
+        worker_id: Optional[str] = None
+    ) -> bool:
+        """
+        Safely and atomically claims an expired STAGED upload for cleanup.
+        Eligible ONLY if status == 'STAGED' AND (lease_expires_at < now OR (lease_expires_at IS NULL AND created_at <= threshold)).
+        Never cleans active uploads (lease_expires_at >= now).
+        Uses conditional atomic UPDATE so multiple instances cannot clean concurrently.
+        Unlinks temporary file only after DB state transition to FAILED succeeds.
+        """
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        expiry_threshold = now - timedelta(minutes=STAGED_EXPIRY_MINUTES)
+
+        op = db.query(UploadOperation).filter(UploadOperation.id == op_id).first()
+        if not op or op.status != "STAGED":
+            return False
+
+        # Active check: lease still valid
+        if op.lease_expires_at and op.lease_expires_at >= now:
+            return False
+
+        stmt = (
+            update(UploadOperation)
+            .where(UploadOperation.id == op_id)
+            .where(UploadOperation.status == "STAGED")
+            .where(
+                or_(
+                    and_(UploadOperation.lease_expires_at != None, UploadOperation.lease_expires_at < now),
+                    and_(UploadOperation.lease_expires_at == None, UploadOperation.created_at <= expiry_threshold)
+                )
+            )
+            .values(
+                status="FAILED",
+                error_message="Staged upload expired without database commit",
+                updated_at=now
+            )
+            .execution_options(synchronize_session=False)
+        )
+        res = db.execute(stmt)
+        db.commit()
+
+        if res.rowcount > 0:
+            temp_p = Path(op.temp_path)
+            if temp_p.exists():
+                try:
+                    temp_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return True
+        return False
 
     def recover_staged_uploads(self, db: Session) -> Dict[str, int]:
         """
@@ -505,7 +629,8 @@ class UploadManager:
         - Skips uploads actively claimed by another worker with a valid lease.
         - Verifies or finalizes uploads safely.
         - Reverts entity reference if file is missing or corrupt.
-        - Cleans expired STAGED uploads and orphaned .tmp files.
+        - Cleans expired STAGED uploads safely without deleting active uploads.
+        - Multiple instances protected against concurrent cleanup.
         """
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         stats = {
@@ -534,23 +659,19 @@ class UploadManager:
                 logger.info(f"Recovery reverted or failed upload {claimed.id}: {e}")
                 stats["reverted_missing"] += 1
 
-        # 2. Clean expired STAGED uploads (abandoned before DB commit)
+        # 2. Clean expired STAGED uploads (abandoned before DB commit) atomically
         expiry_threshold = now - timedelta(minutes=STAGED_EXPIRY_MINUTES)
         expired_staged = db.query(UploadOperation).filter(
             UploadOperation.status == "STAGED",
-            UploadOperation.created_at <= expiry_threshold
+            or_(
+                and_(UploadOperation.lease_expires_at != None, UploadOperation.lease_expires_at < now),
+                and_(UploadOperation.lease_expires_at == None, UploadOperation.created_at <= expiry_threshold)
+            )
         ).all()
 
         for op in expired_staged:
-            temp_p = Path(op.temp_path)
-            if temp_p.exists():
-                temp_p.unlink(missing_ok=True)
-            op.status = "FAILED"
-            op.error_message = "Staged upload expired without database commit"
-            op.updated_at = now
-            stats["staged_cleaned"] += 1
-
-        db.commit()
+            if self.claim_and_clean_staged_upload(db, op.id, worker_id=self.worker_id):
+                stats["staged_cleaned"] += 1
 
         # 3. Clean orphaned .tmp files in settings.temp_dir
         if self.temp_root.exists():

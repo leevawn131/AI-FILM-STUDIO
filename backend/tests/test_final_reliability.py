@@ -367,7 +367,7 @@ def test_task2_staged_upload_lifecycle_and_idempotent_finalization(tmp_path):
     assert old_asset.exists()  # Still untouched!
 
     # 4. Finalize upload
-    finalized_path = um.finalize_upload(session, op.id)
+    finalized_path = um.finalize_upload(session, op.id, worker_id=op.worker_id, fencing_token=op.fencing_token)
     assert finalized_path.exists()
     assert finalized_path == final_dest
     assert not temp_file.exists()
@@ -378,7 +378,7 @@ def test_task2_staged_upload_lifecycle_and_idempotent_finalization(tmp_path):
     assert op.completed_at is not None
 
     # 5. Idempotent repeat finalization: does not corrupt or raise
-    second_finalize = um.finalize_upload(session, op.id)
+    second_finalize = um.finalize_upload(session, op.id, worker_id=op.worker_id, fencing_token=op.fencing_token)
     assert second_finalize == final_dest
     assert second_finalize.exists()
 
@@ -808,7 +808,7 @@ def test_task2_persistent_upload_recovery_and_failure_handling(tmp_path):
         try:
             raise sqlite3.OperationalError("Simulated DB lock failure during entity update")
         except Exception as sim_err:
-            um.fail_upload(session, op1.id, sim_err)
+            um.fail_upload(session, op1.id, sim_err, worker_id=op1.worker_id, fencing_token=op1.fencing_token)
 
         session.refresh(op1)
         assert op1.status == "FAILED"
@@ -840,7 +840,7 @@ def test_task2_persistent_upload_recovery_and_failure_handling(tmp_path):
         # Mock shutil.move to fail
         with patch("shutil.move", side_effect=OSError("Disk full or permission denied")):
             with pytest.raises(OSError):
-                um.finalize_upload(session, op2.id)
+                um.finalize_upload(session, op2.id, worker_id=op2.worker_id, fencing_token=op2.fencing_token)
 
         session.refresh(op2)
         assert op2.status == "FAILED"
@@ -870,12 +870,12 @@ def test_task2_persistent_upload_recovery_and_failure_handling(tmp_path):
         session.commit()
 
         # Finalize
-        res_dest = um.finalize_upload(session, op3.id)
+        res_dest = um.finalize_upload(session, op3.id, worker_id=op3.worker_id, fencing_token=op3.fencing_token)
         assert res_dest == final_dest
         assert final_dest.exists()
 
         # Repeated finalization (idempotent)
-        res_dest2 = um.finalize_upload(session, op3.id)
+        res_dest2 = um.finalize_upload(session, op3.id, worker_id=op3.worker_id, fencing_token=op3.fencing_token)
         assert res_dest2 == final_dest
         assert final_dest.exists()
 

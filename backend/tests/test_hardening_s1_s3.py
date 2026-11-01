@@ -147,8 +147,8 @@ def test_task1_database_enforced_job_idempotency_and_concurrency(tmp_path):
 
     # 3. Simulate completion with winning worker and verify REUSE
     winning_worker = all_jobs[0].worker_id
-    winning_token = all_jobs[0].lease_token
-    jm.complete_job(verify_session, job_id, {"rendered_file": "vfx_shot_1.mp4"}, worker_id=winning_worker, lease_token=winning_token)
+    winning_token = all_jobs[0].fencing_token
+    jm.complete_job(verify_session, job_id, {"rendered_file": "vfx_shot_1.mp4"}, worker_id=winning_worker, fencing_token=winning_token)
     reused_job, action = jm.prepare_or_claim_job(
         db=verify_session,
         project_id="proj-task1",

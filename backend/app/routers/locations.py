@@ -176,17 +176,34 @@ async def upload_location_ref(location_id: str, file: UploadFile = File(...), db
 
     try:
         loc.reference_image_path = rel_path
-        upload_manager.mark_db_committed(db, upload_op.id)
+        upload_op = upload_manager.mark_db_committed(db, upload_op.id)
         db.commit()
     except Exception as e:
         db.rollback()
-        upload_manager.fail_upload(db, upload_op.id, e)
+        upload_manager.fail_upload(
+            db=db,
+            op_id=upload_op.id,
+            error=e,
+            worker_id=upload_op.worker_id,
+            fencing_token=upload_op.fencing_token
+        )
         raise
 
     try:
-        upload_manager.finalize_upload(db, upload_op.id)
+        upload_manager.finalize_upload(
+            db=db,
+            op_id=upload_op.id,
+            worker_id=upload_op.worker_id,
+            fencing_token=upload_op.fencing_token
+        )
     except Exception as e:
-        upload_manager.fail_upload(db, upload_op.id, e)
+        upload_manager.fail_upload(
+            db=db,
+            op_id=upload_op.id,
+            error=e,
+            worker_id=upload_op.worker_id,
+            fencing_token=upload_op.fencing_token
+        )
         raise
 
     return {"status": "uploaded", "reference_url": f"/media/{rel_path}"}

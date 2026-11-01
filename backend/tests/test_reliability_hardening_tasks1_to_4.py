@@ -365,7 +365,7 @@ def test_task3_correct_destination_checksum(tmp_path):
     um.mark_db_committed(session, op.id)
     session.commit()
 
-    res = um.finalize_upload(session, op.id)
+    res = um.finalize_upload(session, op.id, worker_id=op.worker_id, fencing_token=op.fencing_token)
     assert res == dest_f
     assert dest_f.exists()
     assert compute_file_sha256(dest_f) == sha
@@ -425,7 +425,7 @@ def test_task3_wrong_destination_checksum_and_missing_temp(tmp_path):
 
     # Finalize should raise ValueError due to checksum mismatch
     with pytest.raises(ValueError) as exc:
-        um.finalize_upload(session, op.id)
+        um.finalize_upload(session, op.id, worker_id=op.worker_id, fencing_token=op.fencing_token)
 
     assert "does not match expected upload checksum" in str(exc.value)
 
@@ -480,7 +480,7 @@ def test_task3_destination_corrupt_with_valid_temp_performs_atomic_replacement(t
     session.commit()
 
     # Finalize detects corrupt destination, verifies valid temp, and safely replaces destination!
-    res = um.finalize_upload(session, op.id)
+    res = um.finalize_upload(session, op.id, worker_id=op.worker_id, fencing_token=op.fencing_token)
     assert res == dest_f
     assert compute_file_sha256(dest_f) == good_sha
     session.refresh(op)
@@ -627,15 +627,17 @@ def test_task4_migration_duplicate_operation_identities_audit_trail(tmp_path):
         can = conn.execute(text("SELECT operation_identity, details FROM cost_records WHERE id = 'rec-canonical'")).fetchone()
         assert can[0] == "dup-flow-tx-1"
 
-        # 3. Historical duplicate #2 was re-keyed and has audit note
+        # 3. Historical duplicate #2 was re-keyed with deterministic SHA-256 suffix and has audit note
         dup2 = conn.execute(text("SELECT operation_identity, details FROM cost_records WHERE id = 'rec-dup-2'")).fetchone()
-        assert dup2[0] == "dup-flow-tx-1#dup-1-rec-dup-2"
+        assert dup2[0].startswith("dup-flow-tx-1#dup-1-")
+        assert len(dup2[0]) == len("dup-flow-tx-1#dup-1-") + 16
         assert "MIGRATION_AUDIT: Historical duplicate #1" in dup2[1]
         assert "Canonical record ID: 'rec-canonical'" in dup2[1]
 
-        # 4. Historical duplicate #3 was re-keyed and has audit note
+        # 4. Historical duplicate #3 was re-keyed with deterministic SHA-256 suffix and has audit note
         dup3 = conn.execute(text("SELECT operation_identity, details FROM cost_records WHERE id = 'rec-dup-3'")).fetchone()
-        assert dup3[0] == "dup-flow-tx-1#dup-2-rec-dup-3"
+        assert dup3[0].startswith("dup-flow-tx-1#dup-2-")
+        assert len(dup3[0]) == len("dup-flow-tx-1#dup-2-") + 16
         assert "MIGRATION_AUDIT: Historical duplicate #2" in dup3[1]
         assert "Canonical record ID: 'rec-canonical'" in dup3[1]
 

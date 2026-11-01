@@ -201,7 +201,7 @@ class CostRecord(Base):
     credits_used = Column(Float, default=1.0)
     cost_usd = Column(Float, default=0.0)
     prompt_hash = Column(String(64), default="") # for duplicate detection
-    operation_identity = Column(String(64), nullable=True, index=True) # composite operation deduplication
+    operation_identity = Column(String(256), nullable=True, index=True) # composite operation deduplication
     generation_attempt_id = Column(String(36), unique=True, nullable=True, index=True) # unique external Flow generation attempt
     details = Column(Text, default="")
     created_at = Column(DateTime, default=utc_now)
