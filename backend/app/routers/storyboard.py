@@ -195,10 +195,10 @@ def generate_shots_for_scene(scene_id: str, req: GenerateShotsRequest, db: Sessi
         for s in created_shots:
             db.refresh(s)
 
-        job_manager.complete_job(db, job.id, {"shot_ids": [s.id for s in created_shots]})
+        job_manager.complete_job(db, job.id, {"shot_ids": [s.id for s in created_shots]}, worker_id=job.worker_id, lease_token=job.lease_token)
         return created_shots
     except Exception as e:
-        job_manager.fail_job(db, job.id, e)
+        job_manager.fail_job(db, job.id, e, worker_id=job.worker_id, lease_token=job.lease_token)
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail=sanitize_error_message(e))

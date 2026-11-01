@@ -14,14 +14,23 @@ from backend.app.services.offline_ai_engine import offline_ai
 logger = logging.getLogger("gemini_service")
 
 def extract_gemini_usage(response: Any, model_name: str) -> Dict[str, Any]:
-    """Extracts actual token counts and metadata from a Gemini response object."""
-    prompt_tokens = 0
-    candidates_tokens = 0
-    total_tokens = 0
-    if hasattr(response, "usage_metadata") and response.usage_metadata:
-        prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
-        candidates_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
-        total_tokens = getattr(response.usage_metadata, "total_token_count", 0) or (prompt_tokens + candidates_tokens)
+    """
+    Extracts actual token counts and metadata from a Gemini response object.
+    Explicitly marks missing usage metadata as unknown/None rather than confirmed zero.
+    """
+    has_meta = hasattr(response, "usage_metadata") and response.usage_metadata is not None
+    if has_meta:
+        prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", None)
+        candidates_tokens = getattr(response.usage_metadata, "candidates_token_count", None)
+        total_tokens = getattr(response.usage_metadata, "total_token_count", None)
+        if total_tokens is None and prompt_tokens is not None and candidates_tokens is not None:
+            total_tokens = prompt_tokens + candidates_tokens
+        usage_known = prompt_tokens is not None or candidates_tokens is not None
+    else:
+        prompt_tokens = None
+        candidates_tokens = None
+        total_tokens = None
+        usage_known = False
 
     return {
         "provider": "gemini",
@@ -29,6 +38,7 @@ def extract_gemini_usage(response: Any, model_name: str) -> Dict[str, Any]:
         "input_tokens": prompt_tokens,
         "output_tokens": candidates_tokens,
         "total_tokens": total_tokens,
+        "usage_known": usage_known,
         "is_fallback": False,
         "engine_label": "Google Gemini"
     }
@@ -41,6 +51,7 @@ def get_offline_usage() -> Dict[str, Any]:
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
+        "usage_known": True,
         "is_fallback": True,
         "engine_label": "Offline Studio Engine"
     }

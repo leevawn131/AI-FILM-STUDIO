@@ -10,6 +10,7 @@ from backend.app.config import settings
 from backend.app.models.entities import Project, Location
 from backend.app.schemas.entities import LocationCreate, LocationUpdate, LocationResponse
 from backend.app.services.security import save_upload_file_securely, finalize_staged_upload, generate_secure_filename, validate_safe_path, sanitize_filename
+from backend.app.services.upload_manager import upload_manager
 
 router = APIRouter(prefix="/api/locations", tags=["locations"])
 
@@ -160,14 +161,32 @@ async def upload_location_ref(location_id: str, file: UploadFile = File(...), db
         except Exception:
             pass
 
-    loc.reference_image_path = rel_path
+    final_dest_path = dest_dir / secure_filename
+    upload_op = upload_manager.start_staged_upload(
+        db=db,
+        project_id=loc.project_id,
+        entity_type="location_reference",
+        entity_id=loc.id,
+        temp_path=temp_path,
+        destination_path=final_dest_path,
+        old_asset_path=old_path,
+        checksum=checksum,
+        file_size_bytes=size_bytes
+    )
+
     try:
+        loc.reference_image_path = rel_path
+        upload_manager.mark_db_committed(db, upload_op.id)
         db.commit()
-        finalize_staged_upload(temp_path, dest_dir, secure_filename, old_path_to_replace=old_path)
-    except Exception:
+    except Exception as e:
         db.rollback()
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+        upload_manager.fail_upload(db, upload_op.id, e)
+        raise
+
+    try:
+        upload_manager.finalize_upload(db, upload_op.id)
+    except Exception as e:
+        upload_manager.fail_upload(db, upload_op.id, e)
         raise
 
     return {"status": "uploaded", "reference_url": f"/media/{rel_path}"}

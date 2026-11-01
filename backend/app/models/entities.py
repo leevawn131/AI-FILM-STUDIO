@@ -38,6 +38,7 @@ class Project(Base):
     cost_records = relationship("CostRecord", back_populates="project", cascade="all, delete-orphan")
     export_jobs = relationship("ExportJob", back_populates="project", cascade="all, delete-orphan")
     studio_jobs = relationship("StudioJob", back_populates="project", cascade="all, delete-orphan")
+    upload_operations = relationship("UploadOperation", back_populates="project", cascade="all, delete-orphan")
 
 
 class Character(Base):
@@ -238,6 +239,7 @@ class StudioJob(Base):
     idempotency_key = Column(String(64), nullable=False, index=True)
     status = Column(String(32), nullable=False, default="PENDING", index=True) # PENDING, RUNNING, COMPLETED, FAILED, CANCELLED
     worker_id = Column(String(64), nullable=True, index=True)
+    lease_token = Column(Integer, nullable=False, default=1)
     lease_expires_at = Column(DateTime, nullable=True)
     payload = Column(Text, default="{}")
     result = Column(Text, default="{}")
@@ -249,3 +251,24 @@ class StudioJob(Base):
     completed_at = Column(DateTime, nullable=True)
 
     project = relationship("Project", back_populates="studio_jobs")
+
+
+class UploadOperation(Base):
+    __tablename__ = "upload_operations"
+
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True)
+    entity_type = Column(String(64), nullable=False, index=True) # "character_reference", "location_reference", "audio_track", "media_asset"
+    entity_id = Column(String(36), nullable=False, index=True)
+    temp_path = Column(String(512), nullable=False)
+    destination_path = Column(String(512), nullable=False)
+    old_asset_path = Column(String(512), nullable=True)
+    status = Column(String(32), nullable=False, default="STAGED", index=True) # STAGED, DB_COMMITTED, FINALIZED, FAILED
+    checksum = Column(String(64), nullable=True)
+    file_size_bytes = Column(Integer, default=0)
+    error_message = Column(Text, default="")
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+    completed_at = Column(DateTime, nullable=True)
+
+    project = relationship("Project", back_populates="upload_operations")

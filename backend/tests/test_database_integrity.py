@@ -217,7 +217,13 @@ def test_2_valid_legacy_database_migration_with_backup_and_data_preservation(tmp
     # Verify upgraded columns exist
     cur.execute("SELECT version_num FROM alembic_version")
     ver = cur.fetchone()[0]
-    assert ver == "0004_job_idempotency_and_flow_attempt"
+    assert ver == "0005_lease_fencing_and_upload_recovery"
+
+    cur.execute("PRAGMA table_info(studio_jobs)")
+    assert "lease_token" in [c[1] for c in cur.fetchall()]
+
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='upload_operations'")
+    assert cur.fetchone() is not None
 
     cur.execute("PRAGMA table_info(media_assets)")
     assert "checksum" in [c[1] for c in cur.fetchall()]
@@ -282,11 +288,11 @@ def test_5_existing_alembic_managed_database_upgrades(tmp_path):
     engine = create_engine(db_url)
     run_migrations(target_engine=engine, db_url=db_url)
 
-    # Verify upgraded to 0004
+    # Verify upgraded to 0005
     vconn = sqlite3.connect(str(alembic_db))
     cur = vconn.cursor()
     cur.execute("SELECT version_num FROM alembic_version")
-    assert cur.fetchone()[0] == "0004_job_idempotency_and_flow_attempt"
+    assert cur.fetchone()[0] == "0005_lease_fencing_and_upload_recovery"
     vconn.close()
 
 def test_database_backup_procedure(tmp_path):

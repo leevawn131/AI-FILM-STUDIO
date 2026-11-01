@@ -282,10 +282,31 @@ class StudioJobResponse(BaseModel):
     job_type: str
     idempotency_key: str
     status: str
+    worker_id: Optional[str] = None
+    lease_token: Optional[int] = 1
     payload: Optional[str] = "{}"
     result: Optional[str] = "{}"
     error_message: Optional[str] = ""
     retry_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UploadOperationResponse(BaseModel):
+    id: str
+    project_id: Optional[str] = None
+    entity_type: str
+    entity_id: str
+    temp_path: str
+    destination_path: str
+    old_asset_path: Optional[str] = None
+    status: str
+    checksum: Optional[str] = None
+    file_size_bytes: int = 0
+    error_message: Optional[str] = ""
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
