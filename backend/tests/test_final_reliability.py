@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -339,7 +340,9 @@ def test_task2_staged_upload_lifecycle_and_idempotent_finalization(tmp_path):
     temp_dir = storage_root / "temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
     temp_file = temp_dir / "new_avatar.jpg.tmp"
-    temp_file.write_bytes(create_test_image(color="green"))
+    temp_bytes = create_test_image(color="green")
+    temp_file.write_bytes(temp_bytes)
+    real_sha = hashlib.sha256(temp_bytes).hexdigest()
 
     final_dest = dest_dir / "new_avatar.jpg"
 
@@ -351,8 +354,8 @@ def test_task2_staged_upload_lifecycle_and_idempotent_finalization(tmp_path):
         temp_path=temp_file,
         destination_path=final_dest,
         old_asset_path=old_asset,
-        checksum="hash123",
-        file_size_bytes=len(temp_file.read_bytes())
+        checksum=real_sha,
+        file_size_bytes=len(temp_bytes)
     )
     assert op.status == "STAGED"
     assert old_asset.exists()  # Old asset MUST remain intact!

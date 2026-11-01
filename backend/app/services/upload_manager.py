@@ -39,6 +39,7 @@ logger = logging.getLogger("upload_manager")
 
 DEFAULT_UPLOAD_LEASE_SECONDS = 300  # 5 minutes
 STAGED_EXPIRY_MINUTES = 60  # Staged uploads older than 60m without DB commit are considered abandoned
+DEFAULT_ORPHAN_TEMP_MIN_AGE_SECONDS = 1800  # 30 minutes safe age threshold for untracked temporary files
 
 
 class UploadOwnershipLostError(HTTPException):
@@ -65,9 +66,6 @@ def _verify_file_integrity(file_path: Path, expected_checksum: Optional[str], ex
         if file_path.stat().st_size != expected_size:
             return False
     if expected_checksum:
-        # If expected_checksum is the legacy placeholder 'hash123' used in older tests, treat as valid if size matches
-        if expected_checksum == "hash123":
-            return True
         actual_chk = compute_file_sha256(file_path)
         if actual_chk.lower() != expected_checksum.lower():
             return False
@@ -99,10 +97,17 @@ def _atomic_replace(src: Path, dst: Path) -> None:
 
 
 class UploadManager:
-    def __init__(self, storage_root: Optional[Path] = None, temp_root: Optional[Path] = None, worker_id: str = CURRENT_WORKER_ID):
+    def __init__(
+        self,
+        storage_root: Optional[Path] = None,
+        temp_root: Optional[Path] = None,
+        worker_id: str = CURRENT_WORKER_ID,
+        orphan_min_age_seconds: int = DEFAULT_ORPHAN_TEMP_MIN_AGE_SECONDS
+    ):
         self.storage_root = storage_root or settings.data_dir
         self.temp_root = temp_root or settings.temp_dir
         self.worker_id = worker_id
+        self.orphan_min_age_seconds = orphan_min_age_seconds
 
     def start_staged_upload(
         self,
@@ -622,7 +627,11 @@ class UploadManager:
             return True
         return False
 
-    def recover_staged_uploads(self, db: Session) -> Dict[str, int]:
+    def recover_staged_uploads(
+        self,
+        db: Session,
+        orphan_min_age_seconds: Optional[int] = None
+    ) -> Dict[str, int]:
         """
         Startup and background recovery coordinator:
         - Atomically claims each eligible DB_COMMITTED upload.
@@ -630,6 +639,8 @@ class UploadManager:
         - Verifies or finalizes uploads safely.
         - Reverts entity reference if file is missing or corrupt.
         - Cleans expired STAGED uploads safely without deleting active uploads.
+        - Safely cleans orphaned .tmp files respecting the safe age threshold so in-flight
+          uploads are never deleted before database staging.
         - Multiple instances protected against concurrent cleanup.
         """
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -673,16 +684,46 @@ class UploadManager:
             if self.claim_and_clean_staged_upload(db, op.id, worker_id=self.worker_id):
                 stats["staged_cleaned"] += 1
 
-        # 3. Clean orphaned .tmp files in settings.temp_dir
+        # 3. Clean orphaned .tmp files in settings.temp_dir respecting safe age threshold
+        orphan_threshold = (
+            orphan_min_age_seconds
+            if orphan_min_age_seconds is not None
+            else self.orphan_min_age_seconds
+        )
         if self.temp_root.exists():
             for tmp_file in self.temp_root.glob("*.tmp"):
+                try:
+                    st = tmp_file.stat()
+                    mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).replace(tzinfo=None)
+                except OSError:
+                    continue
+
+                # Check if tracked by an operation
                 tracked = db.query(UploadOperation).filter(
-                    UploadOperation.temp_path == str(tmp_file),
-                    UploadOperation.status.in_(["STAGED", "DB_COMMITTED"])
+                    UploadOperation.temp_path == str(tmp_file)
                 ).first()
-                if not tracked:
+
+                if tracked:
+                    # If tracked by an already finished/terminal operation (FAILED or FINALIZED),
+                    # the staged temp file was left over from an interrupted cleanup or crash.
+                    if tracked.status in ("FAILED", "FINALIZED"):
+                        try:
+                            tmp_file.unlink(missing_ok=True)
+                            stats["staged_cleaned"] += 1
+                        except OSError:
+                            pass
+                    # If status is STAGED or DB_COMMITTED, it is handled in steps 1 or 2; skip.
+                else:
+                    # Untracked temporary file:
+                    # Safe age threshold: Never delete recently created or modified temporary files.
+                    # In-progress uploads by any application instance may be streaming before DB commit.
+                    if (now - mtime) < timedelta(seconds=orphan_threshold):
+                        continue
+
+                    # Untracked and older than safe threshold: genuinely abandoned
                     try:
                         tmp_file.unlink(missing_ok=True)
+                        stats["staged_cleaned"] += 1
                     except OSError:
                         pass
 

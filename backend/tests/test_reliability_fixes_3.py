@@ -10,6 +10,7 @@ Tests for AI Film Studio – Reliability Fixes 3:
 """
 
 import os
+import time
 import sqlite3
 import hashlib
 import concurrent.futures
@@ -22,7 +23,11 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.database import run_migrations
 from backend.app.models.entities import Project, Character, Location, UploadOperation, CostRecord
-from backend.app.services.upload_manager import UploadManager, UploadOwnershipLostError
+from backend.app.services.upload_manager import (
+    UploadManager,
+    UploadOwnershipLostError,
+    _verify_file_integrity
+)
 from backend.app.services.security import compute_file_sha256
 
 
@@ -741,3 +746,311 @@ def test_task4_recovery_after_cleanup_interruption(tmp_path):
     assert not temp_f.exists()
 
     session.close()
+
+
+# ==============================================================================
+# TASK 1 & 2 REGRESSION TESTS: UNTRACKED SAFE AGE & CHECKSUM VERIFICATION
+# ==============================================================================
+
+def test_untracked_active_temp_file_not_deleted_by_recovery(tmp_path):
+    """
+    TASK 1: An active in-progress upload writes a .tmp file before DB commit.
+    Recovery MUST NOT delete recently created untracked temporary files.
+    """
+    storage_root = tmp_path / "storage_untracked_active"
+    storage_root.mkdir()
+    temp_dir = storage_root / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    db_file = tmp_path / "untracked_active.db"
+    db_url = f"sqlite:///{db_file}"
+    run_migrations(db_url)
+
+    engine = create_engine(db_url)
+    SessionMaker = sessionmaker(bind=engine)
+    session = SessionMaker()
+
+    # Create an in-flight temporary file written seconds ago (no DB record yet!)
+    active_temp = temp_dir / "streaming_upload_123.tmp"
+    active_temp.write_bytes(b"actively_streaming_bytes_not_yet_in_db")
+
+    um = UploadManager(storage_root=storage_root, temp_root=temp_dir, orphan_min_age_seconds=1800)
+
+    # Run recovery coordinator
+    stats = um.recover_staged_uploads(session)
+
+    # In-flight temporary file MUST NOT be deleted!
+    assert active_temp.exists()
+    assert active_temp.read_bytes() == b"actively_streaming_bytes_not_yet_in_db"
+    session.close()
+
+
+def test_abandoned_untracked_temp_file_cleaned_after_age_threshold(tmp_path):
+    """
+    TASK 1: An abandoned untracked temporary file older than safe age threshold IS cleaned.
+    """
+    storage_root = tmp_path / "storage_abandoned"
+    storage_root.mkdir()
+    temp_dir = storage_root / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    db_file = tmp_path / "abandoned.db"
+    db_url = f"sqlite:///{db_file}"
+    run_migrations(db_url)
+
+    engine = create_engine(db_url)
+    SessionMaker = sessionmaker(bind=engine)
+    session = SessionMaker()
+
+    # Create an abandoned temporary file from 2 hours ago
+    abandoned_temp = temp_dir / "abandoned_upload_old.tmp"
+    abandoned_temp.write_bytes(b"abandoned_stale_content")
+    old_time = time.time() - 7200
+    os.utime(abandoned_temp, (old_time, old_time))
+
+    um = UploadManager(storage_root=storage_root, temp_root=temp_dir, orphan_min_age_seconds=1800)
+
+    # Run recovery coordinator
+    stats = um.recover_staged_uploads(session)
+
+    # Abandoned file MUST be cleaned up
+    assert not abandoned_temp.exists()
+    assert stats["staged_cleaned"] >= 1
+    session.close()
+
+
+def test_concurrent_recovery_attempts_from_multiple_workers(tmp_path):
+    """
+    TASK 1 & 4: Concurrent recovery from multiple workers:
+    - 1 DB_COMMITTED upload
+    - 1 expired STAGED upload
+    - 1 active STAGED upload
+    - 1 recent untracked in-flight temp file
+    - 1 old abandoned untracked temp file
+    Runs recovery across 3 concurrent threads; verifies idempotency and correctness.
+    """
+    storage_root = tmp_path / "storage_concurrent_rec"
+    storage_root.mkdir()
+    temp_dir = storage_root / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    dest_dir = storage_root / "dest"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    db_file = tmp_path / "concurrent_rec.db"
+    db_url = f"sqlite:///{db_file}"
+    run_migrations(db_url)
+
+    engine = create_engine(db_url, pool_size=5, max_overflow=5)
+    SessionMaker = sessionmaker(bind=engine)
+    init_session = SessionMaker()
+
+    proj = Project(id="p-con-rec", name="Concurrent Rec Proj")
+    init_session.add(proj)
+    init_session.commit()
+
+    # 1. DB_COMMITTED upload ready for finalization
+    data_comm = create_sample_image(b"committed_file")
+    sha_comm = hashlib.sha256(data_comm).hexdigest()
+    temp_comm = temp_dir / "comm.tmp"
+    temp_comm.write_bytes(data_comm)
+    dest_comm = dest_dir / "comm.png"
+
+    um_init = UploadManager(storage_root=storage_root, temp_root=temp_dir, worker_id="init")
+    op_comm = um_init.start_staged_upload(
+        db=init_session,
+        project_id="p-con-rec",
+        entity_type="character_reference",
+        entity_id="c-comm",
+        temp_path=temp_comm,
+        destination_path=dest_comm,
+        checksum=sha_comm,
+        file_size_bytes=len(data_comm)
+    )
+    um_init.mark_db_committed(init_session, op_comm.id)
+    # Clear worker claim to make it eligible for recovery
+    op_comm.worker_id = None
+    op_comm.lease_expires_at = None
+    init_session.commit()
+
+    # 2. Expired STAGED upload
+    temp_exp = temp_dir / "expired_staged.tmp"
+    temp_exp.write_bytes(b"expired_data")
+    op_exp = um_init.start_staged_upload(
+        db=init_session,
+        project_id="p-con-rec",
+        entity_type="character_reference",
+        entity_id="c-exp",
+        temp_path=temp_exp,
+        destination_path=dest_dir / "expired_staged.png"
+    )
+    past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20)
+    init_session.execute(
+        text("UPDATE upload_operations SET lease_expires_at = :past WHERE id = :id"),
+        {"past": past, "id": op_exp.id}
+    )
+    init_session.commit()
+
+    # 3. Active STAGED upload (future lease)
+    temp_act = temp_dir / "active_staged.tmp"
+    temp_act.write_bytes(b"active_data")
+    op_act = um_init.start_staged_upload(
+        db=init_session,
+        project_id="p-con-rec",
+        entity_type="character_reference",
+        entity_id="c-act",
+        temp_path=temp_act,
+        destination_path=dest_dir / "active_staged.png"
+    )
+
+    # 4. Recent untracked temporary file (written right now)
+    recent_untracked = temp_dir / "recent_untracked.tmp"
+    recent_untracked.write_bytes(b"recent_bytes")
+
+    # 5. Old abandoned untracked temporary file (2 hours old)
+    old_abandoned = temp_dir / "old_abandoned.tmp"
+    old_abandoned.write_bytes(b"abandoned_bytes")
+    old_t = time.time() - 7200
+    os.utime(old_abandoned, (old_t, old_t))
+
+    init_session.close()
+
+    def run_worker_recovery(w_id: str):
+        mgr = UploadManager(storage_root=storage_root, temp_root=temp_dir, worker_id=w_id, orphan_min_age_seconds=1800)
+        with SessionMaker() as sess:
+            return mgr.recover_staged_uploads(sess)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futs = [executor.submit(run_worker_recovery, f"worker-rec-{i}") for i in range(3)]
+        results = [f.result() for f in concurrent.futures.as_completed(futs)]
+
+    # Exactly 1 recovery finalized the committed upload
+    total_finalized = sum(r["finalized"] for r in results)
+    assert total_finalized == 1
+    assert dest_comm.exists()
+
+    # Expired staged upload was cleaned
+    assert not temp_exp.exists()
+
+    # Active staged upload remains intact
+    assert temp_act.exists()
+
+    # Recent untracked temp file remains intact!
+    assert recent_untracked.exists()
+
+    # Old abandoned temp file was cleaned!
+    assert not old_abandoned.exists()
+
+    engine.dispose()
+
+
+def test_valid_sha256_verification(tmp_path):
+    """TASK 2: Valid SHA-256 and matching size pass integrity verification."""
+    f = tmp_path / "valid.bin"
+    content = b"exact_content_for_hash_verification"
+    f.write_bytes(content)
+    real_sha = hashlib.sha256(content).hexdigest()
+
+    assert _verify_file_integrity(f, real_sha, len(content)) is True
+    # Case insensitivity
+    assert _verify_file_integrity(f, real_sha.upper(), len(content)) is True
+
+
+def test_invalid_checksum_rejected_no_hash123_bypass(tmp_path):
+    """
+    TASK 2: The 'hash123' bypass is removed. Any checksum mismatch is strictly rejected.
+    """
+    f = tmp_path / "reject.bin"
+    content = b"some_file_content"
+    f.write_bytes(content)
+
+    # 1. 'hash123' must be REJECTED unless the content actually hashes to 'hash123'
+    assert _verify_file_integrity(f, "hash123", len(content)) is False
+
+    # 2. Wrong hex SHA-256 must be REJECTED
+    wrong_sha = hashlib.sha256(b"completely_different_content").hexdigest()
+    assert _verify_file_integrity(f, wrong_sha, len(content)) is False
+
+
+def test_mismatched_file_size_rejected(tmp_path):
+    """TASK 2: Matching checksum with mismatched file size is rejected."""
+    f = tmp_path / "size_mismatch.bin"
+    content = b"content_for_size_test"
+    f.write_bytes(content)
+    real_sha = hashlib.sha256(content).hexdigest()
+
+    # Correct checksum, wrong size
+    assert _verify_file_integrity(f, real_sha, len(content) + 5) is False
+    assert _verify_file_integrity(f, real_sha, 0) is True  # 0 or None skips size check
+    assert _verify_file_integrity(f, real_sha, None) is True
+
+
+def test_negative_finalize_upload_corrupt_checksum_rejection(tmp_path):
+    """
+    TASK 2: Staged file with corrupt checksum raises ValueError, reverts entity reference,
+    preserves old asset, and marks operation FAILED.
+    """
+    storage_root = tmp_path / "storage_corrupt"
+    storage_root.mkdir()
+    um = UploadManager(storage_root=storage_root, worker_id="worker-corrupt")
+
+    db_file = tmp_path / "corrupt_chk.db"
+    db_url = f"sqlite:///{db_file}"
+    run_migrations(db_url)
+
+    engine = create_engine(db_url)
+    SessionMaker = sessionmaker(bind=engine)
+    session = SessionMaker()
+
+    proj = Project(id="p-corrupt", name="Corrupt Proj")
+    char = Character(id="c-corrupt", project_id="p-corrupt", name="Hero")
+    session.add_all([proj, char])
+    session.commit()
+
+    ref_dir = storage_root / "projects" / "p-corrupt" / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    old_asset = ref_dir / "old_hero.png"
+    old_asset.write_bytes(create_sample_image(b"original_good_data"))
+    char.reference_image_path = "projects/p-corrupt/references/old_hero.png"
+    session.commit()
+
+    temp_f = storage_root / "corrupted_file.tmp"
+    temp_f.write_bytes(create_sample_image(b"tampered_data"))
+    dest_f = ref_dir / "new_hero.png"
+
+    # Expected checksum is different from actual tampered_data
+    expected_sha = hashlib.sha256(b"legitimate_untampered_content").hexdigest()
+
+    op = um.start_staged_upload(
+        db=session,
+        project_id="p-corrupt",
+        entity_type="character_reference",
+        entity_id="c-corrupt",
+        temp_path=temp_f,
+        destination_path=dest_f,
+        old_asset_path=old_asset,
+        checksum=expected_sha,
+        file_size_bytes=len(temp_f.read_bytes())
+    )
+    char.reference_image_path = "projects/p-corrupt/references/new_hero.png"
+    um.mark_db_committed(session, op.id)
+    session.commit()
+
+    # Finalization must fail because staged file fails SHA-256 integrity
+    with pytest.raises(ValueError) as exc:
+        um.finalize_upload(session, op.id, worker_id="worker-corrupt", fencing_token=op.fencing_token)
+
+    assert "integrity verification" in str(exc.value)
+
+    # Entity reference reverted
+    session.refresh(char)
+    assert "old_hero.png" in char.reference_image_path
+
+    # Old asset preserved
+    assert old_asset.exists()
+
+    # Operation marked FAILED
+    session.refresh(op)
+    assert op.status == "FAILED"
+
+    session.close()
+

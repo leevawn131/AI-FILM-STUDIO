@@ -15,6 +15,7 @@ Environment Configuration:
 """
 
 import os
+import time
 import uuid
 import hashlib
 import concurrent.futures
@@ -514,4 +515,122 @@ def test_pg_stale_upload_worker_fenced_off(pg_session_factory, tmp_path):
 
     # Now old asset is cleanly removed
     assert not old_asset.exists()
+
+
+def test_pg_concurrent_recover_staged_uploads_multi_instance(pg_session_factory, tmp_path):
+    """
+    TASK 1 & 3 on PostgreSQL: Multiple concurrent worker instances running recover_staged_uploads().
+    - 1 DB_COMMITTED upload (must be claimed and finalized by exactly 1 worker).
+    - 1 expired STAGED upload (must be cleaned by exactly 1 worker).
+    - 1 active STAGED upload (must remain active and preserved).
+    - 1 recent untracked temp file (must remain intact, protected by safe age threshold).
+    - 1 abandoned untracked temp file (older than threshold, must be cleaned).
+    """
+    storage_root = tmp_path / "pg_multi_rec"
+    storage_root.mkdir()
+    temp_dir = storage_root / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    dest_dir = storage_root / "dest"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    project_id = f"pg-proj-mrec-{uuid.uuid4().hex[:8]}"
+
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG Multi Rec Proj")
+        session.add(proj)
+        session.commit()
+
+        # 1. DB_COMMITTED upload
+        content_comm = b"pg_comm_file_bytes"
+        sha_comm = hashlib.sha256(content_comm).hexdigest()
+        temp_comm = temp_dir / "pg_comm.tmp"
+        temp_comm.write_bytes(content_comm)
+        dest_comm = dest_dir / "pg_comm.png"
+
+        init_mgr = UploadManager(storage_root=storage_root, temp_root=temp_dir, worker_id="pg-init")
+        op_comm = init_mgr.start_staged_upload(
+            db=session,
+            project_id=project_id,
+            entity_type="character_reference",
+            entity_id="c-pg-comm",
+            temp_path=temp_comm,
+            destination_path=dest_comm,
+            checksum=sha_comm,
+            file_size_bytes=len(content_comm)
+        )
+        init_mgr.mark_db_committed(session, op_comm.id)
+        # Clear claim to make it eligible
+        op_comm.worker_id = None
+        op_comm.lease_expires_at = None
+        session.commit()
+
+        # 2. Expired STAGED upload
+        temp_exp = temp_dir / "pg_exp.tmp"
+        temp_exp.write_bytes(b"pg_exp_bytes")
+        op_exp = init_mgr.start_staged_upload(
+            db=session,
+            project_id=project_id,
+            entity_type="character_reference",
+            entity_id="c-pg-exp",
+            temp_path=temp_exp,
+            destination_path=dest_dir / "pg_exp.png"
+        )
+        past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20)
+        session.execute(
+            text("UPDATE upload_operations SET lease_expires_at = :past WHERE id = :id"),
+            {"past": past, "id": op_exp.id}
+        )
+        session.commit()
+
+        # 3. Active STAGED upload
+        temp_act = temp_dir / "pg_act.tmp"
+        temp_act.write_bytes(b"pg_act_bytes")
+        init_mgr.start_staged_upload(
+            db=session,
+            project_id=project_id,
+            entity_type="character_reference",
+            entity_id="c-pg-act",
+            temp_path=temp_act,
+            destination_path=dest_dir / "pg_act.png"
+        )
+
+        # 4. Recent untracked temp file (0 seconds old)
+        recent_untracked = temp_dir / "pg_recent_untracked.tmp"
+        recent_untracked.write_bytes(b"pg_recent_untracked_bytes")
+
+        # 5. Abandoned untracked temp file (2 hours old)
+        abandoned_untracked = temp_dir / "pg_abandoned_untracked.tmp"
+        abandoned_untracked.write_bytes(b"pg_abandoned_untracked_bytes")
+        old_ts = time.time() - 7200
+        os.utime(abandoned_untracked, (old_ts, old_ts))
+
+    def pg_worker_recovery(w_idx: int):
+        with pg_session_factory() as s:
+            mgr = UploadManager(
+                storage_root=storage_root,
+                temp_root=temp_dir,
+                worker_id=f"pg-worker-rec-{w_idx}",
+                orphan_min_age_seconds=1800
+            )
+            return mgr.recover_staged_uploads(s)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futs = [executor.submit(pg_worker_recovery, i) for i in range(3)]
+        results = [f.result() for f in concurrent.futures.as_completed(futs)]
+
+    # Exactly 1 worker finalized the committed upload
+    assert sum(r["finalized"] for r in results) == 1
+    assert dest_comm.exists()
+
+    # Expired staged upload temp was cleaned
+    assert not temp_exp.exists()
+
+    # Active staged temp remains
+    assert temp_act.exists()
+
+    # Recent untracked temp file MUST remain intact
+    assert recent_untracked.exists()
+
+    # Abandoned untracked temp file MUST be cleaned
+    assert not abandoned_untracked.exists()
+
 
