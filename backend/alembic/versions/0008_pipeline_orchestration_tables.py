@@ -37,7 +37,7 @@ def upgrade() -> None:
         if 'pipeline_overall_status' not in proj_cols:
             batch_op.add_column(sa.Column('pipeline_overall_status', sa.String(32), nullable=False, server_default='in_progress'))
 
-    # 2. Create pipeline_stage_states table (published schema with CASCADE; converted to RESTRICT in 0009)
+    # 2. Create pipeline_stage_states table
     if 'pipeline_stage_states' not in tables:
         op.create_table(
             'pipeline_stage_states',
@@ -61,7 +61,7 @@ def upgrade() -> None:
         op.create_index('ix_pipeline_stage_states_stage_name', 'pipeline_stage_states', ['stage_name'])
         op.create_index('ix_pipeline_stage_states_status', 'pipeline_stage_states', ['status'])
 
-    # 3. Create pipeline_checkpoints table (published schema with CASCADE; converted to RESTRICT in 0009)
+    # 3. Create pipeline_checkpoints table
     if 'pipeline_checkpoints' not in tables:
         op.create_table(
             'pipeline_checkpoints',
@@ -140,61 +140,14 @@ def downgrade() -> None:
     inspector = sa.inspect(bind)
     tables = set(inspector.get_table_names())
 
-    # Protect against silent destruction of audit history with validated administrative archival
+    # Protect against silent destruction of audit history
     if 'pipeline_checkpoint_audit' in tables:
         count = bind.execute(sa.text("SELECT count(*) FROM pipeline_checkpoint_audit")).scalar() or 0
-        if count > 0:
-            archive_path_str = os.environ.get("AUDIT_ARCHIVE_PATH")
-            if not archive_path_str:
-                raise RuntimeError(
-                    f"Refusing destructive downgrade: 'pipeline_checkpoint_audit' contains {count} audit record(s). "
-                    "Audit records are immutable compliance journals and cannot be silently destroyed. "
-                    "To downgrade, you must first archive the audit records using: "
-                    "AUDIT_ARCHIVE_PATH=/path/to/audit_archive.json alembic downgrade <rev>"
-                )
-
-            import json
-            from pathlib import Path
-            archive_path = Path(archive_path_str)
-            if not archive_path.parent.exists():
-                archive_path.parent.mkdir(parents=True, exist_ok=True)
-
-            rows = bind.execute(sa.text("SELECT * FROM pipeline_checkpoint_audit")).mappings().all()
-            serializable_rows = [dict(r) for r in rows]
-            for r in serializable_rows:
-                for k, v in r.items():
-                    if hasattr(v, "isoformat"):
-                        r[k] = v.isoformat()
-
-            with open(archive_path, "w", encoding="utf-8") as f:
-                json.dump(serializable_rows, f, indent=2)
-
-            if not archive_path.exists() or archive_path.stat().st_size == 0:
-                raise RuntimeError(f"Audit archive verification failed: archive file '{archive_path}' is missing or empty.")
-
-            with open(archive_path, "r", encoding="utf-8") as f:
-                archived_data = json.load(f)
-
-            if len(archived_data) != count:
-                raise RuntimeError(
-                    f"Audit archive verification failed: expected {count} records in '{archive_path}', found {len(archived_data)}."
-                )
-
-            # Deep record-level verification: ensure EVERY source audit record is preserved exactly
-            archived_by_id = {rec.get("id"): rec for rec in archived_data if isinstance(rec, dict)}
-            for src_row in serializable_rows:
-                src_id = src_row.get("id")
-                if src_id not in archived_by_id:
-                    raise RuntimeError(
-                        f"Audit archive verification failed: source audit record id '{src_id}' missing from archive."
-                    )
-                archived_rec = archived_by_id[src_id]
-                for key in ["project_id", "checkpoint_type", "decision", "artifact_content_hash", "artifact_version"]:
-                    if str(archived_rec.get(key)) != str(src_row.get(key)):
-                        raise RuntimeError(
-                            f"Audit archive verification failed for record '{src_id}': field '{key}' mismatch "
-                            f"(source: {src_row.get(key)}, archive: {archived_rec.get(key)})."
-                        )
+        if count > 0 and os.environ.get("FORCE_AUDIT_PURGE") != "1":
+            raise RuntimeError(
+                f"Cannot downgrade migration: 'pipeline_checkpoint_audit' contains {count} audit record(s). "
+                "Audit history is immutable. Set environment variable FORCE_AUDIT_PURGE=1 to force purge during downgrade."
+            )
 
     dialect_name = bind.dialect.name
     if dialect_name == 'sqlite':
