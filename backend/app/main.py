@@ -7,7 +7,7 @@ from backend.app.config import settings
 from backend.app.database import init_db, SessionLocal
 from backend.app.models.entities import Project, Character, Location, Scene, Shot
 from backend.app.services.pipeline_orchestrator import initialize_project_pipeline
-from backend.app.routers import projects, dashboard, cost, screenplay, storyboard, characters, locations, flow_handoff, media, editor, audio, export, system, jobs
+from backend.app.routers import projects, dashboard, cost, screenplay, storyboard, characters, locations, flow_handoff, media, editor, audio, export, system, jobs, pipeline
 
 def seed_initial_demo_if_empty(force: bool = False):
     if not settings.seed_demo_data and not force:
@@ -196,6 +196,7 @@ app.include_router(audio.router)
 app.include_router(export.router)
 app.include_router(system.router)
 app.include_router(jobs.router)
+app.include_router(pipeline.router)
 
 @app.get("/api/health")
 def health_check():

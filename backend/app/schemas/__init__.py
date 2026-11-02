@@ -12,6 +12,16 @@ from backend.app.schemas.entities import (
     ExportJobCreate, ExportJobResponse,
     StudioJobResponse, RecordFlowUsageRequest
 )
+from backend.app.schemas.pipeline import (
+    JobSummaryResponse,
+    PipelineStageResponse,
+    PipelineStageDetailResponse,
+    PipelineCheckpointResponse,
+    PipelineCheckpointAuditItem,
+    PipelineCheckpointDetailResponse,
+    PipelineAuditHistoryResponse,
+    PipelineStatusResponse
+)
 
 __all__ = [
     "ProjectBase", "ProjectCreate", "ProjectUpdate", "ProjectResponse", "DashboardStats",
@@ -23,5 +33,13 @@ __all__ = [
     "AudioTrackBase", "AudioTrackCreate", "AudioTrackUpdate", "AudioTrackResponse",
     "CostRecordResponse", "BudgetSummary",
     "ExportJobCreate", "ExportJobResponse",
-    "StudioJobResponse", "RecordFlowUsageRequest"
+    "StudioJobResponse", "RecordFlowUsageRequest",
+    "JobSummaryResponse",
+    "PipelineStageResponse",
+    "PipelineStageDetailResponse",
+    "PipelineCheckpointResponse",
+    "PipelineCheckpointAuditItem",
+    "PipelineCheckpointDetailResponse",
+    "PipelineAuditHistoryResponse",
+    "PipelineStatusResponse"
 ]

@@ -52,6 +52,20 @@ PIPELINE_CHECKPOINTS = [
     ("final_review", "assembly_cut")
 ]
 
+STAGE_CHECKPOINT_MAPPING = {
+    "screenplay": "story_approval",
+    "location_design": "visual_approval",
+    "cinematic_prompts": "production_approval",
+    "audio_mixing": "final_review",
+}
+
+CHECKPOINT_PREREQUISITE_STAGE = {
+    "story_approval": "screenplay",
+    "visual_approval": "location_design",
+    "production_approval": "cinematic_prompts",
+    "final_review": "audio_mixing",
+}
+
 
 def is_pipeline_complete(db: Session, project_id: str) -> bool:
     """
@@ -315,6 +329,9 @@ class PipelineOrchestrator:
         stage_order = {name: idx for idx, name in enumerate(PIPELINE_STAGES)}
         sorted_stages = sorted(stages, key=lambda s: stage_order.get(s.stage_name, 99))
 
+        cp_order = {cp[0]: idx for idx, cp in enumerate(PIPELINE_CHECKPOINTS)}
+        sorted_checkpoints = sorted(checkpoints, key=lambda c: cp_order.get(c.checkpoint_type, 99))
+
         return {
             "project_id": project.id,
             "project_name": project.name,
@@ -323,22 +340,27 @@ class PipelineOrchestrator:
             "stages": [
                 {
                     "id": s.id,
+                    "project_id": s.project_id,
                     "stage_name": s.stage_name,
                     "status": s.status,
+                    "order_index": stage_order.get(s.stage_name, 0) + 1,
                     "active_job_id": s.active_job_id,
                     "retry_count": s.retry_count,
                     "content_hash": s.content_hash,
                     "consumed_input_hash": s.consumed_input_hash,
                     "error_message": s.error_message,
                     "stage_metadata": s.stage_metadata,
-                    "started_at": s.started_at.isoformat() if s.started_at else None,
-                    "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                    "started_at": s.started_at,
+                    "completed_at": s.completed_at,
+                    "created_at": s.created_at,
+                    "updated_at": s.updated_at,
                 }
                 for s in sorted_stages
             ],
             "checkpoints": [
                 {
                     "id": cp.id,
+                    "project_id": cp.project_id,
                     "checkpoint_type": cp.checkpoint_type,
                     "status": cp.status,
                     "artifact_type": cp.artifact_type,
@@ -346,10 +368,309 @@ class PipelineOrchestrator:
                     "artifact_content_hash": cp.artifact_content_hash,
                     "reviewer_name": cp.reviewer_name,
                     "feedback_notes": cp.feedback_notes,
-                    "decided_at": cp.decided_at.isoformat() if cp.decided_at else None,
+                    "decided_at": cp.decided_at,
+                    "created_at": cp.created_at,
+                    "updated_at": cp.updated_at,
                 }
-                for cp in checkpoints
+                for cp in sorted_checkpoints
             ]
+        }
+
+    @staticmethod
+    def get_stage_detail(db: Session, project_id: str, stage_name: str) -> Dict[str, Any]:
+        """
+        Retrieves detailed information for an individual pipeline stage,
+        including associated background job information and associated checkpoint.
+        """
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project or project.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        if stage_name not in PIPELINE_STAGES:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Stage '{stage_name}' not found. Valid stages: {', '.join(PIPELINE_STAGES)}"
+            )
+
+        if not is_pipeline_complete(db, project_id):
+            initialize_project_pipeline(project_id, db, auto_commit=True)
+            db.refresh(project)
+
+        stage = db.query(PipelineStageState).filter(
+            PipelineStageState.project_id == project_id,
+            PipelineStageState.stage_name == stage_name
+        ).first()
+
+        if not stage:
+            raise HTTPException(status_code=404, detail=f"Stage '{stage_name}' not found for project '{project_id}'")
+
+        stage_order = {name: idx for idx, name in enumerate(PIPELINE_STAGES)}
+
+        active_job_dict = None
+        if stage.active_job_id:
+            job = db.query(StudioJob).filter(StudioJob.id == stage.active_job_id).first()
+            if job:
+                active_job_dict = {
+                    "id": job.id,
+                    "job_type": job.job_type,
+                    "status": job.status,
+                    "error_message": job.error_message,
+                    "created_at": job.created_at,
+                    "updated_at": job.updated_at,
+                }
+
+        associated_cp_dict = None
+        cp_type = STAGE_CHECKPOINT_MAPPING.get(stage_name)
+        if cp_type:
+            cp = db.query(PipelineCheckpoint).filter(
+                PipelineCheckpoint.project_id == project_id,
+                PipelineCheckpoint.checkpoint_type == cp_type
+            ).first()
+            if cp:
+                associated_cp_dict = {
+                    "id": cp.id,
+                    "project_id": cp.project_id,
+                    "checkpoint_type": cp.checkpoint_type,
+                    "status": cp.status,
+                    "artifact_type": cp.artifact_type,
+                    "artifact_version": cp.artifact_version,
+                    "artifact_content_hash": cp.artifact_content_hash,
+                    "reviewer_name": cp.reviewer_name,
+                    "feedback_notes": cp.feedback_notes,
+                    "decided_at": cp.decided_at,
+                    "created_at": cp.created_at,
+                    "updated_at": cp.updated_at,
+                }
+
+        return {
+            "id": stage.id,
+            "project_id": stage.project_id,
+            "stage_name": stage.stage_name,
+            "status": stage.status,
+            "order_index": stage_order.get(stage.stage_name, 0) + 1,
+            "active_job_id": stage.active_job_id,
+            "retry_count": stage.retry_count,
+            "content_hash": stage.content_hash,
+            "consumed_input_hash": stage.consumed_input_hash,
+            "error_message": stage.error_message,
+            "stage_metadata": stage.stage_metadata,
+            "started_at": stage.started_at,
+            "completed_at": stage.completed_at,
+            "created_at": stage.created_at,
+            "updated_at": stage.updated_at,
+            "active_job": active_job_dict,
+            "associated_checkpoint": associated_cp_dict,
+        }
+
+    @staticmethod
+    def get_checkpoint_detail(db: Session, project_id: str, checkpoint_type: str) -> Dict[str, Any]:
+        """
+        Retrieves detailed approval checkpoint state, hash freshness, and latest audit decision.
+        """
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project or project.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        valid_cp_types = [cp[0] for cp in PIPELINE_CHECKPOINTS]
+        if checkpoint_type not in valid_cp_types:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Checkpoint '{checkpoint_type}' not found. Valid checkpoints: {', '.join(valid_cp_types)}"
+            )
+
+        if not is_pipeline_complete(db, project_id):
+            initialize_project_pipeline(project_id, db, auto_commit=True)
+            db.refresh(project)
+
+        cp = db.query(PipelineCheckpoint).filter(
+            PipelineCheckpoint.project_id == project_id,
+            PipelineCheckpoint.checkpoint_type == checkpoint_type
+        ).first()
+
+        if not cp:
+            raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_type}' not found for project '{project_id}'")
+
+        # Fresh hash calculation (where supported)
+        current_hash = None
+        try:
+            current_hash = PipelineOrchestrator.compute_artifact_hash(db, project_id, cp.artifact_type)
+        except NotImplementedError:
+            current_hash = None
+
+        is_fresh = None
+        if cp.artifact_content_hash and current_hash:
+            is_fresh = (cp.artifact_content_hash == current_hash)
+        elif cp.status == "APPROVED" and not current_hash:
+            is_fresh = False
+
+        # Latest audit record
+        latest_audit = (
+            db.query(PipelineCheckpointAudit)
+            .filter(
+                PipelineCheckpointAudit.project_id == project_id,
+                PipelineCheckpointAudit.checkpoint_type == checkpoint_type
+            )
+            .order_by(PipelineCheckpointAudit.created_at.desc())
+            .first()
+        )
+
+        latest_audit_dict = None
+        if latest_audit:
+            latest_audit_dict = {
+                "id": latest_audit.id,
+                "project_id": latest_audit.project_id,
+                "project_name_snapshot": latest_audit.project_name_snapshot,
+                "checkpoint_id": latest_audit.checkpoint_id,
+                "checkpoint_type": latest_audit.checkpoint_type,
+                "decision": latest_audit.decision,
+                "artifact_content_hash": latest_audit.artifact_content_hash,
+                "artifact_version": latest_audit.artifact_version,
+                "reviewer_name": latest_audit.reviewer_name,
+                "feedback_notes": latest_audit.feedback_notes,
+                "created_at": latest_audit.created_at,
+            }
+
+        return {
+            "id": cp.id,
+            "project_id": cp.project_id,
+            "checkpoint_type": cp.checkpoint_type,
+            "status": cp.status,
+            "artifact_type": cp.artifact_type,
+            "artifact_version": cp.artifact_version,
+            "artifact_content_hash": cp.artifact_content_hash,
+            "current_artifact_hash": current_hash,
+            "is_hash_fresh": is_fresh,
+            "reviewer_name": cp.reviewer_name,
+            "feedback_notes": cp.feedback_notes,
+            "decided_at": cp.decided_at,
+            "created_at": cp.created_at,
+            "updated_at": cp.updated_at,
+            "latest_audit": latest_audit_dict,
+        }
+
+    @staticmethod
+    def get_checkpoint_audit_history(
+        db: Session,
+        project_id: str,
+        checkpoint_type: str,
+        limit: int = 50,
+        offset: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Retrieves paginated, chronological compliance audit records for a checkpoint.
+        """
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project or project.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        valid_cp_types = [cp[0] for cp in PIPELINE_CHECKPOINTS]
+        if checkpoint_type not in valid_cp_types:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Checkpoint '{checkpoint_type}' not found. Valid checkpoints: {', '.join(valid_cp_types)}"
+            )
+
+        cp = db.query(PipelineCheckpoint).filter(
+            PipelineCheckpoint.project_id == project_id,
+            PipelineCheckpoint.checkpoint_type == checkpoint_type
+        ).first()
+
+        checkpoint_id = cp.id if cp else None
+
+        query = db.query(PipelineCheckpointAudit).filter(
+            PipelineCheckpointAudit.project_id == project_id,
+            PipelineCheckpointAudit.checkpoint_type == checkpoint_type
+        )
+
+        total = query.count()
+        records = (
+            query.order_by(PipelineCheckpointAudit.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        items = [
+            {
+                "id": r.id,
+                "project_id": r.project_id,
+                "project_name_snapshot": r.project_name_snapshot,
+                "checkpoint_id": r.checkpoint_id,
+                "checkpoint_type": r.checkpoint_type,
+                "decision": r.decision,
+                "artifact_content_hash": r.artifact_content_hash,
+                "artifact_version": r.artifact_version,
+                "reviewer_name": r.reviewer_name,
+                "feedback_notes": r.feedback_notes,
+                "created_at": r.created_at,
+            }
+            for r in records
+        ]
+
+        return {
+            "project_id": project_id,
+            "checkpoint_type": checkpoint_type,
+            "checkpoint_id": checkpoint_id,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": items,
+        }
+
+    @staticmethod
+    def get_project_audit_history(
+        db: Session,
+        project_id: str,
+        checkpoint_type: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Retrieves paginated compliance audit history across all checkpoints for a project.
+        """
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project or project.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        query = db.query(PipelineCheckpointAudit).filter(
+            PipelineCheckpointAudit.project_id == project_id
+        )
+        if checkpoint_type:
+            query = query.filter(PipelineCheckpointAudit.checkpoint_type == checkpoint_type)
+
+        total = query.count()
+        records = (
+            query.order_by(PipelineCheckpointAudit.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        items = [
+            {
+                "id": r.id,
+                "project_id": r.project_id,
+                "project_name_snapshot": r.project_name_snapshot,
+                "checkpoint_id": r.checkpoint_id,
+                "checkpoint_type": r.checkpoint_type,
+                "decision": r.decision,
+                "artifact_content_hash": r.artifact_content_hash,
+                "artifact_version": r.artifact_version,
+                "reviewer_name": r.reviewer_name,
+                "feedback_notes": r.feedback_notes,
+                "created_at": r.created_at,
+            }
+            for r in records
+        ]
+
+        return {
+            "project_id": project_id,
+            "checkpoint_type": checkpoint_type,
+            "checkpoint_id": None,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": items,
         }
 
     @staticmethod
