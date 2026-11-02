@@ -9,7 +9,7 @@ from backend.app.schemas.entities import SceneCreate, SceneUpdate, SceneResponse
 from backend.app.agents.screenwriter_agent import screenwriter_agent
 from backend.app.services.cost_controller import cost_controller
 from backend.app.services.job_manager import job_manager, sanitize_error_message
-from backend.app.services.pipeline_orchestrator import PipelineOrchestrator
+from backend.app.services.pipeline_orchestrator import PipelineOrchestrator, acquire_project_write_lock
 
 CANONICAL_SCREENPLAY_FIELDS = {
     "slugline", "title", "summary", "script_content",
@@ -77,8 +77,8 @@ def get_scene(scene_id: str, db: Session = Depends(get_db)):
 
 @router.post("", response_model=SceneResponse, status_code=201)
 def create_scene(data: SceneCreate, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == data.project_id).first()
-    if not project:
+    project = acquire_project_write_lock(db, data.project_id)
+    if not project or project.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Project not found")
 
     committed = False
@@ -128,8 +128,8 @@ def create_scene(data: SceneCreate, db: Session = Depends(get_db)):
 
 @router.post("/generate", response_model=SceneResponse)
 def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == data.project_id).first()
-    if not project:
+    project = acquire_project_write_lock(db, data.project_id)
+    if not project or project.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Project not found")
 
     job_payload = {
@@ -256,6 +256,9 @@ def update_scene(scene_id: str, data: SceneUpdate, db: Session = Depends(get_db)
     scene = db.query(Scene).filter(Scene.id == scene_id).first()
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
+    project = acquire_project_write_lock(db, scene.project_id)
+    if not project or project.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Project not found")
 
     try:
         changed_canonical = False
@@ -299,6 +302,9 @@ def delete_scene(scene_id: str, db: Session = Depends(get_db)):
     scene = db.query(Scene).filter(Scene.id == scene_id).first()
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
+    project = acquire_project_write_lock(db, scene.project_id)
+    if not project or project.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Project not found")
 
     try:
         project_id = scene.project_id
@@ -318,6 +324,9 @@ def refine_scene(scene_id: str, req: RefineSceneRequest, db: Session = Depends(g
     scene = db.query(Scene).filter(Scene.id == scene_id).first()
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
+    project = acquire_project_write_lock(db, scene.project_id)
+    if not project or project.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Project not found")
 
     old_content = scene.script_content or ""
     refined = screenwriter_agent.refine_scene(old_content, req.direction)

@@ -10,9 +10,10 @@ Comprehensive Test Suite for S4 M2.2–M2.4:
 import os
 import uuid
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 
 from backend.app.main import app
 from backend.app.database import get_db, run_migrations
@@ -932,3 +933,192 @@ def test_ai_scene_generation_failure_atomicity_and_clean_job_failure(test_db_ses
     assert failed_job is not None
     assert failed_job.status == "FAILED"
     assert "Simulated DB crash" in (failed_job.error_message or "")
+
+
+def test_sqlite_lock_acquisition_and_serialization(tmp_path):
+    """
+    Requirement 6C: SQLite lock acquisition and transaction serialization.
+    - Demonstrates that acquire_project_write_lock acquires BEGIN IMMEDIATE.
+    - Concurrent connection attempting to acquire write lock while held receives 409 database is locked.
+    - After the first transaction commits, the second connection successfully acquires write lock.
+    - Calling acquire_project_write_lock when a DBAPI transaction is already active without write lock raises 409.
+    """
+    from sqlalchemy.orm import sessionmaker
+    from backend.app.services.pipeline_orchestrator import acquire_project_write_lock
+
+    db_file = tmp_path / "sqlite_lock_serialization.db"
+    db_url = f"sqlite:///{db_file}"
+    engine = create_engine(db_url)
+    run_migrations(target_engine=engine, db_url=db_url)
+    SessionFactory = sessionmaker(bind=engine)
+
+    proj_id = str(uuid.uuid4())
+    with SessionFactory() as s:
+        p = Project(id=proj_id, name="SQLite Serialization Film")
+        s.add(p)
+        s.commit()
+
+    s1 = SessionFactory()
+    s2 = SessionFactory()
+
+    try:
+        # 1. s1 acquires project write lock via BEGIN IMMEDIATE
+        p1 = acquire_project_write_lock(s1, proj_id)
+        assert p1 is not None
+
+        # 2. s2 attempts to acquire write lock with a low busy timeout -> 409 Database write lock contention
+        c2 = s2.connection()
+        c2.exec_driver_sql("PRAGMA busy_timeout = 100")
+        with pytest.raises(HTTPException) as excinfo:
+            acquire_project_write_lock(s2, proj_id)
+        assert excinfo.value.status_code == 409
+        assert "locked" in str(excinfo.value.detail).lower()
+
+        # 3. s1 commits and releases the lock
+        s1.commit()
+
+        # 4. s2 can now acquire the project write lock successfully
+        p2 = acquire_project_write_lock(s2, proj_id)
+        assert p2 is not None
+        s2.commit()
+
+        # 5. Calling acquire_project_write_lock when connection is already in an active un-locked transaction
+        s3 = SessionFactory()
+        # Perform an INSERT to trigger active DBAPI transaction without write lock
+        s3.add(Project(id=str(uuid.uuid4()), name="Pre-existing Transaction"))
+        s3.flush()
+        with pytest.raises(HTTPException) as exc_unlocked:
+            acquire_project_write_lock(s3, proj_id)
+        assert exc_unlocked.value.status_code == 409
+        assert "active transaction is already in progress" in str(exc_unlocked.value.detail).lower()
+        s3.rollback()
+        s3.close()
+    finally:
+        s1.close()
+        s2.close()
+        engine.dispose()
+
+
+def test_worker_failure_rejected_when_stage_stale(test_db_session):
+    """
+    Requirement 6D: Worker failure rejected when stage is STALE.
+    - Worker begins executing on H1.
+    - Screenplay mutates to H2 -> stage is invalidated to STALE and active_job_id cleared.
+    - Stale worker calls fail_pipeline_stage -> rejected with JobOwnershipLostError.
+    - Stage remains STALE, neither marked FAILED nor overwritten.
+    """
+    from backend.app.services.job_manager import JobManager, JobOwnershipLostError
+    session, engine = test_db_session
+
+    create_res = client.post("/api/projects", json={"name": "Worker Failure Defense Film"})
+    project_id = create_res.json()["id"]
+
+    sc_res = client.post("/api/scenes", json={
+        "project_id": project_id,
+        "scene_number": 1,
+        "slugline": "INT. BASE - NIGHT",
+        "script_content": "H1 initial draft."
+    })
+    scene_id = sc_res.json()["id"]
+
+    h1 = PipelineOrchestrator.compute_artifact_hash(session, project_id, "screenplay")
+    client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/submit")
+    client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/decision", json={
+        "decision": "APPROVED",
+        "expected_artifact_version": 1,
+        "expected_artifact_hash": h1,
+        "reviewer_name": "Director"
+    })
+
+    # Start character_design worker job on H1
+    jm = JobManager()
+    worker_id = "worker-fail-char-01"
+    job, action = jm.prepare_or_claim_job(
+        db=session,
+        project_id=project_id,
+        job_type="character_generation",
+        payload={"screenplay_hash": h1}
+    )
+    fencing_token = job.fencing_token
+
+    stage = session.query(PipelineStageState).filter(
+        PipelineStageState.project_id == project_id,
+        PipelineStageState.stage_name == "character_design"
+    ).first()
+    stage.status = "IN_PROGRESS"
+    stage.active_job_id = job.id
+    stage.consumed_input_hash = h1
+    session.commit()
+
+    # Screenplay is modified to H2 -> invalidates character_design stage to STALE
+    client.patch(f"/api/scenes/{scene_id}", json={"script_content": "H2 modified content."})
+
+    session.expire_all()
+    stage_stale = session.query(PipelineStageState).filter(
+        PipelineStageState.project_id == project_id,
+        PipelineStageState.stage_name == "character_design"
+    ).first()
+    assert stage_stale.status == "STALE"
+    assert stage_stale.active_job_id is None
+
+    # Stale worker attempts to fail the stage
+    with pytest.raises(JobOwnershipLostError) as excinfo:
+        PipelineOrchestrator.fail_pipeline_stage(
+            db=session,
+            project_id=project_id,
+            stage_name="character_design",
+            active_job_id=job.id,
+            error=RuntimeError("Worker GPU Out of Memory"),
+            worker_id=worker_id,
+            fencing_token=fencing_token
+        )
+    assert "stale" in str(excinfo.value.detail).lower()
+
+    # Stage remains STALE, not overwritten by FAILED
+    session.expire_all()
+    stage_after = session.query(PipelineStageState).filter(
+        PipelineStageState.project_id == project_id,
+        PipelineStageState.stage_name == "character_design"
+    ).first()
+    assert stage_after.status == "STALE"
+
+
+def test_final_commit_fault_injection_in_generate_ai_scene(test_db_session, monkeypatch):
+    """
+    Requirement 6E: Commit fault injection in generate_ai_scene.
+    - Simulates an OperationalError directly during db.commit() in generate_ai_scene.
+    - Verifies that scene addition is rolled back and fail_job executes in a clean transaction.
+    """
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Commit Fault Film"})
+    project_id = create_res.json()["id"]
+
+    orig_commit = Session.commit
+    commit_count = 0
+
+    def mock_commit(self):
+        nonlocal commit_count
+        commit_count += 1
+        # Commit 1 is prepare_or_claim_job. Commit 2 is final commit in generate_ai_scene.
+        if commit_count == 2:
+            from sqlalchemy.exc import OperationalError
+            raise OperationalError("Simulated disk I/O failure during final commit", {}, Exception())
+        return orig_commit(self)
+
+    monkeypatch.setattr(Session, "commit", mock_commit)
+
+    gen_res = client.post("/api/scenes/generate", json={"project_id": project_id, "prompt": "Epic final scene"})
+    assert gen_res.status_code == 500
+
+    # Ensure no scene was committed
+    scenes = client.get(f"/api/scenes/{project_id}").json()
+    assert len(scenes) == 0
+
+    # Ensure job was recorded as FAILED in a clean transaction
+    failed_job = session.query(StudioJob).filter(
+        StudioJob.project_id == project_id,
+        StudioJob.job_type == "screenplay_generate"
+    ).first()
+    assert failed_job is not None
+    assert failed_job.status == "FAILED"
+

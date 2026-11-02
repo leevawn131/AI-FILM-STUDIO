@@ -526,7 +526,7 @@ def test_pg_concurrent_recover_staged_uploads_multi_instance(pg_session_factory,
     - 1 recent untracked temp file (must remain intact, protected by safe age threshold).
     - 1 abandoned untracked temp file (older than threshold, must be cleaned).
     """
-    storage_root = tmp_path / "pg_multi_rec"
+    storage_root = tmp_path / f"pg_multi_rec_{uuid.uuid4().hex[:8]}"
     storage_root.mkdir()
     temp_dir = storage_root / "temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -634,5 +634,229 @@ def test_pg_concurrent_recover_staged_uploads_multi_instance(pg_session_factory,
 
     # Abandoned untracked temp file MUST be cleaned
     assert not abandoned_untracked.exists()
+
+
+def test_pg_concurrent_story_approval_with_barrier(pg_session_factory):
+    """
+    Requirement 6A: PostgreSQL concurrent Story Approval.
+    - Two independent sessions attempt conflicting decisions (APPROVED vs REJECTED).
+    - Synchronized via threading.Barrier to hit row lock simultaneously.
+    - Exactly one decision succeeds (200), loser receives 409 Conflict.
+    - Exactly one decision audit row exists; no state or audit overwritten.
+    """
+    import threading
+    from backend.app.models.entities import PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit
+    from backend.app.services.pipeline_orchestrator import PipelineOrchestrator
+    from backend.app.schemas.pipeline import CheckpointDecisionRequest
+
+    project_id = f"pg-appr-{uuid.uuid4().hex[:8]}"
+
+    # Setup project with screenplay and submit for review
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG Concurrency Film")
+        session.add(proj)
+        session.commit()
+        PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+        sc = Scene(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            scene_number=1,
+            slugline="INT. LAB - NIGHT",
+            script_content="Blue chemicals glow in the dark.",
+            order_index=1
+        )
+        session.add(sc)
+        session.commit()
+
+        sub_res = PipelineOrchestrator.submit_story_for_review(session, project_id)
+        assert sub_res["status"] == "WAITING_FOR_APPROVAL"
+        h1 = sub_res["artifact_content_hash"]
+        v1 = sub_res["artifact_version"]
+
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def reviewer_worker(reviewer_id: str, decision: str):
+        with pg_session_factory() as sess:
+            barrier.wait(timeout=5.0)
+            req = CheckpointDecisionRequest(
+                decision=decision,
+                expected_artifact_version=v1,
+                expected_artifact_hash=h1,
+                reviewer_name=f"Reviewer-{reviewer_id}"
+            )
+            try:
+                dec_res = PipelineOrchestrator.record_story_decision(sess, project_id, req)
+                results[reviewer_id] = {"status": 200, "decision": dec_res["decision"]}
+            except HTTPException as e:
+                results[reviewer_id] = {"status": e.status_code, "error": str(e.detail)}
+            except Exception as e:
+                results[reviewer_id] = {"status": 500, "error": str(e)}
+
+    t1 = threading.Thread(target=reviewer_worker, args=("A", "APPROVED"))
+    t2 = threading.Thread(target=reviewer_worker, args=("B", "REJECTED"))
+
+    t1.start()
+    t2.start()
+    t1.join(timeout=10.0)
+    t2.join(timeout=10.0)
+
+    # Exactly one winner (200) and one loser (409)
+    statuses = [r["status"] for r in results.values()]
+    assert 200 in statuses
+    assert 409 in statuses
+    assert len(statuses) == 2
+
+    # Verify database state consistency
+    with pg_session_factory() as session:
+        cp = session.query(PipelineCheckpoint).filter(
+            PipelineCheckpoint.project_id == project_id,
+            PipelineCheckpoint.checkpoint_type == "story_approval"
+        ).first()
+        winner_decision = [r["decision"] for r in results.values() if r["status"] == 200][0]
+        expected_status = "APPROVED" if winner_decision == "APPROVED" else "REJECTED"
+        assert cp.status == expected_status
+
+        # Audits must have exactly 1 SUBMITTED_FOR_REVIEW and 1 decision audit
+        audits = session.query(PipelineCheckpointAudit).filter(
+            PipelineCheckpointAudit.project_id == project_id
+        ).order_by(PipelineCheckpointAudit.created_at.asc()).all()
+
+        assert len(audits) == 2
+        assert audits[0].decision == "SUBMITTED_FOR_REVIEW"
+        assert audits[1].decision == winner_decision
+
+
+def test_pg_screenplay_mutation_vs_worker_completion_with_barrier(pg_session_factory):
+    """
+    Requirement 6B: PostgreSQL screenplay mutation vs worker completion.
+    - Worker begins executing on screenplay H1.
+    - Another transaction modifies screenplay to H2 and invalidates downstream stages.
+    - Controlled via barrier to verify worker H1 is strictly rejected from completing.
+    - Both StudioJob and PipelineStageState preserve valid uncorrupted states.
+    """
+    import threading
+    from backend.app.models.entities import PipelineStageState, PipelineCheckpoint
+    from backend.app.services.pipeline_orchestrator import PipelineOrchestrator
+    from backend.app.services.job_manager import JobManager, JobOwnershipLostError
+    from backend.app.schemas.pipeline import CheckpointDecisionRequest
+
+    project_id = f"pg-mut-work-{uuid.uuid4().hex[:8]}"
+
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG Mutation vs Worker")
+        session.add(proj)
+        session.commit()
+        PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+        sc = Scene(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            scene_number=1,
+            slugline="INT. BUNKER - DAY",
+            script_content="H1 initial screenplay content.",
+            order_index=1
+        )
+        session.add(sc)
+        session.commit()
+
+        sub = PipelineOrchestrator.submit_story_for_review(session, project_id)
+        h1 = sub["artifact_content_hash"]
+        v1 = sub["artifact_version"]
+
+        PipelineOrchestrator.record_story_decision(
+            session, project_id,
+            CheckpointDecisionRequest(
+                decision="APPROVED",
+                expected_artifact_version=v1,
+                expected_artifact_hash=h1,
+                reviewer_name="Director"
+            )
+        )
+
+        # Setup in-progress character_design stage with leased job
+        jm = JobManager()
+        worker_id = "pg-char-worker-01"
+        job, action = jm.prepare_or_claim_job(
+            db=session,
+            project_id=project_id,
+            job_type="character_generation",
+            payload={"screenplay_hash": h1}
+        )
+        fencing_token = job.fencing_token
+
+        stage = session.query(PipelineStageState).filter(
+            PipelineStageState.project_id == project_id,
+            PipelineStageState.stage_name == "character_design"
+        ).first()
+        stage.status = "IN_PROGRESS"
+        stage.active_job_id = job.id
+        stage.consumed_input_hash = h1
+        session.commit()
+        job_id = job.id
+
+    # Coordination: Mutation transaction finishes and commits first
+    mutation_done = threading.Event()
+    worker_result = {}
+
+    def mutation_worker():
+        with pg_session_factory() as sess:
+            # Acquire lock and mutate screenplay to H2
+            sc_to_edit = sess.query(Scene).filter(Scene.project_id == project_id).first()
+            sc_to_edit.script_content = "H2 radically modified content."
+            PipelineOrchestrator.invalidate_downstream_stages(
+                db=sess,
+                project_id=project_id,
+                changed_stage="screenplay",
+                commit=False
+            )
+            sess.commit()
+            mutation_done.set()
+
+    def stage_completion_worker():
+        # Wait until mutation transaction has committed
+        mutation_done.wait(timeout=5.0)
+        with pg_session_factory() as sess:
+            try:
+                PipelineOrchestrator.complete_pipeline_stage(
+                    db=sess,
+                    project_id=project_id,
+                    stage_name="character_design",
+                    active_job_id=job_id,
+                    worker_id=worker_id,
+                    fencing_token=fencing_token,
+                    result_hash="res-char-h1",
+                    consumed_input_hash=h1
+                )
+                worker_result["completed"] = True
+            except JobOwnershipLostError as e:
+                worker_result["completed"] = False
+                worker_result["error"] = str(e.detail)
+
+    t_mut = threading.Thread(target=mutation_worker)
+    t_work = threading.Thread(target=stage_completion_worker)
+
+    t_mut.start()
+    t_work.start()
+    t_mut.join(timeout=10.0)
+    t_work.join(timeout=10.0)
+
+    # Worker must be rejected because stage became STALE and input H1 != current H2
+    assert worker_result.get("completed") is False
+    assert "stale" in worker_result.get("error", "").lower() or "obsolete" in worker_result.get("error", "").lower()
+
+    # Verify stage remains STALE and StudioJob was NOT completed
+    with pg_session_factory() as session:
+        st = session.query(PipelineStageState).filter(
+            PipelineStageState.project_id == project_id,
+            PipelineStageState.stage_name == "character_design"
+        ).first()
+        assert st.status == "STALE"
+        assert st.active_job_id is None
+
+        jb = session.query(StudioJob).filter(StudioJob.id == job_id).first()
+        assert jb.status != "COMPLETED"
+
 
 

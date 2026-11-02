@@ -566,16 +566,14 @@ export async function optimizeShotPrompt(id: string, characterAnchors?: string):
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ character_anchors: characterAnchors }),
   });
-  if (!res.ok) throw new Error('Failed to optimize shot prompt');
-  return res.json();
+  return parseApiResponse<Shot>(res, 'Failed to optimize shot prompt');
 }
 
 export async function runContinuityCheck(projectId: string): Promise<ContinuityReport> {
   const res = await fetch(`${API_BASE}/storyboard/continuity-check/${projectId}`, {
     method: 'POST',
   });
-  if (!res.ok) throw new Error('Failed to run continuity check');
-  return res.json();
+  return parseApiResponse<ContinuityReport>(res, 'Failed to run continuity check');
 }
 
 // Flow Handoff API methods

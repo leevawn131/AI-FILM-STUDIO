@@ -21,7 +21,7 @@ import json
 import hashlib
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple, Set
-from sqlalchemy import update
+from sqlalchemy import update, event
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -117,28 +117,66 @@ def validate_stage_transition(current_status: str, target_status: str) -> bool:
     return target_status in allowed
 
 
+@event.listens_for(Session, "after_transaction_end")
+def _clear_project_locks(session, transaction):
+    if transaction.nested:
+        return
+    session.info.pop("_locked_projects", None)
+
+
 def acquire_project_write_lock(db: Session, project_id: str) -> Optional[Project]:
     """
     Acquires an exclusive write lock for the project across SQLite and PostgreSQL.
     - PostgreSQL: Executes SELECT ... FOR UPDATE on the Project row to serialize writers.
-    - SQLite: Starts a BEGIN IMMEDIATE transaction if not already in a write transaction,
-      serializing concurrent writers before reading snapshots.
+    - SQLite: Starts a BEGIN IMMEDIATE transaction before reading snapshots,
+      ensuring that transactions are serialized. Reentrant if already held.
+      If connection is already in an un-locked transaction or lock cannot be acquired,
+      rolls back and raises an explicit error.
     """
+    locked_projects = db.info.get("_locked_projects", set())
     bind = db.get_bind()
     dialect = bind.dialect.name if bind else "sqlite"
+
     if dialect == "postgresql":
-        return db.query(Project).filter(Project.id == project_id).with_for_update().first()
+        project = db.query(Project).filter(Project.id == project_id).with_for_update().first()
+        if project:
+            db.info.setdefault("_locked_projects", set()).add(project_id)
+        return project
     else:
+        if project_id in locked_projects:
+            return db.query(Project).filter(Project.id == project_id).first()
+
         conn = db.connection()
         raw_conn = getattr(conn.connection, "dbapi_connection", None)
         if raw_conn is None:
             raw_conn = getattr(conn.connection, "connection", None)
-        if raw_conn is not None and not getattr(raw_conn, "in_transaction", False):
-            try:
-                conn.exec_driver_sql("BEGIN IMMEDIATE")
-            except Exception:
-                pass
-        return db.query(Project).filter(Project.id == project_id).first()
+
+        if raw_conn is not None and getattr(raw_conn, "in_transaction", False):
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot safely acquire SQLite write lock: an active transaction is already in progress on this connection."
+            )
+
+        try:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+        except Exception as lock_err:
+            db.rollback()
+            err_msg = str(lock_err).lower()
+            if "locked" in err_msg or "busy" in err_msg:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Database write lock contention: database is locked by concurrent transaction. Please retry."
+                ) from lock_err
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to acquire SQLite write lock: {lock_err}"
+            ) from lock_err
+
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if project:
+            db.info.setdefault("_locked_projects", set()).add(project_id)
+        return project
 
 
 def is_pipeline_complete(db: Session, project_id: str) -> bool:
@@ -1227,72 +1265,18 @@ class PipelineOrchestrator:
         reviewer_name: str = "Director / User"
     ) -> PipelineCheckpoint:
         """
-        Legacy checkpoint decision recording.
-        Bypassing the Story Approval lifecycle is strictly forbidden.
+        Legacy checkpoint decision recording is disabled and fails closed.
+        All checkpoint mutations must go through dedicated milestone lifecycles.
         """
         if checkpoint_type == "story_approval":
             raise HTTPException(
                 status_code=400,
                 detail="Direct decision on 'story_approval' via legacy record_checkpoint_decision is not permitted. The Story Approval lifecycle (submit_story_for_review and record_story_decision) is the only supported write path."
             )
-
-        if decision not in ("APPROVED", "REJECTED", "REQUEST_CHANGES"):
-            raise HTTPException(status_code=400, detail="Decision must be 'APPROVED', 'REJECTED', or 'REQUEST_CHANGES'")
-
-        project = db.query(Project).filter(Project.id == project_id).first()
-        if not project or project.deleted_at is not None:
-            raise HTTPException(status_code=404, detail="Project not found")
-
-        cp = db.query(PipelineCheckpoint).filter(
-            PipelineCheckpoint.project_id == project_id,
-            PipelineCheckpoint.checkpoint_type == checkpoint_type
-        ).first()
-
-        if not cp:
-            raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_type}' not found")
-
-        try:
-            current_hash = PipelineOrchestrator.compute_artifact_hash(db, project_id, cp.artifact_type)
-        except NotImplementedError:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Canonical artifact hashing for '{cp.artifact_type}' is not implemented. Cannot approve checkpoint '{checkpoint_type}'."
-            )
-
-        if not current_hash:
-            raise HTTPException(status_code=400, detail="Cannot approve checkpoint: artifact outputs have not been generated.")
-
-        target_status = "APPROVED" if decision == "APPROVED" else "REJECTED"
-        if not validate_checkpoint_transition(cp.status, target_status):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Illegal transition: cannot move checkpoint from '{cp.status}' to '{target_status}' directly."
-            )
-
-        now = utc_now()
-        cp.status = target_status
-        cp.artifact_content_hash = current_hash
-        cp.decided_at = now
-        cp.reviewer_name = reviewer_name
-        cp.feedback_notes = notes or ""
-        cp.updated_at = now
-
-        # Append-only immutable audit record
-        audit = PipelineCheckpointAudit(
-            project_id=project.id,
-            project_name_snapshot=project.name,
-            checkpoint_id=cp.id,
-            checkpoint_type=checkpoint_type,
-            decision=decision,
-            artifact_content_hash=current_hash,
-            artifact_version=cp.artifact_version,
-            reviewer_name=reviewer_name,
-            feedback_notes=notes or ""
+        raise HTTPException(
+            status_code=400,
+            detail=f"Checkpoint lifecycle for '{checkpoint_type}' is not implemented. Direct decisions via legacy endpoint are disabled (fail-closed)."
         )
-        db.add(audit)
-        db.commit()
-        db.refresh(cp)
-        return cp
 
     @staticmethod
     def invalidate_downstream_stages(
@@ -1306,7 +1290,7 @@ class PipelineOrchestrator:
         Does not commit when commit=False, allowing callers to atomically bundle invalidation
         with entity mutations in a single transaction.
         """
-        project = db.query(Project).filter(Project.id == project_id).first()
+        project = acquire_project_write_lock(db, project_id)
         if not project or project.deleted_at is not None:
             return
 
@@ -1412,6 +1396,10 @@ class PipelineOrchestrator:
         if fencing_token is None:
             raise JobOwnershipLostError("fencing_token is required to complete pipeline stage")
 
+        project = acquire_project_write_lock(db, project_id)
+        if not project or project.deleted_at is not None:
+            raise JobOwnershipLostError(f"Project '{project_id}' not found")
+
         now = utc_now()
 
         stage = db.query(PipelineStageState).filter(
@@ -1423,13 +1411,20 @@ class PipelineOrchestrator:
             raise JobOwnershipLostError(f"Pipeline stage '{stage_name}' for project '{project_id}' not found")
 
         # Worker input snapshot freshness check
-        if consumed_input_hash:
-            if stage_name in ("character_design", "location_design", "storyboard"):
-                current_screenplay_hash = PipelineOrchestrator.compute_artifact_hash(db, project_id, "screenplay")
-                if current_screenplay_hash and current_screenplay_hash != consumed_input_hash:
-                    raise JobOwnershipLostError(
-                        f"Worker consumed an obsolete input snapshot (input hash '{consumed_input_hash}' != current '{current_screenplay_hash}'). Execution rejected."
-                    )
+        if stage_name in ("character_design", "location_design", "storyboard"):
+            current_screenplay_hash = PipelineOrchestrator.compute_artifact_hash(db, project_id, "screenplay")
+            if not current_screenplay_hash:
+                raise JobOwnershipLostError(
+                    f"Cannot complete stage '{stage_name}': upstream screenplay artifact has no content hash (fail-closed)."
+                )
+            if consumed_input_hash and consumed_input_hash != current_screenplay_hash:
+                raise JobOwnershipLostError(
+                    f"Worker consumed an obsolete input snapshot (input hash '{consumed_input_hash}' != current '{current_screenplay_hash}'). Execution rejected."
+                )
+            if stage.consumed_input_hash and stage.consumed_input_hash != current_screenplay_hash:
+                raise JobOwnershipLostError(
+                    f"Stage input snapshot drifted (stage hash '{stage.consumed_input_hash}' != current '{current_screenplay_hash}'). Execution rejected."
+                )
 
         # Do not allow late completion to move a STALE stage back to COMPLETED
         if stage.status == "STALE":
@@ -1468,7 +1463,7 @@ class PipelineOrchestrator:
                 .values(
                     status="COMPLETED",
                     content_hash=result_hash,
-                    consumed_input_hash=consumed_input_hash,
+                    consumed_input_hash=consumed_input_hash or stage.consumed_input_hash,
                     stage_metadata=stage_metadata,
                     completed_at=now,
                     updated_at=now
@@ -1517,8 +1512,36 @@ class PipelineOrchestrator:
         if fencing_token is None:
             raise JobOwnershipLostError("fencing_token is required to fail pipeline stage")
 
+        project = acquire_project_write_lock(db, project_id)
+        if not project or project.deleted_at is not None:
+            raise JobOwnershipLostError(f"Project '{project_id}' not found")
+
         now = utc_now()
         err_msg = str(error)
+
+        stage = db.query(PipelineStageState).filter(
+            PipelineStageState.project_id == project_id,
+            PipelineStageState.stage_name == stage_name
+        ).first()
+
+        if not stage:
+            raise JobOwnershipLostError(f"Pipeline stage '{stage_name}' for project '{project_id}' not found")
+
+        # Do not allow late failure to move a STALE stage to FAILED
+        if stage.status == "STALE":
+            raise JobOwnershipLostError(
+                f"Pipeline stage '{stage_name}' is STALE due to upstream invalidation. Stale worker execution cannot fail a stale stage."
+            )
+
+        if stage.active_job_id != active_job_id:
+            raise JobOwnershipLostError(
+                f"Pipeline stage '{stage_name}' active job '{stage.active_job_id}' does not match worker job '{active_job_id}'"
+            )
+
+        if not validate_stage_transition(stage.status, "FAILED"):
+            raise JobOwnershipLostError(
+                f"Illegal stage transition: cannot move stage '{stage_name}' from '{stage.status}' to 'FAILED'."
+            )
 
         try:
             # 1. Fail underlying StudioJob with commit=False in the active transaction
@@ -1537,6 +1560,8 @@ class PipelineOrchestrator:
                 .where(PipelineStageState.project_id == project_id)
                 .where(PipelineStageState.stage_name == stage_name)
                 .where(PipelineStageState.active_job_id == active_job_id)
+                .where(PipelineStageState.status != "STALE")
+                .where(PipelineStageState.status.in_(["IN_PROGRESS", "WAITING_FOR_APPROVAL", "WAITING_FOR_EXTERNAL_MEDIA"]))
                 .values(
                     status="FAILED",
                     error_message=err_msg,
@@ -1547,7 +1572,7 @@ class PipelineOrchestrator:
             res = db.execute(stmt)
             if res.rowcount == 0:
                 raise JobOwnershipLostError(
-                    f"Pipeline stage '{stage_name}' for project '{project_id}' is no longer associated with active job '{active_job_id}'"
+                    f"Pipeline stage '{stage_name}' for project '{project_id}' is no longer associated with active job '{active_job_id}' or is STALE"
                 )
 
             # 3. Update derived projections

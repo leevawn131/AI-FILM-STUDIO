@@ -158,7 +158,7 @@ export const ScreenplayView: React.FC<ScreenplayViewProps> = ({
     } catch (err: any) {
       if (err instanceof ApiClientError || typeof err?.status === 'number') {
         if (err.status === 409) {
-          setDecisionError('Pipeline Conflict (409): Screenplay was modified while reviewing. The approval state has been marked STALE. Refreshing review draft...');
+          setDecisionError(`Pipeline Conflict (409): ${err.detail || 'Screenplay state changed concurrently. Refreshing review draft and checkpoint...'}`);
           try {
             const fresh = await fetchStoryReview(activeProject.id);
             setReviewData(fresh);

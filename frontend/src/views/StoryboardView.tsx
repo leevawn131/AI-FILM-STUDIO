@@ -140,7 +140,7 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
           return;
         }
         if (err.status === 409) {
-          setGatekeeperError('Pipeline Conflict (409): Screenplay was modified or approval state is stale. Please review and re-approve.');
+          setGatekeeperError(`Pipeline Conflict (409): ${err.detail || 'Screenplay or approval state was modified concurrently. Refreshing status...'}`);
           loadStoryApproval();
           return;
         }
@@ -243,7 +243,7 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
           return;
         }
         if (err.status === 409) {
-          setGatekeeperError('Pipeline Conflict (409): Screenplay was modified or approval state is stale. Please review and re-approve.');
+          setGatekeeperError(`Pipeline Conflict (409): ${err.detail || 'Screenplay or approval state was modified concurrently. Refreshing status...'}`);
           setShowAddModal(false);
           loadStoryApproval();
           return;
