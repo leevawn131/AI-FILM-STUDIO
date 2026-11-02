@@ -347,75 +347,100 @@ def archive_audit_records(
 def safe_administrative_purge(
     target: Union[Engine, Connection, Session],
     archive_path: Union[str, Path],
-    force: bool = False
+    force: bool = False,
+    _on_lock_acquired: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Safely purges audit records from the database ONLY after strict archive verification succeeds.
 
-    Concurrency & Transaction Guarantees:
-    - Serializes verification and purge under an appropriate database write/table lock:
-      * SQLite: BEGIN IMMEDIATE write transaction.
-      * PostgreSQL: LOCK TABLE pipeline_checkpoint_audit IN ACCESS EXCLUSIVE MODE.
-    - Fetches current source records and verifies the archive under the lock, eliminating race conditions.
-    - If verification fails, rolls back completely without deleting any records or altering triggers.
-    - When target is a Session with unrelated uncommitted changes, uses a savepoint so that the caller's
-      unrelated transaction is not committed.
-    - Preserves support for Session, Connection, and Engine.
+    Transaction Ownership & Concurrency Model:
+    - Engine Target:
+        Function owns the connection and dedicated transaction.
+        Acquires write lock (BEGIN IMMEDIATE on SQLite, ACCESS EXCLUSIVE on Postgres),
+        verifies archive, drops triggers, deletes records, restores triggers, and commits explicitly.
+        Reports status='purged' and is_durable=True.
+    - Connection Target:
+        If connection is not in a transaction, function manages and commits a dedicated transaction
+        (is_durable=True). If caller already owns an active transaction on the connection,
+        the purge is staged within a SAVEPOINT and released into the caller's transaction without
+        calling conn.commit(). Reports status='pending_commit' and is_durable=False.
+    - Session Target:
+        Caller owns the Session. Obtains conn = target.connection().
+        Acquires write lock (BEGIN IMMEDIATE on SQLite before savepoint, ACCESS EXCLUSIVE on Postgres).
+        Purges within a SAVEPOINT (begin_nested) and releases the savepoint into the caller's session.
+        Does NOT commit caller's session. If caller calls session.rollback(), the purge is rolled back.
+        If caller calls session.commit(), the purge and caller changes are committed together.
+        Reports status='pending_commit' and is_durable=False.
+    - Failure Guarantees:
+        On verification failure or any error, rolls back completely. No records are deleted.
     """
     if not force:
         raise AuditArchivalError("Administrative purge requires explicit force=True flag.")
 
-    # 1. Obtain connection and determine ownership & caller context
+    # 1. Determine target type and connection ownership
     owns_connection = False
     is_session = False
+    caller_owns_transaction = False
 
     if isinstance(target, Session):
         conn = target.connection()
         is_session = True
+        caller_owns_transaction = True
     elif isinstance(target, Connection):
         conn = target
+        caller_owns_transaction = conn.in_transaction()
     elif isinstance(target, Engine):
         conn = target.connect()
         owns_connection = True
+        caller_owns_transaction = False
     else:
         raise TypeError(f"Unsupported target type: {type(target).__name__}. Expected Session, Connection, or Engine.")
 
     dialect_name = conn.dialect.name
-    # 2. Manage transaction and acquire write lock to serialize verification and purge
     trans = None
-    try:
-        # Start transaction / savepoint
-        if is_session:
-            if conn.in_transaction():
-                trans = conn.begin_nested()
-            else:
-                trans = conn.begin()
-        elif isinstance(target, Connection):
-            if conn.in_transaction():
-                trans = conn.begin_nested()
-            else:
-                trans = conn.begin()
-        else:  # Engine
-            trans = conn.begin()
+    savepoint = None
 
-        # Acquire database write/table lock before reading source records
+    try:
+        # 2. Acquire database write lock BEFORE opening any savepoint and before reading source records
         if dialect_name == "sqlite":
+            raw_conn = getattr(conn.connection, "dbapi_connection", None)
+            if raw_conn is None:
+                raw_conn = getattr(conn.connection, "connection", None)
+
+            # Check if an existing DBAPI transaction is already active on SQLite
+            if raw_conn is not None and getattr(raw_conn, "in_transaction", False):
+                raise AuditArchivalError(
+                    "Cannot safely acquire SQLite write lock: an existing active caller transaction "
+                    "is already in progress on this connection. Please commit or rollback the active "
+                    "transaction before executing an administrative purge."
+                )
+
             try:
                 conn.exec_driver_sql("BEGIN IMMEDIATE")
-            except Exception:
-                # SQLite already holding transaction or in savepoint
-                pass
+            except Exception as lock_err:
+                raise AuditArchivalError(f"Failed to acquire SQLite BEGIN IMMEDIATE write lock: {lock_err}") from lock_err
+
         elif dialect_name == "postgresql":
+            if not conn.in_transaction():
+                trans = conn.begin()
             conn.execute(text("LOCK TABLE pipeline_checkpoint_audit IN ACCESS EXCLUSIVE MODE"))
 
-        # 3. Read source records while holding the lock
+        # Optional test synchronization hook immediately after lock is acquired
+        if _on_lock_acquired is not None:
+            _on_lock_acquired()
+
+        # 3. If caller owns transaction (Session or caller Connection), isolate purge in a savepoint
+        if caller_owns_transaction:
+            savepoint = conn.begin_nested()
+
+        # 4. Read source records while holding the write lock
         source_records = fetch_source_audit_records(conn)
         count = len(source_records)
 
-        # 4. Verify archive against the locked/current source records
+        # 5. Verify archive against the locked/current source records
         verify_result = verify_audit_archive(source_records, archive_path)
 
-        # 5. Perform deletion and trigger management atomically
+        # 6. Perform deletion and trigger management atomically under the lock
         if dialect_name == "sqlite":
             conn.execute(text("DROP TRIGGER IF EXISTS trg_audit_no_delete;"))
             conn.execute(text("DELETE FROM pipeline_checkpoint_audit;"))
@@ -431,31 +456,45 @@ def safe_administrative_purge(
             conn.execute(text("DELETE FROM pipeline_checkpoint_audit;"))
             conn.execute(text("ALTER TABLE pipeline_checkpoint_audit ENABLE TRIGGER trg_audit_prevent_mod;"))
 
-        # 6. Commit transaction
-        if trans is not None:
-            trans.commit()
+        # 7. Commit or release savepoint
+        if savepoint is not None:
+            savepoint.commit()
+            is_durable = False
+            status = "pending_commit"
         else:
-            conn.commit()
+            if trans is not None:
+                trans.commit()
+            else:
+                conn.commit()
+            is_durable = True
+            status = "purged"
 
     except Exception:
-        if trans is not None:
+        if savepoint is not None:
             try:
-                trans.rollback()
+                savepoint.rollback()
             except Exception:
                 pass
-        else:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+        if not caller_owns_transaction:
+            if trans is not None:
+                try:
+                    trans.rollback()
+                except Exception:
+                    pass
+            else:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
         raise
     finally:
         if owns_connection:
             conn.close()
 
-    logger.info("Safely purged %d audit records after verified archive at %s", count, archive_path)
+    logger.info("Administrative purge completed: %d records, durable=%s at %s", count, is_durable, archive_path)
     return {
-        "status": "purged",
+        "status": status,
+        "is_durable": is_durable,
         "purged_record_count": count,
         "archive_path": str(archive_path),
         "verification": verify_result,

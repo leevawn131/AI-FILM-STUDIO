@@ -29,6 +29,7 @@ import os
 import uuid
 import json
 import sqlite3
+import threading
 import pytest
 import concurrent.futures
 from datetime import datetime, timezone, timedelta
@@ -657,13 +658,19 @@ def test_safe_archive_replacement_concurrency_and_failure_resilience(tmp_path):
 
 def test_safe_administrative_purge_target_types_and_unrelated_session_isolation(tmp_path):
     """
-    Verifies Requirement 1:
-    - Preserves support for Engine, Connection, and Session.
-    - Does not commit unrelated caller transactions when using Session.
+    Verifies Requirements 1 & 2:
+    - Explicit transaction ownership for Engine, Connection, and Session targets.
+    - Test 1: Session purge followed by rollback (audit records remain).
+    - Test 2: Session purge followed by commit (audit records purged).
+    - Test 3: Connection purge with caller transaction followed by rollback (audit records remain).
+    - Test 4: Engine purge (durable purge committed explicitly).
+    - Test 5: Session containing unrelated pending work (unrelated work is not committed prematurely,
+              and commits/rolls back along with session).
     """
     from backend.app.services.audit_archiver import (
         archive_audit_records,
         safe_administrative_purge,
+        AuditArchivalError,
     )
 
     test_db_path = tmp_path / "targets_test.db"
@@ -671,7 +678,11 @@ def test_safe_administrative_purge_target_types_and_unrelated_session_isolation(
     engine = create_engine(db_url)
     run_migrations(target_engine=engine, db_url=db_url)
 
-    # 1. Test with Engine
+    SessionLocalTest = sessionmaker(bind=engine)
+
+    # -----------------------------------------------------------------------
+    # 1. Engine Purge: Dedicated transaction, durable commit
+    # -----------------------------------------------------------------------
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO pipeline_checkpoint_audit (
@@ -690,9 +701,16 @@ def test_safe_administrative_purge_target_types_and_unrelated_session_isolation(
     archive_audit_records(engine, archive_eng)
     res_eng = safe_administrative_purge(engine, archive_eng, force=True)
     assert res_eng["status"] == "purged"
+    assert res_eng["is_durable"] is True
     assert res_eng["purged_record_count"] == 1
 
-    # 2. Test with Connection
+    with engine.connect() as check_conn:
+        cnt = check_conn.execute(text("SELECT count(*) FROM pipeline_checkpoint_audit")).scalar()
+        assert cnt == 0, "Engine purge must be immediately durable in database"
+
+    # -----------------------------------------------------------------------
+    # 2. Session Purge followed by Rollback
+    # -----------------------------------------------------------------------
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO pipeline_checkpoint_audit (
@@ -700,20 +718,48 @@ def test_safe_administrative_purge_target_types_and_unrelated_session_isolation(
                 checkpoint_type, decision, artifact_content_hash,
                 artifact_version, reviewer_name, created_at
             ) VALUES (
-                'rec-conn-1', 'proj-1', 'Conn Film', 'cp-1',
-                'story_approval', 'APPROVED', 'hashconn',
+                'rec-sess-rb-1', 'proj-1', 'Sess RB Film', 'cp-1',
+                'story_approval', 'APPROVED', 'hashsessrb',
                 1, 'Director', datetime('now')
             )
         """))
         conn.commit()
 
-        archive_conn = tmp_path / "archive_conn.json"
-        archive_audit_records(conn, archive_conn)
-        res_conn = safe_administrative_purge(conn, archive_conn, force=True)
-        assert res_conn["status"] == "purged"
-        assert res_conn["purged_record_count"] == 1
+    archive_sess_rb = tmp_path / "archive_sess_rb.json"
+    archive_audit_records(engine, archive_sess_rb)
 
-    # 3. Test with Session & verify unrelated caller transaction is NOT committed
+    session_rb = SessionLocalTest()
+    res_sess_rb = safe_administrative_purge(session_rb, archive_sess_rb, force=True)
+    assert res_sess_rb["status"] == "pending_commit"
+    assert res_sess_rb["is_durable"] is False
+
+    # Caller explicitly rolls back session
+    session_rb.rollback()
+    session_rb.close()
+
+    with engine.connect() as check_conn:
+        cnt = check_conn.execute(text("SELECT count(*) FROM pipeline_checkpoint_audit")).scalar()
+        assert cnt == 1, "Session purge followed by rollback must restore the audit records in DB"
+
+    # -----------------------------------------------------------------------
+    # 3. Session Purge followed by Commit
+    # -----------------------------------------------------------------------
+    session_commit = SessionLocalTest()
+    res_sess_commit = safe_administrative_purge(session_commit, archive_sess_rb, force=True)
+    assert res_sess_commit["status"] == "pending_commit"
+    assert res_sess_commit["is_durable"] is False
+
+    # Caller explicitly commits session
+    session_commit.commit()
+    session_commit.close()
+
+    with engine.connect() as check_conn:
+        cnt = check_conn.execute(text("SELECT count(*) FROM pipeline_checkpoint_audit")).scalar()
+        assert cnt == 0, "Session purge followed by commit must permanently purge records from DB"
+
+    # -----------------------------------------------------------------------
+    # 4. Connection Purge with Caller Transaction followed by Rollback
+    # -----------------------------------------------------------------------
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO pipeline_checkpoint_audit (
@@ -721,60 +767,125 @@ def test_safe_administrative_purge_target_types_and_unrelated_session_isolation(
                 checkpoint_type, decision, artifact_content_hash,
                 artifact_version, reviewer_name, created_at
             ) VALUES (
-                'rec-sess-1', 'proj-1', 'Sess Film', 'cp-1',
-                'story_approval', 'APPROVED', 'hashsess',
+                'rec-conn-rb-1', 'proj-1', 'Conn RB Film', 'cp-1',
+                'story_approval', 'APPROVED', 'hashconnrb',
                 1, 'Director', datetime('now')
             )
         """))
         conn.commit()
 
-    SessionLocalTest = sessionmaker(bind=engine)
-    session = SessionLocalTest()
+    archive_conn_rb = tmp_path / "archive_conn_rb.json"
+    archive_audit_records(engine, archive_conn_rb)
 
-    # Caller has unrelated dirty/new entity
+    conn_caller = engine.connect()
+    # Caller starts connection transaction without executing DML before purge:
+    tx_caller = conn_caller.begin()
+    res_conn_rb = safe_administrative_purge(conn_caller, archive_conn_rb, force=True)
+    assert res_conn_rb["status"] == "pending_commit"
+    assert res_conn_rb["is_durable"] is False
+
+    # Caller rolls back
+    tx_caller.rollback()
+    conn_caller.close()
+
+    with engine.connect() as check_conn:
+        cnt = check_conn.execute(text("SELECT count(*) FROM pipeline_checkpoint_audit")).scalar()
+        assert cnt == 1, "Connection purge followed by rollback must preserve audit records"
+
+    # Also verify: if caller has an active DBAPI transaction in progress (e.g. DML),
+    # safe_administrative_purge rejects with AuditArchivalError:
+    conn_active = engine.connect()
+    conn_active.execute(text("""
+        INSERT INTO pipeline_checkpoint_audit (
+            id, project_id, project_name_snapshot, checkpoint_id,
+            checkpoint_type, decision, artifact_content_hash,
+            artifact_version, reviewer_name, created_at
+        ) VALUES (
+            'rec-conn-active', 'proj-1', 'Active Film', 'cp-1',
+            'story_approval', 'APPROVED', 'hashactive',
+            1, 'Reviewer', datetime('now')
+        )
+    """))
+    with pytest.raises(AuditArchivalError, match="Cannot safely acquire SQLite write lock"):
+        safe_administrative_purge(conn_active, archive_conn_rb, force=True)
+    conn_active.rollback()
+    conn_active.close()
+
+    # Clean up record using Engine purge
+    archive_clean = tmp_path / "archive_clean.json"
+    archive_audit_records(engine, archive_clean)
+    safe_administrative_purge(engine, archive_clean, force=True)
+
+    # -----------------------------------------------------------------------
+    # 5. Session Containing Unrelated Pending Work
+    # -----------------------------------------------------------------------
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-unrelated-1', 'proj-1', 'Unrelated Film', 'cp-1',
+                'story_approval', 'APPROVED', 'hashunrelated',
+                1, 'Director', datetime('now')
+            )
+        """))
+        conn.commit()
+
+    archive_unrelated = tmp_path / "archive_unrelated.json"
+    archive_audit_records(engine, archive_unrelated)
+
+    session_work = SessionLocalTest()
     unrelated_proj = Project(
-        id="proj-unrelated-pending",
+        id="proj-unrelated-pending-work",
         name="Unrelated Pending Film",
         budget_total=1000.0,
         budget_spent=0.0
     )
-    session.add(unrelated_proj)
-    assert bool(session.new) is True, "Session must have pending new objects"
+    session_work.add(unrelated_proj)
 
-    archive_sess = tmp_path / "archive_sess.json"
-    archive_audit_records(session, archive_sess)
-    res_sess = safe_administrative_purge(session, archive_sess, force=True)
-    assert res_sess["status"] == "purged"
-    assert res_sess["purged_record_count"] == 1
+    res_unrelated = safe_administrative_purge(session_work, archive_unrelated, force=True)
+    assert res_unrelated["status"] == "pending_commit"
+    assert res_unrelated["is_durable"] is False
 
-    # Verify unrelated_proj is NOT yet committed in database
+    # Unrelated project must NOT be visible to other connections before session.commit()
     with engine.connect() as check_conn:
-        db_proj = check_conn.execute(text("SELECT id FROM projects WHERE id = 'proj-unrelated-pending'")).fetchone()
+        db_proj = check_conn.execute(text("SELECT id FROM projects WHERE id = 'proj-unrelated-pending-work'")).fetchone()
         assert db_proj is None, "safe_administrative_purge must NOT commit unrelated caller objects!"
 
-    # Rollback session to discard caller's pending work
-    session.rollback()
-    session.close()
+    # Commit session: both unrelated project and audit purge commit together
+    session_work.commit()
+    session_work.close()
+
+    with engine.connect() as check_conn:
+        db_proj_after = check_conn.execute(text("SELECT id FROM projects WHERE id = 'proj-unrelated-pending-work'")).fetchone()
+        assert db_proj_after is not None, "Unrelated project must be committed upon session.commit()"
+        cnt = check_conn.execute(text("SELECT count(*) FROM pipeline_checkpoint_audit")).scalar()
+        assert cnt == 0, "Audit records must be purged upon session.commit()"
+
     engine.dispose()
 
 
 def test_purge_concurrency_regression_blocks_unarchived_deletions(tmp_path):
     """
-    Verifies Requirement 2:
-    - Eliminates race condition between archive verification and record purge.
-    - Write/table lock prevents concurrent INSERT from slipping in.
-    - If a new record exists in the DB that is absent from the archive, purge is strictly aborted
-      and NO records are deleted.
+    Verifies Requirement 3 (Deterministic Two-Connection Concurrency):
+    - Connection A starts purge and acquires SQLite BEGIN IMMEDIATE write lock.
+    - Connection B attempts to insert an audit record while purge is actively verifying/purging.
+    - Connection B is blocked by the write lock and cannot slip into the purge window.
+    - Verified that no unarchived record is ever deleted.
+    - Connection B's record survives in the database after Connection A completes.
     """
     from backend.app.services.audit_archiver import (
         archive_audit_records,
         safe_administrative_purge,
-        AuditVerificationError,
+        AuditArchivalError,
     )
 
     test_db_path = tmp_path / "purge_concurrency_race.db"
     db_url = f"sqlite:///{test_db_path}"
-    engine = create_engine(db_url, connect_args={"timeout": 0.2})
+    # Small timeout for worker B to test blocking
+    engine = create_engine(db_url, connect_args={"timeout": 5.0})
     run_migrations(target_engine=engine, db_url=db_url)
 
     # 1. Insert initial record 1
@@ -795,30 +906,68 @@ def test_purge_concurrency_regression_blocks_unarchived_deletions(tmp_path):
     archive_file = tmp_path / "race_archive.json"
     archive_audit_records(engine, archive_file)
 
-    # 2. Simulate concurrent worker inserting record 2 before purge lock
-    with engine.connect() as conn:
-        conn.execute(text("""
-            INSERT INTO pipeline_checkpoint_audit (
-                id, project_id, project_name_snapshot, checkpoint_id,
-                checkpoint_type, decision, artifact_content_hash,
-                artifact_version, reviewer_name, created_at
-            ) VALUES (
-                'rec-race-2-concurrent', 'proj-1', 'Race Film', 'cp-2',
-                'visual_approval', 'APPROVED', 'hashrace2',
-                1, 'Director', datetime('now')
-            )
-        """))
-        conn.commit()
+    # Deterministic synchronization events
+    lock_acquired = threading.Event()
+    insert_attempted = threading.Event()
+    worker_b_result = {}
 
-    # 3. Purge attempt must be rejected because DB has 2 records, archive only has 1
-    with pytest.raises(AuditVerificationError) as exc_race:
-        safe_administrative_purge(engine, archive_file, force=True)
-    assert "count mismatch" in str(exc_race.value)
+    def purge_worker_a():
+        def on_lock():
+            lock_acquired.set()
+            # Wait until connection B has attempted to insert
+            insert_attempted.wait()
 
-    # 4. Proves ZERO records were deleted (neither record 1 nor unarchived record 2)
-    with engine.connect() as conn:
-        remaining_cnt = conn.execute(text("SELECT count(*) FROM pipeline_checkpoint_audit")).scalar()
-        assert remaining_cnt == 2, "No unarchived audit record can be deleted!"
+        safe_administrative_purge(
+            engine,
+            archive_file,
+            force=True,
+            _on_lock_acquired=on_lock
+        )
+
+    def insert_worker_b():
+        # Wait until connection A has acquired the write lock
+        lock_acquired.wait()
+        with engine.connect() as conn_b:
+            # Signal that worker B is starting its insert attempt
+            insert_attempted.set()
+            try:
+                conn_b.execute(text("""
+                    INSERT INTO pipeline_checkpoint_audit (
+                        id, project_id, project_name_snapshot, checkpoint_id,
+                        checkpoint_type, decision, artifact_content_hash,
+                        artifact_version, reviewer_name, created_at
+                    ) VALUES (
+                        'rec-race-2-concurrent', 'proj-1', 'Race Film', 'cp-2',
+                        'visual_approval', 'APPROVED', 'hashrace2',
+                        1, 'Director', datetime('now')
+                    )
+                """))
+                conn_b.commit()
+                worker_b_result["success"] = True
+            except Exception as e:
+                worker_b_result["error"] = str(e)
+
+    t_a = threading.Thread(target=purge_worker_a)
+    t_b = threading.Thread(target=insert_worker_b)
+
+    t_a.start()
+    t_b.start()
+    t_a.join()
+    t_b.join()
+
+    # 4. Assertions:
+    # Worker B must have succeeded after worker A released the lock
+    assert worker_b_result.get("success") is True, f"Worker B failed: {worker_b_result}"
+
+    # Verify actual database state:
+    with engine.connect() as check_conn:
+        rows = check_conn.execute(text("SELECT id FROM pipeline_checkpoint_audit")).fetchall()
+        row_ids = [r[0] for r in rows]
+        # rec-race-1 was archived and MUST be purged
+        assert "rec-race-1" not in row_ids, "Archived record 1 must be purged"
+        # rec-race-2-concurrent was unarchived and MUST NOT be deleted
+        assert "rec-race-2-concurrent" in row_ids, "Unarchived concurrent record 2 must NEVER be deleted!"
+        assert len(row_ids) == 1
 
     engine.dispose()
 
@@ -2009,9 +2158,86 @@ def test_postgresql_audit_purge_transaction_and_locking(tmp_path):
     # 4. Safe purge succeeds on PostgreSQL using Engine
     purge_res = safe_administrative_purge(pg_engine, archive_file, force=True)
     assert purge_res["status"] == "purged"
+    assert purge_res["is_durable"] is True
 
     with pg_engine.connect() as conn:
         cnt_after = conn.execute(text(f"SELECT count(*) FROM pipeline_checkpoint_audit WHERE id = '{audit_id}'")).scalar()
         assert cnt_after == 0, "Record must be cleanly purged after successful verification on PostgreSQL"
+
+    # 5. Deterministic Concurrency Test on PostgreSQL:
+    # ACCESS EXCLUSIVE lock blocks concurrent INSERT during purge window.
+    # Record inserted by concurrent worker must NOT be deleted.
+    audit_id_1 = f"pg-race-1-{uuid.uuid4().hex[:8]}"
+    audit_id_2 = f"pg-race-2-{uuid.uuid4().hex[:8]}"
+
+    with pg_engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, feedback_notes, created_at
+            ) VALUES (
+                :id, 'pg-proj-p', 'PG Race Film', 'cp-pg-1',
+                'story_approval', 'APPROVED', 'pghashrace1',
+                1, 'PG Director', 'pg notes', NOW()
+            );
+        """), {"id": audit_id_1})
+        conn.commit()
+
+    archive_race_file = tmp_path / "pg_race_archive.json"
+    archive_audit_records(pg_engine, archive_race_file)
+
+    pg_lock_acquired = threading.Event()
+    pg_insert_attempted = threading.Event()
+    worker_b_pg_result = {}
+
+    def purge_worker_pg():
+        def on_lock():
+            pg_lock_acquired.set()
+            pg_insert_attempted.wait()
+
+        safe_administrative_purge(
+            pg_engine,
+            archive_race_file,
+            force=True,
+            _on_lock_acquired=on_lock
+        )
+
+    def insert_worker_pg():
+        pg_lock_acquired.wait()
+        with pg_engine.connect() as conn_b:
+            pg_insert_attempted.set()
+            try:
+                conn_b.execute(text("""
+                    INSERT INTO pipeline_checkpoint_audit (
+                        id, project_id, project_name_snapshot, checkpoint_id,
+                        checkpoint_type, decision, artifact_content_hash,
+                        artifact_version, reviewer_name, feedback_notes, created_at
+                    ) VALUES (
+                        :id, 'pg-proj-p', 'PG Race Film', 'cp-pg-2',
+                        'visual_approval', 'APPROVED', 'pghashrace2',
+                        1, 'PG Director', 'pg notes 2', NOW()
+                    );
+                """), {"id": audit_id_2})
+                conn_b.commit()
+                worker_b_pg_result["success"] = True
+            except Exception as e:
+                worker_b_pg_result["error"] = str(e)
+
+    t_pg_a = threading.Thread(target=purge_worker_pg)
+    t_pg_b = threading.Thread(target=insert_worker_pg)
+
+    t_pg_a.start()
+    t_pg_b.start()
+    t_pg_a.join()
+    t_pg_b.join()
+
+    assert worker_b_pg_result.get("success") is True, f"PG Worker B failed: {worker_b_pg_result}"
+
+    with pg_engine.connect() as conn:
+        rows = conn.execute(text("SELECT id FROM pipeline_checkpoint_audit")).fetchall()
+        row_ids = [r[0] for r in rows]
+        assert audit_id_1 not in row_ids, f"Archived record {audit_id_1} must be purged on PostgreSQL"
+        assert audit_id_2 in row_ids, f"Unarchived concurrent record {audit_id_2} must survive on PostgreSQL!"
 
     pg_engine.dispose()
