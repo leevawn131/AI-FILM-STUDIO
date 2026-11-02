@@ -14,6 +14,7 @@ import {
   fetchCheckpointDetail,
   PipelineCheckpointDetail,
   StoryReviewData,
+  ApiClientError,
 } from '../api/client';
 import {
   BookOpen,
@@ -102,6 +103,21 @@ export const ScreenplayView: React.FC<ScreenplayViewProps> = ({
       await loadCheckpoint();
       onRefreshProject();
     } catch (err: any) {
+      if (err instanceof ApiClientError || typeof err?.status === 'number') {
+        if (err.status === 409) {
+          alert('Pipeline Conflict (409): Screenplay state has changed or is already in review.');
+          await loadCheckpoint();
+          return;
+        }
+        if (err.status === 422) {
+          alert(`Validation Error (422): ${err.detail || err.message}`);
+          return;
+        }
+        if (err.status >= 500) {
+          alert('Server Error (500): Safe server failure. Please retry.');
+          return;
+        }
+      }
       alert('Submit for review failed: ' + (err.message || err));
     } finally {
       setSubmittingApproval(false);
@@ -140,16 +156,26 @@ export const ScreenplayView: React.FC<ScreenplayViewProps> = ({
       await loadCheckpoint();
       onRefreshProject();
     } catch (err: any) {
-      if (err.status === 409) {
-        setDecisionError('Conflict (409): Screenplay was modified while reviewing. The approval state has been marked STALE. Refreshing review draft...');
-        try {
-          const fresh = await fetchStoryReview(activeProject.id);
-          setReviewData(fresh);
-          await loadCheckpoint();
-        } catch (_) {}
-      } else {
-        setDecisionError('Decision failed: ' + (err.message || err));
+      if (err instanceof ApiClientError || typeof err?.status === 'number') {
+        if (err.status === 409) {
+          setDecisionError('Pipeline Conflict (409): Screenplay was modified while reviewing. The approval state has been marked STALE. Refreshing review draft...');
+          try {
+            const fresh = await fetchStoryReview(activeProject.id);
+            setReviewData(fresh);
+            await loadCheckpoint();
+          } catch (_) {}
+          return;
+        }
+        if (err.status === 422) {
+          setDecisionError(`Validation Error (422): ${err.detail || err.message}`);
+          return;
+        }
+        if (err.status >= 500) {
+          setDecisionError('Server Error (500): Safe server failure. Please retry.');
+          return;
+        }
       }
+      setDecisionError('Decision failed: ' + (err.message || err));
     } finally {
       setDecisionSubmitting(false);
     }

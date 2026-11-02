@@ -13,7 +13,8 @@ import {
   runContinuityCheck,
   ContinuityReport,
   fetchCheckpointDetail,
-  PipelineCheckpointDetail
+  PipelineCheckpointDetail,
+  ApiClientError
 } from '../api/client';
 import { ViewTab } from '../components/Sidebar';
 import {
@@ -132,13 +133,27 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
       await loadStoryApproval();
       onRefreshProject();
     } catch (err: any) {
-      const msg = err.message || String(err);
-      if (msg.includes('Gatekeeper') || msg.includes('approval') || msg.includes('403') || msg.includes('409') || msg.includes('locked')) {
-        setGatekeeperError(`Gatekeeper blocked shot generation: ${msg}`);
-        loadStoryApproval();
-      } else {
-        alert('Director breakdown failed: ' + msg);
+      if (err instanceof ApiClientError || typeof err?.status === 'number') {
+        if (err.status === 403) {
+          setGatekeeperError('Gatekeeper Security (403): Screenplay approval is required before generating shots.');
+          loadStoryApproval();
+          return;
+        }
+        if (err.status === 409) {
+          setGatekeeperError('Pipeline Conflict (409): Screenplay was modified or approval state is stale. Please review and re-approve.');
+          loadStoryApproval();
+          return;
+        }
+        if (err.status === 422) {
+          alert(`Validation Error (422): ${err.detail || err.message}`);
+          return;
+        }
+        if (err.status >= 500) {
+          alert('Server Error (500): Safe server failure. Please retry.');
+          return;
+        }
       }
+      alert('Director breakdown failed: ' + (err.message || String(err)));
     } finally {
       setGenerating(false);
     }
@@ -220,14 +235,29 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
       await loadScenesAndShots();
       onRefreshProject();
     } catch (err: any) {
-      const msg = err.message || String(err);
-      if (msg.includes('Gatekeeper') || msg.includes('approval') || msg.includes('403') || msg.includes('409') || msg.includes('locked')) {
-        setGatekeeperError(`Gatekeeper blocked shot creation: ${msg}`);
-        setShowAddModal(false);
-        loadStoryApproval();
-      } else {
-        alert('Failed to create shot: ' + msg);
+      if (err instanceof ApiClientError || typeof err?.status === 'number') {
+        if (err.status === 403) {
+          setGatekeeperError('Gatekeeper Security (403): Screenplay approval is required before adding shots.');
+          setShowAddModal(false);
+          loadStoryApproval();
+          return;
+        }
+        if (err.status === 409) {
+          setGatekeeperError('Pipeline Conflict (409): Screenplay was modified or approval state is stale. Please review and re-approve.');
+          setShowAddModal(false);
+          loadStoryApproval();
+          return;
+        }
+        if (err.status === 422) {
+          alert(`Validation Error (422): ${err.detail || err.message}`);
+          return;
+        }
+        if (err.status >= 500) {
+          alert('Server Error (500): Safe server failure. Please retry.');
+          return;
+        }
       }
+      alert('Failed to create shot: ' + (err.message || String(err)));
     }
   };
 

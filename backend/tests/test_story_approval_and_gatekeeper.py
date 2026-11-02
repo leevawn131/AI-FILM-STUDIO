@@ -706,3 +706,229 @@ def test_state_transitions_and_concurrency(test_db_session):
             pg_session.rollback()
             pg_session.close()
             pg_engine.dispose()
+
+
+def test_legacy_approval_bypass_blocked(test_db_session):
+    """
+    Requirement 1:
+    - Calling record_checkpoint_decision on story_approval raises 400.
+    - Calling record_checkpoint_decision on non-story checkpoints raises 400 (fail-closed).
+    """
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Bypass Defense Film"})
+    project_id = create_res.json()["id"]
+
+    # Attempting to call legacy record_checkpoint_decision on story_approval
+    with pytest.raises(Exception) as exc_story:
+        PipelineOrchestrator.record_checkpoint_decision(
+            session, project_id, "story_approval", "APPROVED", reviewer_name="Hacker"
+        )
+    assert exc_story.value.status_code == 400
+    assert "bypass" in str(exc_story.value.detail).lower() or "story approval" in str(exc_story.value.detail).lower()
+
+    # Attempting to call on non-story checkpoint (e.g. visual_approval)
+    with pytest.raises(Exception) as exc_non_story:
+        PipelineOrchestrator.record_checkpoint_decision(
+            session, project_id, "visual_approval", "APPROVED", reviewer_name="Hacker"
+        )
+    assert exc_non_story.value.status_code == 400
+    assert "not implemented" in str(exc_non_story.value.detail).lower() or "fail-closed" in str(exc_non_story.value.detail).lower()
+
+
+def test_concurrent_submissions_stable_snapshot(test_db_session):
+    """
+    Requirement 2:
+    - Multiple threads submit story for review concurrently.
+    - Serialized under project write lock.
+    - Produces a consistent state (WAITING_FOR_APPROVAL) and valid version without race conditions.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Concurrent Submit Film"})
+    project_id = create_res.json()["id"]
+
+    scene = client.post("/api/scenes", json={
+        "project_id": project_id,
+        "scene_number": 1,
+        "slugline": "INT. LAB - DAY",
+        "script_content": "Scientists observe stable reactions."
+    })
+    assert scene.status_code == 201
+
+    def do_submit():
+        return client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/submit")
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(do_submit) for _ in range(3)]
+        results = [f.result() for f in futures]
+
+    for r in results:
+        assert r.status_code == 200
+
+    # Verify checkpoint state
+    cp = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval").json()
+    assert cp["status"] == "WAITING_FOR_APPROVAL"
+    assert cp["artifact_version"] == 1
+
+    # Audit history should have exactly 1 SUBMITTED_FOR_REVIEW due to idempotency
+    audits = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/audit").json()["items"]
+    submit_audits = [a for a in audits if a["decision"] == "SUBMITTED_FOR_REVIEW"]
+    assert len(submit_audits) == 1
+
+
+def test_worker_invalidation_and_late_completion_rejection(test_db_session):
+    """
+    Requirements 3 & 4:
+    - Worker running on H1 while screenplay changes to H2 causes stage to become STALE and clears active_job_id.
+    - Late completion attempt by worker is rejected when stage is STALE or consumed_input_hash is mismatched.
+    """
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Worker Invalidation Film"})
+    project_id = create_res.json()["id"]
+
+    # 1. Create scene with content H1
+    sc_res = client.post("/api/scenes", json={
+        "project_id": project_id,
+        "scene_number": 1,
+        "slugline": "INT. BUNKER - NIGHT",
+        "script_content": "H1 initial draft content."
+    })
+    scene_id = sc_res.json()["id"]
+
+    # Compute H1 hash
+    h1_hash = PipelineOrchestrator.compute_artifact_hash(session, project_id, "screenplay")
+    assert h1_hash is not None
+
+    # Submit and approve H1
+    client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/submit")
+    client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/decision", json={
+        "decision": "APPROVED",
+        "expected_artifact_version": 1,
+        "expected_artifact_hash": h1_hash,
+        "reviewer_name": "Director"
+    })
+
+    # Start a downstream worker job (e.g. character_design) consuming H1
+    from backend.app.services.job_manager import job_manager, JobOwnershipLostError
+    job, action = job_manager.prepare_or_claim_job(
+        db=session,
+        project_id=project_id,
+        job_type="character_generation",
+        payload={"screenplay_hash": h1_hash}
+    )
+    worker_id = job_manager.worker_id
+    fencing_token = job.fencing_token
+
+    # Associate stage with job
+    stage = session.query(PipelineStageState).filter(
+        PipelineStageState.project_id == project_id,
+        PipelineStageState.stage_name == "character_design"
+    ).first()
+    stage.status = "IN_PROGRESS"
+    stage.active_job_id = job.id
+    stage.consumed_input_hash = h1_hash
+    session.commit()
+
+    # 2. User mutates screenplay to H2
+    client.patch(f"/api/scenes/{scene_id}", json={"script_content": "H2 radically modified content."})
+
+    # Check stage was invalidated to STALE and active_job_id cleared
+    session.expire_all()
+    stage_refreshed = session.query(PipelineStageState).filter(
+        PipelineStageState.project_id == project_id,
+        PipelineStageState.stage_name == "character_design"
+    ).first()
+    assert stage_refreshed.status == "STALE"
+    assert stage_refreshed.active_job_id is None
+
+    # 3. Worker tries to complete stage with consumed_input_hash=h1_hash
+    with pytest.raises(JobOwnershipLostError) as exc_stale:
+        PipelineOrchestrator.complete_pipeline_stage(
+            db=session,
+            project_id=project_id,
+            stage_name="character_design",
+            active_job_id=job.id,
+            worker_id=worker_id,
+            fencing_token=fencing_token,
+            result_hash="res-char-hash",
+            consumed_input_hash=h1_hash
+        )
+    assert "obsolete input snapshot" in str(exc_stale.value.detail).lower() or "stale" in str(exc_stale.value.detail).lower()
+
+
+def test_invalidation_audit_no_duplicate_when_already_stale(test_db_session):
+    """
+    Requirement 5:
+    - Updating a scene when checkpoint is already STALE does not create redundant INVALIDATED audit rows.
+    """
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Audit Deduplication Film"})
+    project_id = create_res.json()["id"]
+
+    sc_res = client.post("/api/scenes", json={
+        "project_id": project_id,
+        "scene_number": 1,
+        "slugline": "INT. OFFICE - DAY",
+        "script_content": "First draft."
+    })
+    scene_id = sc_res.json()["id"]
+
+    # Submit and approve
+    client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/submit")
+    rev = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/review").json()
+    client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/decision", json={
+        "decision": "APPROVED",
+        "expected_artifact_version": 1,
+        "expected_artifact_hash": rev["current_artifact_hash"],
+        "reviewer_name": "Director"
+    })
+
+    # First modification -> STALE, exactly 1 INVALIDATED row
+    client.patch(f"/api/scenes/{scene_id}", json={"script_content": "Second draft modification."})
+    audits_1 = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/audit").json()["items"]
+    inval_audits_1 = [a for a in audits_1 if a["decision"] == "INVALIDATED"]
+    assert len(inval_audits_1) == 1
+
+    # Second modification while already STALE -> remains STALE, no duplicate INVALIDATED row
+    client.patch(f"/api/scenes/{scene_id}", json={"script_content": "Third draft modification."})
+    audits_2 = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/audit").json()["items"]
+    inval_audits_2 = [a for a in audits_2 if a["decision"] == "INVALIDATED"]
+    assert len(inval_audits_2) == 1
+
+
+def test_ai_scene_generation_failure_atomicity_and_clean_job_failure(test_db_session, monkeypatch):
+    """
+    Requirement 6:
+    - Fault injection in generate_ai_scene: simulate exception before db.commit().
+    - Verifies that scene addition is rolled back and fail_job marks the job as FAILED cleanly.
+    """
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Atomic Failure Film"})
+    project_id = create_res.json()["id"]
+
+    # Mock PipelineOrchestrator.invalidate_downstream_stages to raise RuntimeError
+    def mock_invalidate_failure(*args, **kwargs):
+        raise RuntimeError("Simulated DB crash during scene generation pipeline invalidation")
+
+    monkeypatch.setattr(
+        PipelineOrchestrator,
+        "invalidate_downstream_stages",
+        mock_invalidate_failure
+    )
+
+    gen_res = client.post("/api/scenes/generate", json={"project_id": project_id, "prompt": "Epic sci-fi battle"})
+    assert gen_res.status_code == 500
+
+    # Ensure no orphan scene was committed
+    scenes = client.get(f"/api/scenes/{project_id}").json()
+    assert len(scenes) == 0
+
+    # Ensure job was recorded as FAILED
+    failed_job = session.query(StudioJob).filter(
+        StudioJob.project_id == project_id,
+        StudioJob.job_type == "screenplay_generate"
+    ).first()
+    assert failed_job is not None
+    assert failed_job.status == "FAILED"
+    assert "Simulated DB crash" in (failed_job.error_message or "")

@@ -262,6 +262,63 @@ export interface BudgetSummary {
 
 const API_BASE = '/api';
 
+export class ApiClientError extends Error {
+  status: number;
+  detail: string;
+  body?: any;
+
+  constructor(status: number, detail: string, body?: any) {
+    super(detail);
+    this.name = 'ApiClientError';
+    this.status = status;
+    this.detail = detail;
+    this.body = body;
+    Object.setPrototypeOf(this, ApiClientError.prototype);
+  }
+}
+
+export async function parseApiResponse<T>(res: Response, fallbackMessage: string): Promise<T> {
+  if (res.ok) {
+    const text = await res.text();
+    if (!text) {
+      return {} as T;
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text as unknown as T;
+    }
+  }
+
+  let body: any = {};
+  try {
+    body = await res.json();
+  } catch {
+    // Response body is not JSON
+  }
+
+  let detail: string = body.detail || body.message || '';
+  if (typeof detail === 'object') {
+    detail = JSON.stringify(detail);
+  }
+
+  if (!detail) {
+    if (res.status === 403) {
+      detail = 'Approval required: action is blocked by Gatekeeper until prerequisite checkpoint is approved.';
+    } else if (res.status === 409) {
+      detail = 'Conflict: artifact state or version has changed concurrently. Please refresh and retry.';
+    } else if (res.status === 422) {
+      detail = 'Validation error: invalid request payload.';
+    } else if (res.status >= 500) {
+      detail = 'Server error: an internal server error occurred.';
+    } else {
+      detail = fallbackMessage;
+    }
+  }
+
+  throw new ApiClientError(res.status, detail, body);
+}
+
 export async function fetchProjects(): Promise<Project[]> {
   const res = await fetch(`${API_BASE}/projects`);
   if (!res.ok) throw new Error('Failed to fetch projects');
@@ -420,8 +477,7 @@ export async function uploadLocationRef(id: string, file: File): Promise<any> {
 }
 export async function fetchScenes(projectId: string): Promise<Scene[]> {
   const res = await fetch(`${API_BASE}/scenes/${projectId}`);
-  if (!res.ok) throw new Error('Failed to fetch scenes');
-  return res.json();
+  return parseApiResponse<Scene[]>(res, 'Failed to fetch scenes');
 }
 
 export async function createScene(data: Partial<Scene>): Promise<Scene> {
@@ -430,8 +486,7 @@ export async function createScene(data: Partial<Scene>): Promise<Scene> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error('Failed to create scene');
-  return res.json();
+  return parseApiResponse<Scene>(res, 'Failed to create scene');
 }
 
 export async function generateScene(projectId: string, prompt: string): Promise<Scene> {
@@ -440,8 +495,7 @@ export async function generateScene(projectId: string, prompt: string): Promise<
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ project_id: projectId, prompt }),
   });
-  if (!res.ok) throw new Error('Failed to generate scene');
-  return res.json();
+  return parseApiResponse<Scene>(res, 'Failed to generate scene');
 }
 
 export async function updateScene(id: string, data: Partial<Scene>): Promise<Scene> {
@@ -450,13 +504,12 @@ export async function updateScene(id: string, data: Partial<Scene>): Promise<Sce
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error('Failed to update scene');
-  return res.json();
+  return parseApiResponse<Scene>(res, 'Failed to update scene');
 }
 
 export async function deleteScene(id: string): Promise<void> {
   const res = await fetch(`${API_BASE}/scenes/${id}`, { method: 'DELETE' });
-  if (!res.ok) throw new Error('Failed to delete scene');
+  return parseApiResponse<void>(res, 'Failed to delete scene');
 }
 
 export async function refineScene(id: string, direction: string): Promise<any> {
@@ -465,16 +518,14 @@ export async function refineScene(id: string, direction: string): Promise<any> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ direction }),
   });
-  if (!res.ok) throw new Error('Failed to refine scene');
-  return res.json();
+  return parseApiResponse<any>(res, 'Failed to refine scene');
 }
 
 // Storyboard API methods
 export async function fetchShots(projectId: string, sceneId?: string): Promise<Shot[]> {
   const url = sceneId ? `${API_BASE}/storyboard/${projectId}?scene_id=${sceneId}` : `${API_BASE}/storyboard/${projectId}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error('Failed to fetch shots');
-  return res.json();
+  return parseApiResponse<Shot[]>(res, 'Failed to fetch shots');
 }
 
 export async function createShot(data: Partial<Shot>): Promise<Shot> {
@@ -483,8 +534,7 @@ export async function createShot(data: Partial<Shot>): Promise<Shot> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error('Failed to create shot');
-  return res.json();
+  return parseApiResponse<Shot>(res, 'Failed to create shot');
 }
 
 export async function generateShotsForScene(sceneId: string, shotCount: number = 4): Promise<Shot[]> {
@@ -493,8 +543,7 @@ export async function generateShotsForScene(sceneId: string, shotCount: number =
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ shot_count: shotCount }),
   });
-  if (!res.ok) throw new Error('Failed to generate shots');
-  return res.json();
+  return parseApiResponse<Shot[]>(res, 'Failed to generate shots');
 }
 
 export async function updateShot(id: string, data: Partial<Shot>): Promise<Shot> {
@@ -503,13 +552,12 @@ export async function updateShot(id: string, data: Partial<Shot>): Promise<Shot>
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error('Failed to update shot');
-  return res.json();
+  return parseApiResponse<Shot>(res, 'Failed to update shot');
 }
 
 export async function deleteShot(id: string): Promise<void> {
   const res = await fetch(`${API_BASE}/storyboard/${id}`, { method: 'DELETE' });
-  if (!res.ok) throw new Error('Failed to delete shot');
+  return parseApiResponse<void>(res, 'Failed to delete shot');
 }
 
 export async function optimizeShotPrompt(id: string, characterAnchors?: string): Promise<Shot> {
@@ -815,11 +863,7 @@ export interface PipelineCheckpointDetail {
 
 export async function fetchStoryReview(projectId: string): Promise<StoryReviewData> {
   const res = await fetch(`${API_BASE}/pipeline/${projectId}/checkpoints/story_approval/review`);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to fetch story review data');
-  }
-  return res.json();
+  return parseApiResponse<StoryReviewData>(res, 'Failed to fetch story review data');
 }
 
 export async function submitStoryForReview(projectId: string): Promise<StorySubmitResponse> {
@@ -827,11 +871,7 @@ export async function submitStoryForReview(projectId: string): Promise<StorySubm
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
   });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to submit story for review');
-  }
-  return res.json();
+  return parseApiResponse<StorySubmitResponse>(res, 'Failed to submit story for review');
 }
 
 export async function decideStoryApproval(
@@ -843,13 +883,7 @@ export async function decideStoryApproval(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    const errorObj: any = new Error(err.detail || 'Failed to record decision');
-    errorObj.status = res.status;
-    throw errorObj;
-  }
-  return res.json();
+  return parseApiResponse<CheckpointDecisionResponse>(res, 'Failed to record decision');
 }
 
 export async function fetchCheckpointDetail(
@@ -857,10 +891,6 @@ export async function fetchCheckpointDetail(
   checkpointType: string
 ): Promise<PipelineCheckpointDetail> {
   const res = await fetch(`${API_BASE}/pipeline/${projectId}/checkpoints/${checkpointType}`);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Failed to fetch checkpoint ${checkpointType}`);
-  }
-  return res.json();
+  return parseApiResponse<PipelineCheckpointDetail>(res, `Failed to fetch checkpoint ${checkpointType}`);
 }
 

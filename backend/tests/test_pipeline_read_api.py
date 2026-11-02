@@ -53,6 +53,7 @@ from backend.app.models.entities import (
     PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit,
     StudioJob
 )
+from backend.app.schemas.pipeline import CheckpointDecisionRequest
 from backend.app.services.pipeline_orchestrator import (
     pipeline_orchestrator, PIPELINE_STAGES, PIPELINE_CHECKPOINTS
 )
@@ -63,6 +64,25 @@ client = TestClient(app)
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def approve_story_helper(session, project_id, decision="APPROVED", notes=None, reviewer_name="Director"):
+    sub = pipeline_orchestrator.submit_story_for_review(session, project_id, reviewer_name=reviewer_name)
+    pipeline_orchestrator.record_story_decision(
+        session,
+        project_id,
+        CheckpointDecisionRequest(
+            decision=decision,
+            reviewer_name=reviewer_name,
+            feedback_notes=notes,
+            expected_artifact_version=sub["artifact_version"],
+            expected_artifact_hash=sub["artifact_content_hash"],
+        )
+    )
+    return session.query(PipelineCheckpoint).filter(
+        PipelineCheckpoint.project_id == project_id,
+        PipelineCheckpoint.checkpoint_type == "story_approval"
+    ).first()
 
 
 @pytest.fixture
@@ -320,11 +340,9 @@ def test_get_checkpoint_detail_freshness_and_latest_audit(test_db_session):
     assert cp_data_scene["artifact_content_hash"] is None
 
     # 3. Approve checkpoint via service (following proper submit -> approve lifecycle)
-    pipeline_orchestrator.submit_story_for_review(session, project_id)
-    approved_cp = pipeline_orchestrator.record_checkpoint_decision(
-        db=session,
+    approved_cp = approve_story_helper(
+        session=session,
         project_id=project_id,
-        checkpoint_type="story_approval",
         decision="APPROVED",
         notes="Dialogue passes director guidelines.",
         reviewer_name="Executive Producer"
@@ -409,18 +427,14 @@ def test_get_checkpoint_audit_history_and_pagination(test_db_session):
         ("APPROVED", "Revisions accepted.", "Director"),
     ]
     for dec, notes, rev in decisions:
-        pipeline_orchestrator.submit_story_for_review(session, project_id)
-        pipeline_orchestrator.record_checkpoint_decision(
-            session, project_id, "story_approval", dec, notes=notes, reviewer_name=rev
-        )
+        approve_story_helper(session, project_id, dec, notes=notes, reviewer_name=rev)
 
     # Invalidate
     pipeline_orchestrator.invalidate_downstream_stages(session, project_id, "screenplay")
 
     # Re-submit and approve
-    pipeline_orchestrator.submit_story_for_review(session, project_id)
-    pipeline_orchestrator.record_checkpoint_decision(
-        session, project_id, "story_approval", "APPROVED", notes="Final sign-off.", reviewer_name="Producer"
+    approve_story_helper(
+        session, project_id, "APPROVED", notes="Final sign-off.", reviewer_name="Producer"
     )
 
     # 1. Default audit query (returns all entries, limit=50)
@@ -496,10 +510,7 @@ def test_get_project_wide_audit_history(test_db_session):
     session.commit()
 
     # Submit and record decision
-    pipeline_orchestrator.submit_story_for_review(session, project_id)
-    pipeline_orchestrator.record_checkpoint_decision(
-        session, project_id, "story_approval", "APPROVED", notes="Approved."
-    )
+    approve_story_helper(session, project_id, "APPROVED", notes="Approved.")
 
     res = client.get(f"/api/pipeline/{project_id}/audit")
     assert res.status_code == 200
@@ -545,9 +556,8 @@ def test_cross_project_isolation_and_security(test_db_session):
     session.add(scene_a)
     session.commit()
 
-    pipeline_orchestrator.submit_story_for_review(session, id_a)
-    pipeline_orchestrator.record_checkpoint_decision(
-        session, id_a, "story_approval", "APPROVED", notes="Alpha notes", reviewer_name="Reviewer Alpha"
+    approve_story_helper(
+        session, id_a, "APPROVED", notes="Alpha notes", reviewer_name="Reviewer Alpha"
     )
 
     # Query Project B pipeline
@@ -875,11 +885,9 @@ def test_hash_freshness_semantics_four_cases(test_db_session):
     session.add(scene)
     session.commit()
 
-    pipeline_orchestrator.submit_story_for_review(session, project_id)
-    approved_cp = pipeline_orchestrator.record_checkpoint_decision(
-        db=session,
+    approved_cp = approve_story_helper(
+        session=session,
         project_id=project_id,
-        checkpoint_type="story_approval",
         decision="APPROVED",
         reviewer_name="Director"
     )
@@ -1004,10 +1012,7 @@ def test_read_only_contract_does_not_mutate_data(test_db_session):
     )
     session.add(scene)
     session.commit()
-    pipeline_orchestrator.submit_story_for_review(session, init_proj_id)
-    pipeline_orchestrator.record_checkpoint_decision(
-        session, init_proj_id, "story_approval", "APPROVED", notes="Initial approval"
-    )
+    approve_story_helper(session, init_proj_id, "APPROVED", notes="Initial approval")
 
     # 2. Create uninitialized project directly via ORM
     uninit_proj = Project(

@@ -81,30 +81,34 @@ def create_scene(data: SceneCreate, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    last_scene = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
-    next_order = (last_scene.order_index + 1) if last_scene else 1
-    next_num = (last_scene.scene_number + 1) if last_scene else 1
+    committed = False
+    try:
+        last_scene = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
+        next_order = (last_scene.order_index + 1) if last_scene else 1
+        next_num = (last_scene.scene_number + 1) if last_scene else 1
 
-    scene = Scene(
-        project_id=data.project_id,
-        scene_number=data.scene_number or next_num,
-        slugline=data.slugline or "INT. NEW SET - DAY",
-        title=data.title or f"Scene {next_num}",
-        summary=data.summary or "",
-        script_content=data.script_content or "",
-        location_id=data.location_id,
-        estimated_duration=data.estimated_duration or 15,
-        budget_limit=data.budget_limit or 20.0,
-        order_index=next_order
-    )
-    db.add(scene)
-    # Atomically invalidate downstream approvals/stages in the same transaction
-    PipelineOrchestrator.invalidate_downstream_stages(
-        db=db, project_id=data.project_id, changed_stage="screenplay", commit=False
-    )
-    db.commit()
-    db.refresh(scene)
-
+        scene = Scene(
+            project_id=data.project_id,
+            scene_number=data.scene_number or next_num,
+            slugline=data.slugline or "INT. NEW SET - DAY",
+            title=data.title or f"Scene {next_num}",
+            summary=data.summary or "",
+            script_content=data.script_content or "",
+            location_id=data.location_id,
+            estimated_duration=data.estimated_duration or 15,
+            budget_limit=data.budget_limit or 20.0,
+            order_index=next_order
+        )
+        db.add(scene)
+        # Atomically invalidate downstream approvals/stages in the same transaction
+        PipelineOrchestrator.invalidate_downstream_stages(
+            db=db, project_id=data.project_id, changed_stage="screenplay", commit=False
+        )
+        db.commit()
+        db.refresh(scene)
+    except Exception:
+        db.rollback()
+        raise
 
     return {
         "id": scene.id,
@@ -156,6 +160,7 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
             detail=f"Screenplay generation job is already in progress (job_id: {job.id}). Please wait for completion."
         )
 
+    committed = False
     try:
         last_scene = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
         next_num = (last_scene.scene_number + 1) if last_scene else 1
@@ -232,10 +237,16 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
             worker_id=job.worker_id, fencing_token=job.fencing_token, commit=False
         )
         db.commit()
+        committed = True
         db.refresh(scene)
         return scene
     except Exception as e:
-        job_manager.fail_job(db, job.id, e, worker_id=job.worker_id, fencing_token=job.fencing_token)
+        if not committed:
+            db.rollback()
+            try:
+                job_manager.fail_job(db, job.id, e, worker_id=job.worker_id, fencing_token=job.fencing_token, commit=True)
+            except Exception as fail_err:
+                logger.error(f"Failed to record job failure for job {job.id}: {fail_err}")
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail=sanitize_error_message(e))
@@ -246,20 +257,25 @@ def update_scene(scene_id: str, data: SceneUpdate, db: Session = Depends(get_db)
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
 
-    changed_canonical = False
-    for k, v in data.model_dump(exclude_unset=True).items():
-        if k in CANONICAL_SCREENPLAY_FIELDS and getattr(scene, k) != v:
-            changed_canonical = True
-        setattr(scene, k, v)
+    try:
+        changed_canonical = False
+        for k, v in data.model_dump(exclude_unset=True).items():
+            if k in CANONICAL_SCREENPLAY_FIELDS and getattr(scene, k) != v:
+                changed_canonical = True
+            setattr(scene, k, v)
 
-    # Invalidate downstream stages only when canonical screenplay fields genuinely change
-    if changed_canonical:
-        PipelineOrchestrator.invalidate_downstream_stages(
-            db=db, project_id=scene.project_id, changed_stage="screenplay", commit=False
-        )
+        # Invalidate downstream stages only when canonical screenplay fields genuinely change
+        if changed_canonical:
+            PipelineOrchestrator.invalidate_downstream_stages(
+                db=db, project_id=scene.project_id, changed_stage="screenplay", commit=False
+            )
 
-    db.commit()
-    db.refresh(scene)
+        db.commit()
+        db.refresh(scene)
+    except Exception:
+        db.rollback()
+        raise
+
     shots_count = db.query(Shot).filter(Shot.scene_id == scene.id).count()
 
     return {
@@ -284,12 +300,17 @@ def delete_scene(scene_id: str, db: Session = Depends(get_db)):
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
 
-    project_id = scene.project_id
-    db.delete(scene)
-    PipelineOrchestrator.invalidate_downstream_stages(
-        db=db, project_id=project_id, changed_stage="screenplay", commit=False
-    )
-    db.commit()
+    try:
+        project_id = scene.project_id
+        db.delete(scene)
+        PipelineOrchestrator.invalidate_downstream_stages(
+            db=db, project_id=project_id, changed_stage="screenplay", commit=False
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
     return {"status": "deleted", "scene_id": scene_id}
 
 @router.post("/{scene_id}/refine")
@@ -301,9 +322,13 @@ def refine_scene(scene_id: str, req: RefineSceneRequest, db: Session = Depends(g
     old_content = scene.script_content or ""
     refined = screenwriter_agent.refine_scene(old_content, req.direction)
     if refined != old_content:
-        scene.script_content = refined
-        PipelineOrchestrator.invalidate_downstream_stages(
-            db=db, project_id=scene.project_id, changed_stage="screenplay", commit=False
-        )
-    db.commit()
+        try:
+            scene.script_content = refined
+            PipelineOrchestrator.invalidate_downstream_stages(
+                db=db, project_id=scene.project_id, changed_stage="screenplay", commit=False
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
     return {"scene_id": scene.id, "refined_script": refined}
