@@ -371,8 +371,22 @@ def safe_administrative_purge(
         Does NOT commit caller's session. If caller calls session.rollback(), the purge is rolled back.
         If caller calls session.commit(), the purge and caller changes are committed together.
         Reports status='pending_commit' and is_durable=False.
-    - Failure Guarantees:
-        On verification failure or any error, rolls back completely. No records are deleted.
+    - Failure Guarantees & Caller-Owned Transaction Contract:
+        On verification failure or any error:
+        * Engine Target:
+            The function rolls back the entire dedicated transaction and closes the connection.
+            The write lock is released immediately. No records are deleted.
+        * Session / Connection Target (Caller-Owned Transaction):
+            The function rolls back only its internal SAVEPOINT (restoring any state changed
+            inside the savepoint). It does NOT commit or automatically rollback the caller's outer transaction,
+            preserving unrelated caller work outside the savepoint.
+            IMPORTANT: Because the write lock (SQLite BEGIN IMMEDIATE or PostgreSQL ACCESS EXCLUSIVE)
+            was acquired on the caller's outer transaction, that lock remains held on the database
+            connection until the caller explicitly commits or rolls back their outer transaction.
+            The caller must promptly call session.rollback() / conn.rollback() to release the database
+            lock and terminate the transaction.
+        * In all failure modes, no audit records are deleted, and audit immutability triggers are
+          never left disabled.
     """
     if not force:
         raise AuditArchivalError("Administrative purge requires explicit force=True flag.")
@@ -475,6 +489,25 @@ def safe_administrative_purge(
                 savepoint.rollback()
             except Exception:
                 pass
+
+        # Defensive safeguard: ensure immutability triggers remain active in failure modes
+        if dialect_name == "sqlite":
+            try:
+                conn.execute(text("""
+                    CREATE TRIGGER IF NOT EXISTS trg_audit_no_delete
+                    BEFORE DELETE ON pipeline_checkpoint_audit
+                    BEGIN
+                        SELECT RAISE(ABORT, 'pipeline_checkpoint_audit is immutable and append-only');
+                    END;
+                """))
+            except Exception:
+                pass
+        elif dialect_name == "postgresql":
+            try:
+                conn.execute(text("ALTER TABLE pipeline_checkpoint_audit ENABLE TRIGGER trg_audit_prevent_mod;"))
+            except Exception:
+                pass
+
         if not caller_owns_transaction:
             if trans is not None:
                 try:

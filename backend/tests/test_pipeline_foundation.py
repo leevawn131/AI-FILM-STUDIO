@@ -869,23 +869,30 @@ def test_safe_administrative_purge_target_types_and_unrelated_session_isolation(
 
 def test_purge_concurrency_regression_blocks_unarchived_deletions(tmp_path):
     """
-    Verifies Requirement 3 (Deterministic Two-Connection Concurrency):
-    - Connection A starts purge and acquires SQLite BEGIN IMMEDIATE write lock.
-    - Connection B attempts to insert an audit record while purge is actively verifying/purging.
-    - Connection B is blocked by the write lock and cannot slip into the purge window.
-    - Verified that no unarchived record is ever deleted.
-    - Connection B's record survives in the database after Connection A completes.
+    Verifies Requirements 1 & 3 (Genuinely Deterministic Two-Connection Concurrency):
+    1. Worker A starts safe_administrative_purge().
+    2. A acquires BEGIN IMMEDIATE write lock.
+    3. A signals lock_acquired and waits for worker B to prove lock contention.
+    4. Worker B opens a separate connection.
+    5. B explicitly attempts BEGIN IMMEDIATE while A still owns the write lock.
+    6. Configures a bounded SQLite busy_timeout (100ms).
+    7. B must receive the expected database-is-locked result while A still holds its lock.
+    8. B signals lock_contention_proven.
+    9. A continues, verifies the archive, purges the archived records, and commits.
+    10. B retries BEGIN IMMEDIATE after A completes, then inserts the new record successfully.
+    11. Assert that archived records were removed and the concurrent unarchived record survived.
+    - All waits and joins use bounded timeouts to prevent hanging indefinitely.
+    - Exceptions are captured from both workers and re-raised if unexpected.
+    - Connections and transactions are cleaned up in finally blocks.
     """
     from backend.app.services.audit_archiver import (
         archive_audit_records,
         safe_administrative_purge,
-        AuditArchivalError,
     )
 
     test_db_path = tmp_path / "purge_concurrency_race.db"
     db_url = f"sqlite:///{test_db_path}"
-    # Small timeout for worker B to test blocking
-    engine = create_engine(db_url, connect_args={"timeout": 5.0})
+    engine = create_engine(db_url)
     run_migrations(target_engine=engine, db_url=db_url)
 
     # 1. Insert initial record 1
@@ -906,60 +913,103 @@ def test_purge_concurrency_regression_blocks_unarchived_deletions(tmp_path):
     archive_file = tmp_path / "race_archive.json"
     archive_audit_records(engine, archive_file)
 
-    # Deterministic synchronization events
+    # Synchronization events
     lock_acquired = threading.Event()
-    insert_attempted = threading.Event()
+    lock_contention_proven = threading.Event()
+    worker_a_result = {}
     worker_b_result = {}
 
     def purge_worker_a():
-        def on_lock():
-            lock_acquired.set()
-            # Wait until connection B has attempted to insert
-            insert_attempted.wait()
+        try:
+            def on_lock():
+                lock_acquired.set()
+                # Bounded wait until worker B has proven lock contention on the database
+                contention_ok = lock_contention_proven.wait(timeout=5.0)
+                if not contention_ok:
+                    raise TimeoutError("Worker A timed out waiting for Worker B to prove lock contention")
 
-        safe_administrative_purge(
-            engine,
-            archive_file,
-            force=True,
-            _on_lock_acquired=on_lock
-        )
+            safe_administrative_purge(
+                engine,
+                archive_file,
+                force=True,
+                _on_lock_acquired=on_lock
+            )
+            worker_a_result["success"] = True
+        except Exception as e:
+            worker_a_result["error"] = e
 
     def insert_worker_b():
-        # Wait until connection A has acquired the write lock
-        lock_acquired.wait()
-        with engine.connect() as conn_b:
-            # Signal that worker B is starting its insert attempt
-            insert_attempted.set()
-            try:
-                conn_b.execute(text("""
-                    INSERT INTO pipeline_checkpoint_audit (
-                        id, project_id, project_name_snapshot, checkpoint_id,
-                        checkpoint_type, decision, artifact_content_hash,
-                        artifact_version, reviewer_name, created_at
-                    ) VALUES (
-                        'rec-race-2-concurrent', 'proj-1', 'Race Film', 'cp-2',
-                        'visual_approval', 'APPROVED', 'hashrace2',
-                        1, 'Director', datetime('now')
-                    )
-                """))
-                conn_b.commit()
-                worker_b_result["success"] = True
-            except Exception as e:
-                worker_b_result["error"] = str(e)
+        try:
+            # 1. Bounded wait until Worker A has acquired BEGIN IMMEDIATE
+            acquired_ok = lock_acquired.wait(timeout=5.0)
+            if not acquired_ok:
+                raise TimeoutError("Worker B timed out waiting for Worker A to acquire write lock")
 
-    t_a = threading.Thread(target=purge_worker_a)
-    t_b = threading.Thread(target=insert_worker_b)
+            # 2. Worker B connects and verifies lock contention with bounded busy_timeout
+            with engine.connect() as conn_b:
+                conn_b.exec_driver_sql("PRAGMA busy_timeout = 100;")
+                try:
+                    conn_b.exec_driver_sql("BEGIN IMMEDIATE")
+                    worker_b_result["locked"] = False
+                    raise AssertionError("Worker B unexpectedly acquired BEGIN IMMEDIATE while Worker A held the write lock!")
+                except Exception as e:
+                    # Verify database is locked
+                    if "locked" in str(e).lower():
+                        worker_b_result["locked"] = True
+                    else:
+                        raise e
+                    try:
+                        conn_b.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    # Signal to Worker A that contention has been verified at the database level
+                    lock_contention_proven.set()
+
+        except Exception as e:
+            worker_b_result["error"] = e
+            # Ensure Worker A does not hang if Worker B encountered an error
+            lock_contention_proven.set()
+
+    t_a = threading.Thread(target=purge_worker_a, name="worker_a")
+    t_b = threading.Thread(target=insert_worker_b, name="worker_b")
 
     t_a.start()
     t_b.start()
-    t_a.join()
-    t_b.join()
+
+    # Bounded joins with explicit timeout
+    t_b.join(timeout=10.0)
+    assert not t_b.is_alive(), "Worker B thread timed out and failed to terminate"
+
+    t_a.join(timeout=10.0)
+    assert not t_a.is_alive(), "Worker A thread timed out and failed to terminate"
+
+    # Re-raise any captured worker exceptions
+    if "error" in worker_a_result:
+        raise worker_a_result["error"]
+    if "error" in worker_b_result:
+        raise worker_b_result["error"]
+
+    assert worker_a_result.get("success") is True, f"Worker A failed: {worker_a_result}"
+    assert worker_b_result.get("locked") is True, "Worker B must have proven database lock contention"
+
+    # 3. Now Worker B retries BEGIN IMMEDIATE after Worker A completed and inserts record 2
+    with engine.connect() as conn_retry:
+        conn_retry.exec_driver_sql("BEGIN IMMEDIATE")
+        conn_retry.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-race-2-concurrent', 'proj-1', 'Race Film', 'cp-2',
+                'visual_approval', 'APPROVED', 'hashrace2',
+                1, 'Director', datetime('now')
+            )
+        """))
+        conn_retry.commit()
 
     # 4. Assertions:
-    # Worker B must have succeeded after worker A released the lock
-    assert worker_b_result.get("success") is True, f"Worker B failed: {worker_b_result}"
-
-    # Verify actual database state:
     with engine.connect() as check_conn:
         rows = check_conn.execute(text("SELECT id FROM pipeline_checkpoint_audit")).fetchall()
         row_ids = [r[0] for r in rows]
@@ -2164,8 +2214,10 @@ def test_postgresql_audit_purge_transaction_and_locking(tmp_path):
         cnt_after = conn.execute(text(f"SELECT count(*) FROM pipeline_checkpoint_audit WHERE id = '{audit_id}'")).scalar()
         assert cnt_after == 0, "Record must be cleanly purged after successful verification on PostgreSQL"
 
-    # 5. Deterministic Concurrency Test on PostgreSQL:
+    # 5. Genuine Deterministic Concurrency Test on PostgreSQL:
     # ACCESS EXCLUSIVE lock blocks concurrent INSERT during purge window.
+    # Worker B sets bounded lock_timeout, proves lock contention at DB level,
+    # rolls back, and retries successfully after Worker A finishes.
     # Record inserted by concurrent worker must NOT be deleted.
     audit_id_1 = f"pg-race-1-{uuid.uuid4().hex[:8]}"
     audit_id_2 = f"pg-race-2-{uuid.uuid4().hex[:8]}"
@@ -2188,56 +2240,339 @@ def test_postgresql_audit_purge_transaction_and_locking(tmp_path):
     archive_audit_records(pg_engine, archive_race_file)
 
     pg_lock_acquired = threading.Event()
-    pg_insert_attempted = threading.Event()
+    pg_contention_proven = threading.Event()
+    worker_a_pg_result = {}
     worker_b_pg_result = {}
 
     def purge_worker_pg():
-        def on_lock():
-            pg_lock_acquired.set()
-            pg_insert_attempted.wait()
+        try:
+            def on_lock():
+                pg_lock_acquired.set()
+                contention_ok = pg_contention_proven.wait(timeout=5.0)
+                if not contention_ok:
+                    raise TimeoutError("Worker A (PG) timed out waiting for Worker B to prove lock contention")
 
-        safe_administrative_purge(
-            pg_engine,
-            archive_race_file,
-            force=True,
-            _on_lock_acquired=on_lock
-        )
+            safe_administrative_purge(
+                pg_engine,
+                archive_race_file,
+                force=True,
+                _on_lock_acquired=on_lock
+            )
+            worker_a_pg_result["success"] = True
+        except Exception as e:
+            worker_a_pg_result["error"] = e
 
     def insert_worker_pg():
-        pg_lock_acquired.wait()
-        with pg_engine.connect() as conn_b:
-            pg_insert_attempted.set()
-            try:
-                conn_b.execute(text("""
-                    INSERT INTO pipeline_checkpoint_audit (
-                        id, project_id, project_name_snapshot, checkpoint_id,
-                        checkpoint_type, decision, artifact_content_hash,
-                        artifact_version, reviewer_name, feedback_notes, created_at
-                    ) VALUES (
-                        :id, 'pg-proj-p', 'PG Race Film', 'cp-pg-2',
-                        'visual_approval', 'APPROVED', 'pghashrace2',
-                        1, 'PG Director', 'pg notes 2', NOW()
-                    );
-                """), {"id": audit_id_2})
-                conn_b.commit()
-                worker_b_pg_result["success"] = True
-            except Exception as e:
-                worker_b_pg_result["error"] = str(e)
+        try:
+            acquired_ok = pg_lock_acquired.wait(timeout=5.0)
+            if not acquired_ok:
+                raise TimeoutError("Worker B (PG) timed out waiting for Worker A to acquire lock")
 
-    t_pg_a = threading.Thread(target=purge_worker_pg)
-    t_pg_b = threading.Thread(target=insert_worker_pg)
+            with pg_engine.connect() as conn_b:
+                tx_b = conn_b.begin()
+                conn_b.execute(text("SET lock_timeout = '200ms';"))
+                try:
+                    conn_b.execute(text("""
+                        INSERT INTO pipeline_checkpoint_audit (
+                            id, project_id, project_name_snapshot, checkpoint_id,
+                            checkpoint_type, decision, artifact_content_hash,
+                            artifact_version, reviewer_name, feedback_notes, created_at
+                        ) VALUES (
+                            :id, 'pg-proj-p', 'PG Race Film', 'cp-pg-2',
+                            'visual_approval', 'APPROVED', 'pghashrace2',
+                            1, 'PG Director', 'pg notes 2', NOW()
+                        );
+                    """), {"id": audit_id_2})
+                    worker_b_pg_result["locked"] = False
+                    raise AssertionError("Worker B unexpectedly inserted while Worker A held ACCESS EXCLUSIVE lock!")
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if "lock timeout" in err_msg or "55p03" in err_msg or "locknotavailable" in err_msg:
+                        worker_b_pg_result["locked"] = True
+                    else:
+                        raise e
+                    try:
+                        tx_b.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    pg_contention_proven.set()
+        except Exception as e:
+            worker_b_pg_result["error"] = e
+            pg_contention_proven.set()
+
+    t_pg_a = threading.Thread(target=purge_worker_pg, name="worker_pg_a")
+    t_pg_b = threading.Thread(target=insert_worker_pg, name="worker_pg_b")
 
     t_pg_a.start()
     t_pg_b.start()
-    t_pg_a.join()
-    t_pg_b.join()
 
-    assert worker_b_pg_result.get("success") is True, f"PG Worker B failed: {worker_b_pg_result}"
+    t_pg_b.join(timeout=10.0)
+    assert not t_pg_b.is_alive(), "Worker B (PG) thread timed out"
+
+    t_pg_a.join(timeout=10.0)
+    assert not t_pg_a.is_alive(), "Worker A (PG) thread timed out"
+
+    if "error" in worker_a_pg_result:
+        raise worker_a_pg_result["error"]
+    if "error" in worker_b_pg_result:
+        raise worker_b_pg_result["error"]
+
+    assert worker_a_pg_result.get("success") is True, f"PG Worker A failed: {worker_a_pg_result}"
+    assert worker_b_pg_result.get("locked") is True, "PG Worker B must have proven lock timeout contention"
+
+    # Worker B retries insert after Worker A completed and released the lock
+    with pg_engine.connect() as conn_retry:
+        conn_retry.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, feedback_notes, created_at
+            ) VALUES (
+                :id, 'pg-proj-p', 'PG Race Film', 'cp-pg-2',
+                'visual_approval', 'APPROVED', 'pghashrace2',
+                1, 'PG Director', 'pg notes 2', NOW()
+            );
+        """), {"id": audit_id_2})
+        conn_retry.commit()
 
     with pg_engine.connect() as conn:
         rows = conn.execute(text("SELECT id FROM pipeline_checkpoint_audit")).fetchall()
         row_ids = [r[0] for r in rows]
         assert audit_id_1 not in row_ids, f"Archived record {audit_id_1} must be purged on PostgreSQL"
         assert audit_id_2 in row_ids, f"Unarchived concurrent record {audit_id_2} must survive on PostgreSQL!"
+
+    pg_engine.dispose()
+
+
+def test_caller_owned_failure_transaction_semantics_sqlite(tmp_path):
+    """
+    Verifies Requirement 4 (SQLite Caller-Owned Failure Transaction Contract):
+    - When safe_administrative_purge() fails on a Session/caller-Connection target:
+      1. SAVEPOINT rollback restores changes made inside that savepoint.
+      2. The caller-owned outer transaction remains active with write lock held.
+      3. Unrelated caller work on the session is not rolled back.
+      4. A second connection attempting BEGIN IMMEDIATE receives 'database is locked'.
+      5. After the caller explicitly calls session.rollback(), the lock is released.
+      6. The second connection can now acquire BEGIN IMMEDIATE and insert normally.
+      7. Failed verification never deletes audit records or leaves triggers disabled.
+    """
+    from backend.app.services.audit_archiver import (
+        safe_administrative_purge,
+        AuditVerificationError,
+    )
+
+    test_db_path = tmp_path / "caller_failure_contract.db"
+    db_url = f"sqlite:///{test_db_path}"
+    engine = create_engine(db_url)
+    run_migrations(target_engine=engine, db_url=db_url)
+
+    # 1. Insert initial audit record
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-caller-fail-1', 'proj-1', 'Fail Contract Film', 'cp-1',
+                'story_approval', 'APPROVED', 'hash1',
+                1, 'Director', datetime('now')
+            )
+        """))
+        conn.commit()
+
+    # 2. Create invalid archive (missing record)
+    bad_archive = tmp_path / "bad_archive.json"
+    with open(bad_archive, "w") as f:
+        f.write("[]")
+
+    SessionLocalTest = sessionmaker(bind=engine)
+    session = SessionLocalTest()
+
+    # Add unrelated work to session before purge
+    unrelated_proj = Project(
+        id="proj-caller-unrelated-fail",
+        name="Unrelated Work Preserved",
+        budget_total=500.0,
+        budget_spent=0.0
+    )
+    session.add(unrelated_proj)
+    assert unrelated_proj in session.new, "Unrelated project should be pending in session"
+
+    # 3. Call safe_administrative_purge with invalid archive
+    with pytest.raises(AuditVerificationError):
+        safe_administrative_purge(session, bad_archive, force=True)
+
+    # Assert unrelated work is NOT automatically rolled back
+    assert unrelated_proj in session.new, "Unrelated caller work must NOT be automatically discarded by purge failure"
+
+    # 4. While caller session transaction is still active, connection 2 tries BEGIN IMMEDIATE
+    with engine.connect() as conn2:
+        conn2.exec_driver_sql("PRAGMA busy_timeout = 100;")
+        conn2_locked = False
+        try:
+            conn2.exec_driver_sql("BEGIN IMMEDIATE")
+        except Exception as e:
+            if "locked" in str(e).lower():
+                conn2_locked = True
+            try:
+                conn2.rollback()
+            except Exception:
+                pass
+        assert conn2_locked is True, "Connection 2 must be locked while caller session holds write lock"
+
+    # 5. Caller promptly rolls back outer transaction
+    session.rollback()
+    session.close()
+
+    # 6. Connection 2 can now acquire BEGIN IMMEDIATE and insert normally
+    with engine.connect() as conn2:
+        conn2.exec_driver_sql("BEGIN IMMEDIATE")
+        conn2.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-caller-fail-2', 'proj-1', 'Fail Contract Film', 'cp-2',
+                'visual_approval', 'APPROVED', 'hash2',
+                1, 'Director', datetime('now')
+            )
+        """))
+        conn2.commit()
+
+    # 7. Assertions on data preservation and trigger integrity
+    with engine.connect() as check_conn:
+        rows = check_conn.execute(text("SELECT id FROM pipeline_checkpoint_audit")).fetchall()
+        row_ids = [r[0] for r in rows]
+        assert "rec-caller-fail-1" in row_ids, "Existing audit record 1 must NEVER be deleted by failed verification"
+        assert "rec-caller-fail-2" in row_ids, "Record 2 inserted after lock release must exist"
+        assert len(row_ids) == 2
+
+        # Verify immutability triggers remain active
+        trigger_blocked = False
+        try:
+            check_conn.execute(text("DELETE FROM pipeline_checkpoint_audit WHERE id = 'rec-caller-fail-1'"))
+        except Exception as e:
+            if "immutable and append-only" in str(e):
+                trigger_blocked = True
+        assert trigger_blocked is True, "Immutability trigger must remain active and block DELETE after failed verification"
+
+    engine.dispose()
+
+
+def test_caller_owned_failure_transaction_semantics_postgresql(tmp_path):
+    """
+    Verifies Requirement 4 (PostgreSQL Caller-Owned Failure Transaction Contract):
+    - When safe_administrative_purge() fails on PostgreSQL Session target:
+      1. SAVEPOINT rollback restores savepoint state.
+      2. The outer transaction remains active holding ACCESS EXCLUSIVE table lock.
+      3. A second connection attempting INSERT with bounded lock_timeout experiences lock timeout.
+      4. After the caller explicitly rolls back the session, the table lock is released.
+      5. The second connection can now insert records normally.
+      6. Audit records are preserved and table triggers remain active.
+    """
+    from backend.tests.test_postgres_concurrency import get_postgres_engine
+    from backend.app.services.audit_archiver import (
+        safe_administrative_purge,
+        AuditVerificationError,
+    )
+
+    pg_engine = get_postgres_engine()
+    if pg_engine is None:
+        pytest.skip("PostgreSQL test instance not reachable; skipping PG caller failure contract test.")
+
+    audit_id_1 = f"pg-cfail-1-{uuid.uuid4().hex[:8]}"
+    audit_id_2 = f"pg-cfail-2-{uuid.uuid4().hex[:8]}"
+
+    # 1. Insert initial audit record
+    with pg_engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, feedback_notes, created_at
+            ) VALUES (
+                :id, 'pg-cfail-proj', 'PG CFail Film', 'cp-1',
+                'story_approval', 'APPROVED', 'pghash1',
+                1, 'PG Director', 'notes', NOW()
+            );
+        """), {"id": audit_id_1})
+        conn.commit()
+
+    bad_archive = tmp_path / "pg_bad_archive.json"
+    with open(bad_archive, "w") as f:
+        f.write("[]")
+
+    SessionLocalTest = sessionmaker(bind=pg_engine)
+    session = SessionLocalTest()
+
+    # 2. Call safe_administrative_purge with bad archive
+    with pytest.raises(AuditVerificationError):
+        safe_administrative_purge(session, bad_archive, force=True)
+
+    # 3. Connection 2 attempts INSERT with lock_timeout while session holds ACCESS EXCLUSIVE lock
+    with pg_engine.connect() as conn2:
+        tx2 = conn2.begin()
+        conn2.execute(text("SET lock_timeout = '200ms';"))
+        conn2_locked = False
+        try:
+            conn2.execute(text("""
+                INSERT INTO pipeline_checkpoint_audit (
+                    id, project_id, project_name_snapshot, checkpoint_id,
+                    checkpoint_type, decision, artifact_content_hash,
+                    artifact_version, reviewer_name, feedback_notes, created_at
+                ) VALUES (
+                    :id, 'pg-cfail-proj', 'PG CFail Film', 'cp-2',
+                    'visual_approval', 'APPROVED', 'pghash2',
+                    1, 'PG Director', 'notes 2', NOW()
+                );
+            """), {"id": audit_id_2})
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "lock timeout" in err_msg or "55p03" in err_msg or "locknotavailable" in err_msg:
+                conn2_locked = True
+            try:
+                tx2.rollback()
+            except Exception:
+                pass
+        assert conn2_locked is True, "PG Connection 2 must timeout while caller session holds ACCESS EXCLUSIVE lock"
+
+    # 4. Caller promptly rolls back outer transaction
+    session.rollback()
+    session.close()
+
+    # 5. Connection 2 retries INSERT and succeeds
+    with pg_engine.connect() as conn2:
+        conn2.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, feedback_notes, created_at
+            ) VALUES (
+                :id, 'pg-cfail-proj', 'PG CFail Film', 'cp-2',
+                'visual_approval', 'APPROVED', 'pghash2',
+                1, 'PG Director', 'notes 2', NOW()
+            );
+        """), {"id": audit_id_2})
+        conn2.commit()
+
+    # 6. Verify audit records and trigger protection
+    with pg_engine.connect() as check_conn:
+        rows = check_conn.execute(text(f"SELECT id FROM pipeline_checkpoint_audit WHERE id IN ('{audit_id_1}', '{audit_id_2}')")).fetchall()
+        row_ids = [r[0] for r in rows]
+        assert audit_id_1 in row_ids, "Existing PostgreSQL audit record must NOT be deleted by failed verification"
+        assert audit_id_2 in row_ids, "PostgreSQL record 2 inserted after lock release must survive"
+        assert len(row_ids) == 2
+
+        # Verify trigger blocks DELETE
+        trigger_blocked = False
+        try:
+            check_conn.execute(text(f"DELETE FROM pipeline_checkpoint_audit WHERE id = '{audit_id_1}'"))
+        except Exception as e:
+            if "immutable and append-only" in str(e):
+                trigger_blocked = True
+        assert trigger_blocked is True, "PostgreSQL trigger must block DELETE after failed verification"
 
     pg_engine.dispose()
