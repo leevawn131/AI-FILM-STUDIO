@@ -135,6 +135,9 @@ FADE TO BLACK.
             )
             db.add_all([sh1, sh2])
             db.commit()
+
+            from backend.app.services.pipeline_orchestrator import initialize_project_pipeline
+            initialize_project_pipeline(demo.id, db)
     finally:
         db.close()
 

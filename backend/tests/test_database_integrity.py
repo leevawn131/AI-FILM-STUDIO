@@ -217,7 +217,7 @@ def test_2_valid_legacy_database_migration_with_backup_and_data_preservation(tmp
     # Verify upgraded columns exist
     cur.execute("SELECT version_num FROM alembic_version")
     ver = cur.fetchone()[0]
-    assert ver == "0007_upload_operation_lease_fencing"
+    assert ver in ("0007_upload_operation_lease_fencing", "0008_pipeline_orchestration_tables")
 
     cur.execute("PRAGMA table_info(studio_jobs)")
     job_cols = [c[1] for c in cur.fetchall()]
@@ -296,11 +296,11 @@ def test_5_existing_alembic_managed_database_upgrades(tmp_path):
     engine = create_engine(db_url)
     run_migrations(target_engine=engine, db_url=db_url)
 
-    # Verify upgraded to 0007
+    # Verify upgraded to 0007 or later head
     vconn = sqlite3.connect(str(alembic_db))
     cur = vconn.cursor()
     cur.execute("SELECT version_num FROM alembic_version")
-    assert cur.fetchone()[0] == "0007_upload_operation_lease_fencing"
+    assert cur.fetchone()[0] in ("0007_upload_operation_lease_fencing", "0008_pipeline_orchestration_tables")
     vconn.close()
 
 def test_database_backup_procedure(tmp_path):

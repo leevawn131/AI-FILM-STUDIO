@@ -1,5 +1,6 @@
 from backend.app.models.entities import (
-    Project, Character, Location, Scene, Shot, MediaAsset, AudioTrack, CostRecord, ExportJob, StudioJob
+    Project, Character, Location, Scene, Shot, MediaAsset, AudioTrack, CostRecord, ExportJob, StudioJob,
+    PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit
 )
 
 __all__ = [
@@ -12,5 +13,8 @@ __all__ = [
     "AudioTrack",
     "CostRecord",
     "ExportJob",
-    "StudioJob"
+    "StudioJob",
+    "PipelineStageState",
+    "PipelineCheckpoint",
+    "PipelineCheckpointAudit"
 ]

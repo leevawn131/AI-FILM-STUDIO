@@ -1,6 +1,7 @@
 import shutil
 from pathlib import Path
 from typing import List, Optional
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from backend.app.database import get_db
@@ -10,6 +11,7 @@ from backend.app.schemas.project import (
     ProjectCreate, ProjectUpdate, ProjectResponse, DashboardStats
 )
 from backend.app.services.security import validate_safe_path, sanitize_filename
+from backend.app.services.pipeline_orchestrator import initialize_project_pipeline, PIPELINE_STAGES
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -31,7 +33,7 @@ def get_project_stats(db: Session, project: Project) -> dict:
 
 @router.get("", response_model=List[ProjectResponse])
 def list_projects(db: Session = Depends(get_db)):
-    projects = db.query(Project).order_by(Project.created_at.desc()).all()
+    projects = db.query(Project).filter(Project.deleted_at.is_(None)).order_by(Project.created_at.desc()).all()
     result = []
     for p in projects:
         stats = get_project_stats(db, p)
@@ -46,6 +48,8 @@ def list_projects(db: Session = Depends(get_db)):
             "visual_style": p.visual_style,
             "budget_total": p.budget_total,
             "budget_spent": p.budget_spent,
+            "current_pipeline_stage": p.current_pipeline_stage or "story_development",
+            "pipeline_overall_status": p.pipeline_overall_status or "in_progress",
             "created_at": p.created_at,
             "updated_at": p.updated_at,
             **stats
@@ -64,11 +68,20 @@ def create_project(data: ProjectCreate, db: Session = Depends(get_db)):
         target_duration_sec=data.target_duration_sec or 120,
         visual_style=data.visual_style or "Cinematic 35mm film look, anamorphic lens flares, rich color grading, natural depth of field",
         budget_total=data.budget_total if data.budget_total is not None else 100.0,
-        budget_spent=0.0
+        budget_spent=0.0,
+        current_pipeline_stage="story_development",
+        pipeline_overall_status="in_progress"
     )
-    db.add(project)
-    db.commit()
-    db.refresh(project)
+    try:
+        db.add(project)
+        db.flush()
+        # Atomically initialize pipeline stages and checkpoints
+        initialize_project_pipeline(project.id, db, auto_commit=False)
+        db.commit()
+        db.refresh(project)
+    except Exception:
+        db.rollback()
+        raise
 
     # Scaffold local project folders
     project_dir = settings.projects_dir / project.id
@@ -86,6 +99,8 @@ def create_project(data: ProjectCreate, db: Session = Depends(get_db)):
         "visual_style": project.visual_style,
         "budget_total": project.budget_total,
         "budget_spent": project.budget_spent,
+        "current_pipeline_stage": project.current_pipeline_stage,
+        "pipeline_overall_status": project.pipeline_overall_status,
         "created_at": project.created_at,
         "updated_at": project.updated_at,
         "scenes_count": 0,
@@ -96,9 +111,17 @@ def create_project(data: ProjectCreate, db: Session = Depends(get_db)):
 
 @router.get("/{project_id}", response_model=ProjectResponse)
 def get_project(project_id: str, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == project_id).first()
+    project = db.query(Project).filter(Project.id == project_id, Project.deleted_at.is_(None)).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Safely self-heal legacy projects predating S4 pipeline
+    from backend.app.models.entities import PipelineStageState
+    stage_count = db.query(PipelineStageState).filter(PipelineStageState.project_id == project_id).count()
+    if stage_count < len(PIPELINE_STAGES):
+        initialize_project_pipeline(project_id, db, auto_commit=True)
+        db.refresh(project)
+
     stats = get_project_stats(db, project)
     return {
         "id": project.id,
@@ -111,6 +134,8 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
         "visual_style": project.visual_style,
         "budget_total": project.budget_total,
         "budget_spent": project.budget_spent,
+        "current_pipeline_stage": project.current_pipeline_stage or "story_development",
+        "pipeline_overall_status": project.pipeline_overall_status or "in_progress",
         "created_at": project.created_at,
         "updated_at": project.updated_at,
         **stats
@@ -118,7 +143,7 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
 def update_project(project_id: str, data: ProjectUpdate, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == project_id).first()
+    project = db.query(Project).filter(Project.id == project_id, Project.deleted_at.is_(None)).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -139,6 +164,8 @@ def update_project(project_id: str, data: ProjectUpdate, db: Session = Depends(g
         "visual_style": project.visual_style,
         "budget_total": project.budget_total,
         "budget_spent": project.budget_spent,
+        "current_pipeline_stage": project.current_pipeline_stage or "story_development",
+        "pipeline_overall_status": project.pipeline_overall_status or "in_progress",
         "created_at": project.created_at,
         "updated_at": project.updated_at,
         **stats
@@ -146,16 +173,11 @@ def update_project(project_id: str, data: ProjectUpdate, db: Session = Depends(g
 
 @router.delete("/{project_id}")
 def delete_project(project_id: str, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == project_id).first()
+    project = db.query(Project).filter(Project.id == project_id, Project.deleted_at.is_(None)).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Delete local project folder safely
-    safe_pid = sanitize_filename(project_id)
-    project_dir = validate_safe_path(settings.projects_dir / safe_pid, settings.projects_dir)
-    if project_dir.exists():
-        shutil.rmtree(project_dir, ignore_errors=True)
-
-    db.delete(project)
+    # Soft delete project to preserve immutable audit trail
+    project.deleted_at = datetime.now(timezone.utc)
     db.commit()
     return {"status": "deleted", "project_id": project_id}

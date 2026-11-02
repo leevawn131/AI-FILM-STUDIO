@@ -29,6 +29,8 @@ class ProjectUpdate(BaseModel):
 class ProjectResponse(ProjectBase):
     id: str
     budget_spent: float
+    current_pipeline_stage: Optional[str] = "story_development"
+    pipeline_overall_status: Optional[str] = "in_progress"
     created_at: datetime
     updated_at: datetime
     scenes_count: Optional[int] = 0

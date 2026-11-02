@@ -25,6 +25,9 @@ class Project(Base):
     visual_style = Column(Text, default="Cinematic 35mm film look, anamorphic lens flares, rich color grading, natural depth of field")
     budget_total = Column(Float, default=100.0)
     budget_spent = Column(Float, default=0.0)
+    deleted_at = Column(DateTime, nullable=True)
+    current_pipeline_stage = Column(String(64), nullable=False, default="story_development")
+    pipeline_overall_status = Column(String(32), nullable=False, default="in_progress")
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
@@ -39,6 +42,8 @@ class Project(Base):
     export_jobs = relationship("ExportJob", back_populates="project", cascade="all, delete-orphan")
     studio_jobs = relationship("StudioJob", back_populates="project", cascade="all, delete-orphan")
     upload_operations = relationship("UploadOperation", back_populates="project", cascade="all, delete-orphan")
+    stage_states = relationship("PipelineStageState", back_populates="project", cascade="all, delete-orphan")
+    checkpoints = relationship("PipelineCheckpoint", back_populates="project", cascade="all, delete-orphan")
 
 
 class Character(Base):
@@ -280,3 +285,69 @@ class UploadOperation(Base):
     completed_at = Column(DateTime, nullable=True)
 
     project = relationship("Project", back_populates="upload_operations")
+
+
+class PipelineStageState(Base):
+    __tablename__ = "pipeline_stage_states"
+
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    stage_name = Column(String(64), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="NOT_STARTED", index=True)
+    active_job_id = Column(String(36), ForeignKey("studio_jobs.id", ondelete="SET NULL"), nullable=True)
+    retry_count = Column(Integer, default=0, nullable=False)
+    content_hash = Column(String(64), nullable=True)
+    consumed_input_hash = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    stage_metadata = Column(Text, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "stage_name", name="uq_project_stage_name"),
+    )
+
+    project = relationship("Project", back_populates="stage_states")
+    active_job = relationship("StudioJob")
+
+
+class PipelineCheckpoint(Base):
+    __tablename__ = "pipeline_checkpoints"
+
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    checkpoint_type = Column(String(64), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="LOCKED", index=True)
+    artifact_type = Column(String(64), nullable=False)
+    artifact_version = Column(Integer, default=1, nullable=False)
+    artifact_content_hash = Column(String(64), nullable=True)
+    reviewer_name = Column(String(128), default="Director / User", nullable=False)
+    feedback_notes = Column(Text, nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "checkpoint_type", name="uq_project_checkpoint_type"),
+    )
+
+    project = relationship("Project", back_populates="checkpoints")
+
+
+class PipelineCheckpointAudit(Base):
+    __tablename__ = "pipeline_checkpoint_audit"
+
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    project_id = Column(String(36), nullable=False, index=True)
+    project_name_snapshot = Column(String(128), nullable=False)
+    checkpoint_id = Column(String(36), nullable=False, index=True)
+    checkpoint_type = Column(String(64), nullable=False)
+    decision = Column(String(32), nullable=False)
+    artifact_content_hash = Column(String(64), nullable=False)
+    artifact_version = Column(Integer, nullable=False)
+    reviewer_name = Column(String(128), nullable=False)
+    feedback_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+
