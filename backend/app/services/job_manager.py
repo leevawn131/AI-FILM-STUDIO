@@ -306,7 +306,8 @@ class JobManager:
         result: Any,
         worker_id: Optional[str] = None,
         fencing_token: Optional[int] = None,
-        lease_token: Optional[int] = None
+        lease_token: Optional[int] = None,
+        commit: bool = True
     ) -> StudioJob:
         """
         Marks a job as COMPLETED and stores its serialized output.
@@ -338,7 +339,8 @@ class JobManager:
             .execution_options(synchronize_session=False)
         )
         res = db.execute(stmt)
-        db.commit()
+        if commit:
+            db.commit()
 
         if res.rowcount == 0:
             current = db.query(StudioJob).filter(StudioJob.id == job_id).first()
@@ -362,7 +364,8 @@ class JobManager:
         user_facing_error: Optional[str] = None,
         worker_id: Optional[str] = None,
         fencing_token: Optional[int] = None,
-        lease_token: Optional[int] = None
+        lease_token: Optional[int] = None,
+        commit: bool = True
     ) -> StudioJob:
         """
         Marks a job as FAILED, storing safe user message while preserving internal diagnostics.
@@ -395,7 +398,8 @@ class JobManager:
             .execution_options(synchronize_session=False)
         )
         res = db.execute(stmt)
-        db.commit()
+        if commit:
+            db.commit()
 
         if res.rowcount == 0:
             current = db.query(StudioJob).filter(StudioJob.id == job_id).first()

@@ -28,13 +28,7 @@ def seed_initial_demo_if_empty(force: bool = False):
                 budget_spent=0.0
             )
             db.add(demo)
-            db.commit()
-            db.refresh(demo)
-
-            # Scaffold folders
-            p_dir = settings.projects_dir / demo.id
-            for sub in ["flow_packages", "imported_videos", "renders", "audio", "references"]:
-                (p_dir / sub).mkdir(parents=True, exist_ok=True)
+            db.flush()
 
             # Seed character
             char = Character(
@@ -134,10 +128,21 @@ FADE TO BLACK.
                 order_index=2
             )
             db.add_all([sh1, sh2])
-            db.commit()
+            db.flush()
 
+            # Atomically initialize pipeline stages and checkpoints within the same transaction
             from backend.app.services.pipeline_orchestrator import initialize_project_pipeline
-            initialize_project_pipeline(demo.id, db)
+            initialize_project_pipeline(demo.id, db, auto_commit=False)
+            db.commit()
+            db.refresh(demo)
+
+            # Scaffold folders only after successful atomic commit
+            p_dir = settings.projects_dir / demo.id
+            for sub in ["flow_packages", "imported_videos", "renders", "audio", "references"]:
+                (p_dir / sub).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 

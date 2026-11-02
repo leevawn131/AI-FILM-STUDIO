@@ -11,7 +11,9 @@ from backend.app.schemas.project import (
     ProjectCreate, ProjectUpdate, ProjectResponse, DashboardStats
 )
 from backend.app.services.security import validate_safe_path, sanitize_filename
-from backend.app.services.pipeline_orchestrator import initialize_project_pipeline, PIPELINE_STAGES
+from backend.app.services.pipeline_orchestrator import (
+    initialize_project_pipeline, is_pipeline_complete, PIPELINE_STAGES
+)
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -115,10 +117,8 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Safely self-heal legacy projects predating S4 pipeline
-    from backend.app.models.entities import PipelineStageState
-    stage_count = db.query(PipelineStageState).filter(PipelineStageState.project_id == project_id).count()
-    if stage_count < len(PIPELINE_STAGES):
+    # Safely self-heal legacy projects predating S4 pipeline or missing checkpoints/stages
+    if not is_pipeline_complete(db, project_id):
         initialize_project_pipeline(project_id, db, auto_commit=True)
         db.refresh(project)
 

@@ -2,20 +2,29 @@
 Pipeline Orchestrator Service.
 Choreographs the end-to-end filmmaking production pipeline across 11 discrete stages
 and 4 human approval checkpoints.
+
+Canonical Single Source of Truth:
+- PipelineStageState: Authoritative state of each production stage.
+- PipelineCheckpoint: Authoritative state of each human approval gate.
+- PipelineCheckpointAudit: Immutable, append-only compliance journal.
+- Project.current_pipeline_stage & Project.pipeline_overall_status: Derived projections
+  updated transactionally by orchestrator operations.
 """
 
 import json
 import hashlib
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 from sqlalchemy import update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
 from backend.app.models.entities import (
     Project, Scene, Shot, Character, Location,
     PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit,
-    StudioJob
+    StudioJob, gen_uuid
 )
 from backend.app.services.job_manager import job_manager, JobOwnershipLostError
 
@@ -44,10 +53,73 @@ PIPELINE_CHECKPOINTS = [
 ]
 
 
+def is_pipeline_complete(db: Session, project_id: str) -> bool:
+    """
+    Checks if all 11 discrete stages and all 4 checkpoints exist for the project.
+    Verifies exact stage names and checkpoint types, not just row count.
+    """
+    stage_names = {
+        name for (name,) in db.query(PipelineStageState.stage_name)
+        .filter(PipelineStageState.project_id == project_id).all()
+    }
+    if not set(PIPELINE_STAGES).issubset(stage_names):
+        return False
+
+    cp_types = {
+        cp_type for (cp_type,) in db.query(PipelineCheckpoint.checkpoint_type)
+        .filter(PipelineCheckpoint.project_id == project_id).all()
+    }
+    expected_cps = {cp[0] for cp in PIPELINE_CHECKPOINTS}
+    if not expected_cps.issubset(cp_types):
+        return False
+
+    return True
+
+
+def update_project_pipeline_projections(db: Session, project_id: str) -> None:
+    """
+    Updates Project.current_pipeline_stage and Project.pipeline_overall_status
+    as derived projections of PipelineStageState (canonical source of truth).
+    """
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        return
+    stages = db.query(PipelineStageState).filter(PipelineStageState.project_id == project_id).all()
+    stage_map = {s.stage_name: s for s in stages}
+
+    current_stage = PIPELINE_STAGES[0]
+    overall_status = "in_progress"
+
+    all_completed = True
+    for stage_name in PIPELINE_STAGES:
+        st = stage_map.get(stage_name)
+        if st and st.status != "COMPLETED":
+            current_stage = stage_name
+            all_completed = False
+            if st.status == "FAILED":
+                overall_status = "failed"
+            elif st.status in ("WAITING_FOR_APPROVAL", "WAITING_FOR_USER_INPUT", "WAITING_FOR_EXTERNAL_MEDIA"):
+                overall_status = st.status.lower()
+            elif st.status == "IN_PROGRESS":
+                overall_status = "in_progress"
+            else:
+                overall_status = "in_progress"
+            break
+
+    if all_completed and len(stage_map) >= len(PIPELINE_STAGES):
+        current_stage = PIPELINE_STAGES[-1]
+        overall_status = "completed"
+
+    project.current_pipeline_stage = current_stage
+    project.pipeline_overall_status = overall_status
+
+
 def initialize_project_pipeline(project_id: Any, db: Any = None, auto_commit: bool = True) -> None:
     """
-    Idempotently initializes all 11 production stages and 4 approval checkpoints for a project.
-    Safe for both new project creation and existing legacy projects.
+    Atomically and idempotently initializes all 11 production stages and 4 approval checkpoints.
+    Safe for concurrent initialization across SQLite and PostgreSQL using dialect-specific
+    INSERT ON CONFLICT DO NOTHING and PostgreSQL row locking.
+    Preserves all existing stages, checkpoints, and associated metadata.
     Supports initialize_project_pipeline(project_id, db) and initialize_project_pipeline(db, project_id).
     """
     if isinstance(project_id, Session) or hasattr(project_id, "query"):
@@ -60,62 +132,152 @@ def initialize_project_pipeline(project_id: Any, db: Any = None, auto_commit: bo
     if not pid or not session:
         raise ValueError("Both project_id and db session are required for pipeline initialization")
 
-    project = session.query(Project).filter(Project.id == pid).first()
-    if not project or project.deleted_at is not None:
-        raise ValueError(f"Project '{pid}' not found or has been soft-deleted")
+    bind = session.get_bind()
+    dialect_name = bind.dialect.name if bind else "sqlite"
 
     try:
-        # 1. Initialize 11 Stage States in order
-        existing_stages = {
-            s.stage_name: s
-            for s in session.query(PipelineStageState).filter(PipelineStageState.project_id == pid).all()
-        }
+        # Row-level lock on PostgreSQL to serialize concurrent initializations
+        if dialect_name == "postgresql":
+            project = session.query(Project).filter(Project.id == pid).with_for_update().first()
+        else:
+            project = session.query(Project).filter(Project.id == pid).first()
 
+        if not project or project.deleted_at is not None:
+            raise ValueError(f"Project '{pid}' not found or has been soft-deleted")
+
+        now = utc_now()
+
+        # 1. Atomic insertion for 11 Stages
         for stage_name in PIPELINE_STAGES:
-            if stage_name not in existing_stages:
-                stage = PipelineStageState(
-                    project_id=pid,
-                    stage_name=stage_name,
-                    status="NOT_STARTED"
+            if dialect_name == "postgresql":
+                stmt = (
+                    pg_insert(PipelineStageState)
+                    .values(
+                        id=gen_uuid(),
+                        project_id=pid,
+                        stage_name=stage_name,
+                        status="NOT_STARTED",
+                        retry_count=0,
+                        created_at=now,
+                        updated_at=now
+                    )
+                    .on_conflict_do_nothing(index_elements=["project_id", "stage_name"])
                 )
-                session.add(stage)
+                session.execute(stmt)
+            elif dialect_name == "sqlite":
+                stmt = (
+                    sqlite_insert(PipelineStageState)
+                    .values(
+                        id=gen_uuid(),
+                        project_id=pid,
+                        stage_name=stage_name,
+                        status="NOT_STARTED",
+                        retry_count=0,
+                        created_at=now,
+                        updated_at=now
+                    )
+                    .on_conflict_do_nothing(index_elements=["project_id", "stage_name"])
+                )
+                session.execute(stmt)
+            else:
+                exists = session.query(PipelineStageState).filter(
+                    PipelineStageState.project_id == pid,
+                    PipelineStageState.stage_name == stage_name
+                ).first()
+                if not exists:
+                    session.add(PipelineStageState(
+                        id=gen_uuid(),
+                        project_id=pid,
+                        stage_name=stage_name,
+                        status="NOT_STARTED",
+                        created_at=now,
+                        updated_at=now
+                    ))
 
-        # 2. Initialize 4 Checkpoints
-        existing_cps = {
-            cp.checkpoint_type: cp
-            for cp in session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == pid).all()
-        }
-
+        # 2. Atomic insertion for 4 Checkpoints
         for cp_type, artifact_type in PIPELINE_CHECKPOINTS:
-            if cp_type not in existing_cps:
-                checkpoint = PipelineCheckpoint(
-                    project_id=pid,
-                    checkpoint_type=cp_type,
-                    status="LOCKED",
-                    artifact_type=artifact_type,
-                    artifact_version=1,
-                    artifact_content_hash=None
+            if dialect_name == "postgresql":
+                stmt = (
+                    pg_insert(PipelineCheckpoint)
+                    .values(
+                        id=gen_uuid(),
+                        project_id=pid,
+                        checkpoint_type=cp_type,
+                        status="LOCKED",
+                        artifact_type=artifact_type,
+                        artifact_version=1,
+                        artifact_content_hash=None,
+                        reviewer_name="Director / User",
+                        created_at=now,
+                        updated_at=now
+                    )
+                    .on_conflict_do_nothing(index_elements=["project_id", "checkpoint_type"])
                 )
-                session.add(checkpoint)
+                session.execute(stmt)
+            elif dialect_name == "sqlite":
+                stmt = (
+                    sqlite_insert(PipelineCheckpoint)
+                    .values(
+                        id=gen_uuid(),
+                        project_id=pid,
+                        checkpoint_type=cp_type,
+                        status="LOCKED",
+                        artifact_type=artifact_type,
+                        artifact_version=1,
+                        artifact_content_hash=None,
+                        reviewer_name="Director / User",
+                        created_at=now,
+                        updated_at=now
+                    )
+                    .on_conflict_do_nothing(index_elements=["project_id", "checkpoint_type"])
+                )
+                session.execute(stmt)
+            else:
+                exists = session.query(PipelineCheckpoint).filter(
+                    PipelineCheckpoint.project_id == pid,
+                    PipelineCheckpoint.checkpoint_type == cp_type
+                ).first()
+                if not exists:
+                    session.add(PipelineCheckpoint(
+                        id=gen_uuid(),
+                        project_id=pid,
+                        checkpoint_type=cp_type,
+                        status="LOCKED",
+                        artifact_type=artifact_type,
+                        artifact_version=1,
+                        artifact_content_hash=None,
+                        reviewer_name="Director / User",
+                        created_at=now,
+                        updated_at=now
+                    ))
 
-        # 3. Synchronize project projections if default
+        # 3. Synchronize projections if not set
         if not project.current_pipeline_stage:
             project.current_pipeline_stage = "story_development"
         if not project.pipeline_overall_status:
             project.pipeline_overall_status = "in_progress"
 
+        # 4. Strict verification of exact stages and checkpoints
+        stages = session.query(PipelineStageState).filter(PipelineStageState.project_id == pid).all()
+        stage_names = {s.stage_name for s in stages}
+        missing_stages = set(PIPELINE_STAGES) - stage_names
+        if missing_stages:
+            raise RuntimeError(f"Pipeline initialization failed to establish all stages: missing {missing_stages}")
+
+        cps = session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == pid).all()
+        cp_types = {cp.checkpoint_type for cp in cps}
+        missing_cps = {c[0] for c in PIPELINE_CHECKPOINTS} - cp_types
+        if missing_cps:
+            raise RuntimeError(f"Pipeline initialization failed to establish all checkpoints: missing {missing_cps}")
+
         session.flush()
         if auto_commit:
             session.commit()
-    except Exception as e:
-        from sqlalchemy.exc import IntegrityError
-        if isinstance(e, IntegrityError):
-            session.rollback()
-            # Another concurrent worker initialized stages; confirm existence
-            stage_cnt = session.query(PipelineStageState).filter(PipelineStageState.project_id == pid).count()
-            cp_cnt = session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == pid).count()
-            if stage_cnt >= len(PIPELINE_STAGES) and cp_cnt >= len(PIPELINE_CHECKPOINTS):
-                return
+    except Exception:
+        session.rollback()
+        # If another worker concurrently initialized the pipeline, verify completeness
+        if is_pipeline_complete(session, pid):
+            return
         raise
 
 
@@ -125,19 +287,27 @@ class PipelineOrchestrator:
         return initialize_project_pipeline(project_id, db, auto_commit=auto_commit)
 
     @staticmethod
+    def is_pipeline_complete(db: Session, project_id: str) -> bool:
+        return is_pipeline_complete(db, project_id)
+
+    @staticmethod
+    def update_project_pipeline_projections(db: Session, project_id: str) -> None:
+        return update_project_pipeline_projections(db, project_id)
+
+    @staticmethod
     def get_pipeline_status(db: Session, project_id: str) -> Dict[str, Any]:
         """
         Retrieves complete pipeline status, active stage, and checkpoints.
-        Self-healing: initializes pipeline records if missing.
+        Self-healing: initializes any missing stage or checkpoint records for legacy projects.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project or project.deleted_at is not None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-        # Self-healing for existing legacy projects
-        stage_count = db.query(PipelineStageState).filter(PipelineStageState.project_id == project_id).count()
-        if stage_count < len(PIPELINE_STAGES):
-            PipelineOrchestrator.initialize_project_pipeline(db, project_id)
+        # Self-healing for legacy or partially initialized projects
+        if not is_pipeline_complete(db, project_id):
+            initialize_project_pipeline(project_id, db, auto_commit=True)
+            db.refresh(project)
 
         stages = db.query(PipelineStageState).filter(PipelineStageState.project_id == project_id).all()
         checkpoints = db.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == project_id).all()
@@ -186,6 +356,8 @@ class PipelineOrchestrator:
     def compute_artifact_hash(db: Session, project_id: str, artifact_type: str) -> Optional[str]:
         """
         Computes canonical SHA-256 hash using deterministic JSON serialization.
+        Currently strictly scoped to 'screenplay' in Milestone 1 foundation.
+        Raises NotImplementedError for other checkpoint types to prevent unsupported approvals.
         """
         if artifact_type == "screenplay":
             scenes = db.query(Scene).filter(Scene.project_id == project_id).order_by(Scene.order_index).all()
@@ -206,7 +378,10 @@ class PipelineOrchestrator:
             raw = json.dumps(canonical_list, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('utf-8')
             return hashlib.sha256(raw).hexdigest()
 
-        return None
+        raise NotImplementedError(
+            f"Artifact hashing for '{artifact_type}' is not implemented in Milestone 1 foundation. "
+            "Only 'screenplay' is supported in this milestone."
+        )
 
     @staticmethod
     def record_checkpoint_decision(
@@ -280,7 +455,7 @@ class PipelineOrchestrator:
                     screenplay_stage.completed_at = now
                 project.current_pipeline_stage = "character_design"
                 project.pipeline_overall_status = "in_progress"
-            else: # REJECTED
+            else:  # REJECTED
                 if screenplay_stage:
                     screenplay_stage.status = "WAITING_FOR_USER_INPUT"
                     screenplay_stage.error_message = notes or "Screenplay rejected during review."
@@ -369,41 +544,58 @@ class PipelineOrchestrator:
         stage_metadata: Optional[str] = None
     ) -> PipelineStageState:
         """
-        Atomically completes a pipeline stage verified by worker fencing token.
-        Guarantees that stale workers cannot update stage status.
+        Atomically completes a pipeline stage verified by worker fencing token within a single database transaction.
+        Guarantees that stale workers, expired leases, or mismatched active jobs cannot update stage or job status.
+        Rolls back both StudioJob and PipelineStageState updates if any validation fails.
         """
+        if not active_job_id:
+            raise JobOwnershipLostError("active_job_id is required to complete pipeline stage")
+        if not worker_id:
+            raise JobOwnershipLostError("worker_id is required to complete pipeline stage")
+        if fencing_token is None:
+            raise JobOwnershipLostError("fencing_token is required to complete pipeline stage")
+
         now = utc_now()
-
-        # 1. Complete underlying StudioJob with mandatory fencing check
-        job_manager.complete_job(
-            db=db,
-            job_id=active_job_id,
-            result={"status": "completed", "content_hash": result_hash},
-            worker_id=worker_id,
-            fencing_token=fencing_token
-        )
-
-        # 2. Conditional atomic update on PipelineStageState
-        stmt = (
-            update(PipelineStageState)
-            .where(PipelineStageState.project_id == project_id)
-            .where(PipelineStageState.stage_name == stage_name)
-            .where(PipelineStageState.active_job_id == active_job_id)
-            .values(
-                status="COMPLETED",
-                content_hash=result_hash,
-                consumed_input_hash=consumed_input_hash,
-                stage_metadata=stage_metadata,
-                completed_at=now,
-                updated_at=now
+        try:
+            # 1. Complete underlying StudioJob with commit=False in the active transaction
+            job_manager.complete_job(
+                db=db,
+                job_id=active_job_id,
+                result={"status": "completed", "content_hash": result_hash},
+                worker_id=worker_id,
+                fencing_token=fencing_token,
+                commit=False
             )
-        )
-        res = db.execute(stmt)
-        if res.rowcount == 0:
-            db.rollback()
-            raise JobOwnershipLostError("Pipeline stage is no longer owned by the specified active job")
 
-        db.commit()
+            # 2. Conditional atomic update on PipelineStageState
+            stmt = (
+                update(PipelineStageState)
+                .where(PipelineStageState.project_id == project_id)
+                .where(PipelineStageState.stage_name == stage_name)
+                .where(PipelineStageState.active_job_id == active_job_id)
+                .values(
+                    status="COMPLETED",
+                    content_hash=result_hash,
+                    consumed_input_hash=consumed_input_hash,
+                    stage_metadata=stage_metadata,
+                    completed_at=now,
+                    updated_at=now
+                )
+                .execution_options(synchronize_session=False)
+            )
+            res = db.execute(stmt)
+            if res.rowcount == 0:
+                raise JobOwnershipLostError(
+                    f"Pipeline stage '{stage_name}' for project '{project_id}' is no longer associated with active job '{active_job_id}'"
+                )
+
+            # 3. Update derived projections
+            update_project_pipeline_projections(db, project_id)
+
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
         stage = db.query(PipelineStageState).filter(
             PipelineStageState.project_id == project_id,
@@ -422,32 +614,57 @@ class PipelineOrchestrator:
         fencing_token: int
     ) -> PipelineStageState:
         """
-        Fails a pipeline stage verified by worker fencing token.
+        Atomically fails a pipeline stage verified by worker fencing token within a single database transaction.
+        Guarantees that stale workers, expired leases, or mismatched active jobs cannot update stage or job status.
+        Rolls back both StudioJob and PipelineStageState updates if any validation fails.
         """
+        if not active_job_id:
+            raise JobOwnershipLostError("active_job_id is required to fail pipeline stage")
+        if not worker_id:
+            raise JobOwnershipLostError("worker_id is required to fail pipeline stage")
+        if fencing_token is None:
+            raise JobOwnershipLostError("fencing_token is required to fail pipeline stage")
+
         now = utc_now()
         err_msg = str(error)
 
-        job_manager.fail_job(
-            db=db,
-            job_id=active_job_id,
-            error=error,
-            worker_id=worker_id,
-            fencing_token=fencing_token
-        )
-
-        stmt = (
-            update(PipelineStageState)
-            .where(PipelineStageState.project_id == project_id)
-            .where(PipelineStageState.stage_name == stage_name)
-            .where(PipelineStageState.active_job_id == active_job_id)
-            .values(
-                status="FAILED",
-                error_message=err_msg,
-                updated_at=now
+        try:
+            # 1. Fail underlying StudioJob with commit=False in the active transaction
+            job_manager.fail_job(
+                db=db,
+                job_id=active_job_id,
+                error=error,
+                worker_id=worker_id,
+                fencing_token=fencing_token,
+                commit=False
             )
-        )
-        db.execute(stmt)
-        db.commit()
+
+            # 2. Conditional atomic update on PipelineStageState
+            stmt = (
+                update(PipelineStageState)
+                .where(PipelineStageState.project_id == project_id)
+                .where(PipelineStageState.stage_name == stage_name)
+                .where(PipelineStageState.active_job_id == active_job_id)
+                .values(
+                    status="FAILED",
+                    error_message=err_msg,
+                    updated_at=now
+                )
+                .execution_options(synchronize_session=False)
+            )
+            res = db.execute(stmt)
+            if res.rowcount == 0:
+                raise JobOwnershipLostError(
+                    f"Pipeline stage '{stage_name}' for project '{project_id}' is no longer associated with active job '{active_job_id}'"
+                )
+
+            # 3. Update derived projections
+            update_project_pipeline_projections(db, project_id)
+
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
         stage = db.query(PipelineStageState).filter(
             PipelineStageState.project_id == project_id,

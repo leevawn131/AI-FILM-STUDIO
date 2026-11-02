@@ -25,7 +25,11 @@ class Project(Base):
     visual_style = Column(Text, default="Cinematic 35mm film look, anamorphic lens flares, rich color grading, natural depth of field")
     budget_total = Column(Float, default=100.0)
     budget_spent = Column(Float, default=0.0)
+    # Soft deletion timestamp (preserves immutable audit journal and stage histories)
     deleted_at = Column(DateTime, nullable=True)
+
+    # Derived projections of pipeline progress (PipelineStageState is the canonical single source of truth).
+    # These fields are updated transactionally by pipeline orchestrator state transitions.
     current_pipeline_stage = Column(String(64), nullable=False, default="story_development")
     pipeline_overall_status = Column(String(32), nullable=False, default="in_progress")
     created_at = Column(DateTime, default=utc_now)
@@ -42,8 +46,8 @@ class Project(Base):
     export_jobs = relationship("ExportJob", back_populates="project", cascade="all, delete-orphan")
     studio_jobs = relationship("StudioJob", back_populates="project", cascade="all, delete-orphan")
     upload_operations = relationship("UploadOperation", back_populates="project", cascade="all, delete-orphan")
-    stage_states = relationship("PipelineStageState", back_populates="project", cascade="all, delete-orphan")
-    checkpoints = relationship("PipelineCheckpoint", back_populates="project", cascade="all, delete-orphan")
+    stage_states = relationship("PipelineStageState", back_populates="project", passive_deletes=True)
+    checkpoints = relationship("PipelineCheckpoint", back_populates="project", passive_deletes=True)
 
 
 class Character(Base):
@@ -291,7 +295,7 @@ class PipelineStageState(Base):
     __tablename__ = "pipeline_stage_states"
 
     id = Column(String(36), primary_key=True, default=gen_uuid)
-    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True)
     stage_name = Column(String(64), nullable=False, index=True)
     status = Column(String(32), nullable=False, default="NOT_STARTED", index=True)
     active_job_id = Column(String(36), ForeignKey("studio_jobs.id", ondelete="SET NULL"), nullable=True)
@@ -317,7 +321,7 @@ class PipelineCheckpoint(Base):
     __tablename__ = "pipeline_checkpoints"
 
     id = Column(String(36), primary_key=True, default=gen_uuid)
-    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True)
     checkpoint_type = Column(String(64), nullable=False, index=True)
     status = Column(String(32), nullable=False, default="LOCKED", index=True)
     artifact_type = Column(String(64), nullable=False)

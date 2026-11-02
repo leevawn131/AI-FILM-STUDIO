@@ -42,7 +42,7 @@ def upgrade() -> None:
         op.create_table(
             'pipeline_stage_states',
             sa.Column('id', sa.String(36), primary_key=True),
-            sa.Column('project_id', sa.String(36), sa.ForeignKey('projects.id', ondelete='CASCADE'), nullable=False),
+            sa.Column('project_id', sa.String(36), sa.ForeignKey('projects.id', ondelete='RESTRICT'), nullable=False),
             sa.Column('stage_name', sa.String(64), nullable=False),
             sa.Column('status', sa.String(32), nullable=False, server_default='NOT_STARTED'),
             sa.Column('active_job_id', sa.String(36), sa.ForeignKey('studio_jobs.id', ondelete='SET NULL'), nullable=True),
@@ -66,7 +66,7 @@ def upgrade() -> None:
         op.create_table(
             'pipeline_checkpoints',
             sa.Column('id', sa.String(36), primary_key=True),
-            sa.Column('project_id', sa.String(36), sa.ForeignKey('projects.id', ondelete='CASCADE'), nullable=False),
+            sa.Column('project_id', sa.String(36), sa.ForeignKey('projects.id', ondelete='RESTRICT'), nullable=False),
             sa.Column('checkpoint_type', sa.String(64), nullable=False),
             sa.Column('status', sa.String(32), nullable=False, server_default='LOCKED'),
             sa.Column('artifact_type', sa.String(64), nullable=False),
@@ -140,14 +140,45 @@ def downgrade() -> None:
     inspector = sa.inspect(bind)
     tables = set(inspector.get_table_names())
 
-    # Protect against silent destruction of audit history
+    # Protect against silent destruction of audit history with validated administrative archival
     if 'pipeline_checkpoint_audit' in tables:
         count = bind.execute(sa.text("SELECT count(*) FROM pipeline_checkpoint_audit")).scalar() or 0
-        if count > 0 and os.environ.get("FORCE_AUDIT_PURGE") != "1":
-            raise RuntimeError(
-                f"Cannot downgrade migration: 'pipeline_checkpoint_audit' contains {count} audit record(s). "
-                "Audit history is immutable. Set environment variable FORCE_AUDIT_PURGE=1 to force purge during downgrade."
-            )
+        if count > 0:
+            archive_path_str = os.environ.get("AUDIT_ARCHIVE_PATH")
+            if not archive_path_str:
+                raise RuntimeError(
+                    f"Refusing destructive downgrade: 'pipeline_checkpoint_audit' contains {count} audit record(s). "
+                    "Audit records are immutable compliance journals and cannot be silently destroyed. "
+                    "To downgrade, you must first archive the audit records using: "
+                    "AUDIT_ARCHIVE_PATH=/path/to/audit_archive.json alembic downgrade <rev>"
+                )
+
+            import json
+            from pathlib import Path
+            archive_path = Path(archive_path_str)
+            if not archive_path.parent.exists():
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+            rows = bind.execute(sa.text("SELECT * FROM pipeline_checkpoint_audit")).mappings().all()
+            serializable_rows = [dict(r) for r in rows]
+            for r in serializable_rows:
+                for k, v in r.items():
+                    if hasattr(v, "isoformat"):
+                        r[k] = v.isoformat()
+
+            with open(archive_path, "w", encoding="utf-8") as f:
+                json.dump(serializable_rows, f, indent=2)
+
+            if not archive_path.exists() or archive_path.stat().st_size == 0:
+                raise RuntimeError(f"Audit archive verification failed: archive file '{archive_path}' is missing or empty.")
+
+            with open(archive_path, "r", encoding="utf-8") as f:
+                archived_data = json.load(f)
+
+            if len(archived_data) != count:
+                raise RuntimeError(
+                    f"Audit archive verification failed: expected {count} records in '{archive_path}', found {len(archived_data)}."
+                )
 
     dialect_name = bind.dialect.name
     if dialect_name == 'sqlite':
