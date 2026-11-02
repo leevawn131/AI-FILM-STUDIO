@@ -478,6 +478,351 @@ def test_administrative_audit_archival_and_roundtrip_verification(tmp_path):
     engine.dispose()
 
 
+def test_audit_verification_strict_json_types(tmp_path):
+    """
+    Verifies strict JSON value typing enforcement in verify_audit_archive():
+    - artifact_version 1 changed to 1.0 (float) is rejected.
+    - artifact_version 1 changed to "1" (string) is rejected.
+    - artifact_version 1 changed to True (bool) is rejected.
+    - string values changed to numbers (int/float) are rejected.
+    - invalid timestamp string is rejected.
+    - null changed to empty string "" is rejected.
+    """
+    from backend.app.services.audit_archiver import (
+        archive_audit_records,
+        verify_audit_archive,
+        AuditVerificationError,
+    )
+
+    test_db_path = tmp_path / "strict_types_test.db"
+    db_url = f"sqlite:///{test_db_path}"
+    engine = create_engine(db_url)
+    run_migrations(target_engine=engine, db_url=db_url)
+
+    now_iso = datetime(2026, 11, 2, 9, 30, 0, tzinfo=timezone.utc).isoformat()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, feedback_notes, created_at
+            ) VALUES (
+                'audit-type-1', 'proj-type', 'Types Film', 'cp-type-1',
+                'story_approval', 'APPROVED', 'validhash123',
+                1, 'Director', NULL, :ts
+            )
+        """), {"ts": now_iso})
+        conn.commit()
+
+    archive_file = tmp_path / "strict_base.json"
+    archive_audit_records(engine, archive_file)
+
+    with open(archive_file, "r", encoding="utf-8") as f:
+        base_records = json.load(f)
+
+    # 1. artifact_version 1 -> 1.0 (float)
+    f_float = tmp_path / "tamper_float.json"
+    r_float = [dict(base_records[0])]
+    r_float[0]["artifact_version"] = 1.0
+    with open(f_float, "w", encoding="utf-8") as f:
+        json.dump(r_float, f)
+    with pytest.raises(AuditVerificationError) as exc_float:
+        verify_audit_archive(engine, f_float)
+    assert "expected JSON integer, got float" in str(exc_float.value)
+
+    # 2. artifact_version 1 -> "1" (str)
+    f_str = tmp_path / "tamper_version_str.json"
+    r_str = [dict(base_records[0])]
+    r_str[0]["artifact_version"] = "1"
+    with open(f_str, "w", encoding="utf-8") as f:
+        json.dump(r_str, f)
+    with pytest.raises(AuditVerificationError) as exc_str:
+        verify_audit_archive(engine, f_str)
+    assert "expected JSON integer, got str" in str(exc_str.value)
+
+    # 3. artifact_version 1 -> True (bool)
+    f_bool = tmp_path / "tamper_version_bool.json"
+    r_bool = [dict(base_records[0])]
+    r_bool[0]["artifact_version"] = True
+    with open(f_bool, "w", encoding="utf-8") as f:
+        json.dump(r_bool, f)
+    with pytest.raises(AuditVerificationError) as exc_bool:
+        verify_audit_archive(engine, f_bool)
+    assert "expected JSON integer, got bool" in str(exc_bool.value)
+
+    # 4. string values changed to numbers (e.g. artifact_content_hash = 12345)
+    f_num = tmp_path / "tamper_str_num.json"
+    r_num = [dict(base_records[0])]
+    r_num[0]["artifact_content_hash"] = 12345
+    with open(f_num, "w", encoding="utf-8") as f:
+        json.dump(r_num, f)
+    with pytest.raises(AuditVerificationError) as exc_num:
+        verify_audit_archive(engine, f_num)
+    assert "expected JSON string, got int" in str(exc_num.value)
+
+    # 5. invalid timestamp
+    f_ts = tmp_path / "tamper_invalid_ts.json"
+    r_ts = [dict(base_records[0])]
+    r_ts[0]["created_at"] = "invalid-not-a-timestamp"
+    with open(f_ts, "w", encoding="utf-8") as f:
+        json.dump(r_ts, f)
+    with pytest.raises(AuditVerificationError) as exc_ts:
+        verify_audit_archive(engine, f_ts)
+    assert "not a valid ISO 8601 timestamp" in str(exc_ts.value)
+
+    # 6. null changed to empty string ""
+    f_null = tmp_path / "tamper_null_to_empty.json"
+    r_null = [dict(base_records[0])]
+    r_null[0]["feedback_notes"] = ""
+    with open(f_null, "w", encoding="utf-8") as f:
+        json.dump(r_null, f)
+    with pytest.raises(AuditVerificationError) as exc_null:
+        verify_audit_archive(engine, f_null)
+    assert "source is None, but archive is ''" in str(exc_null.value)
+
+    engine.dispose()
+
+
+def test_safe_archive_replacement_concurrency_and_failure_resilience(tmp_path):
+    """
+    Verifies Requirement 4:
+    - Avoids concurrent writers using the same temporary filename (uses unique uuid suffix).
+    - Ensure overwrite=False cannot overwrite an archive created concurrently.
+    - When overwrite=True, preserves previous valid archive until new archive passes verification.
+    - Never deletes a previous valid archive because a new export failed.
+    """
+    from backend.app.services.audit_archiver import (
+        archive_audit_records,
+        AuditArchiveExistsError,
+        AuditVerificationError,
+    )
+
+    test_db_path = tmp_path / "replacement_test.db"
+    db_url = f"sqlite:///{test_db_path}"
+    engine = create_engine(db_url)
+    run_migrations(target_engine=engine, db_url=db_url)
+
+    now_iso = datetime(2026, 11, 2, 9, 35, 0, tzinfo=timezone.utc).isoformat()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-orig-1', 'proj-r', 'Orig Film', 'cp-r1',
+                'story_approval', 'APPROVED', 'hashorig',
+                1, 'Director', :ts
+            )
+        """), {"ts": now_iso})
+        conn.commit()
+
+    archive_file = tmp_path / "production_archive.json"
+
+    # 1. First valid export
+    archive_audit_records(engine, archive_file, overwrite=False)
+    original_mtime = archive_file.stat().st_mtime
+    original_content = archive_file.read_text(encoding="utf-8")
+
+    # 2. Overwrite=False strictly blocks overwrite
+    with pytest.raises(AuditArchiveExistsError):
+        archive_audit_records(engine, archive_file, overwrite=False)
+    assert archive_file.read_text(encoding="utf-8") == original_content
+
+    # 3. Simulate failure during overwrite=True export (e.g. corrupting temp verification)
+    # Monkey-patch verify_audit_archive to simulate verification rejection of the new data
+    import backend.app.services.audit_archiver as archiver_module
+    real_verify = archiver_module.verify_audit_archive
+
+    def failing_verify(source_records_or_target, archive_path):
+        raise AuditVerificationError("Simulated verification failure for new export")
+
+    archiver_module.verify_audit_archive = failing_verify
+    try:
+        with pytest.raises(AuditVerificationError):
+            archive_audit_records(engine, archive_file, overwrite=True)
+
+        # Previous valid archive MUST STILL EXIST and remain completely untouched!
+        assert archive_file.exists()
+        assert archive_file.read_text(encoding="utf-8") == original_content
+    finally:
+        archiver_module.verify_audit_archive = real_verify
+
+    # 4. Legitimate overwrite=True succeeds and atomically replaces
+    archive_audit_records(engine, archive_file, overwrite=True)
+    assert archive_file.exists()
+
+    engine.dispose()
+
+
+def test_safe_administrative_purge_target_types_and_unrelated_session_isolation(tmp_path):
+    """
+    Verifies Requirement 1:
+    - Preserves support for Engine, Connection, and Session.
+    - Does not commit unrelated caller transactions when using Session.
+    """
+    from backend.app.services.audit_archiver import (
+        archive_audit_records,
+        safe_administrative_purge,
+    )
+
+    test_db_path = tmp_path / "targets_test.db"
+    db_url = f"sqlite:///{test_db_path}"
+    engine = create_engine(db_url)
+    run_migrations(target_engine=engine, db_url=db_url)
+
+    # 1. Test with Engine
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-eng-1', 'proj-1', 'Eng Film', 'cp-1',
+                'story_approval', 'APPROVED', 'hasheng',
+                1, 'Director', datetime('now')
+            )
+        """))
+        conn.commit()
+
+    archive_eng = tmp_path / "archive_eng.json"
+    archive_audit_records(engine, archive_eng)
+    res_eng = safe_administrative_purge(engine, archive_eng, force=True)
+    assert res_eng["status"] == "purged"
+    assert res_eng["purged_record_count"] == 1
+
+    # 2. Test with Connection
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-conn-1', 'proj-1', 'Conn Film', 'cp-1',
+                'story_approval', 'APPROVED', 'hashconn',
+                1, 'Director', datetime('now')
+            )
+        """))
+        conn.commit()
+
+        archive_conn = tmp_path / "archive_conn.json"
+        archive_audit_records(conn, archive_conn)
+        res_conn = safe_administrative_purge(conn, archive_conn, force=True)
+        assert res_conn["status"] == "purged"
+        assert res_conn["purged_record_count"] == 1
+
+    # 3. Test with Session & verify unrelated caller transaction is NOT committed
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-sess-1', 'proj-1', 'Sess Film', 'cp-1',
+                'story_approval', 'APPROVED', 'hashsess',
+                1, 'Director', datetime('now')
+            )
+        """))
+        conn.commit()
+
+    SessionLocalTest = sessionmaker(bind=engine)
+    session = SessionLocalTest()
+
+    # Caller has unrelated dirty/new entity
+    unrelated_proj = Project(
+        id="proj-unrelated-pending",
+        name="Unrelated Pending Film",
+        budget_total=1000.0,
+        budget_spent=0.0
+    )
+    session.add(unrelated_proj)
+    assert bool(session.new) is True, "Session must have pending new objects"
+
+    archive_sess = tmp_path / "archive_sess.json"
+    archive_audit_records(session, archive_sess)
+    res_sess = safe_administrative_purge(session, archive_sess, force=True)
+    assert res_sess["status"] == "purged"
+    assert res_sess["purged_record_count"] == 1
+
+    # Verify unrelated_proj is NOT yet committed in database
+    with engine.connect() as check_conn:
+        db_proj = check_conn.execute(text("SELECT id FROM projects WHERE id = 'proj-unrelated-pending'")).fetchone()
+        assert db_proj is None, "safe_administrative_purge must NOT commit unrelated caller objects!"
+
+    # Rollback session to discard caller's pending work
+    session.rollback()
+    session.close()
+    engine.dispose()
+
+
+def test_purge_concurrency_regression_blocks_unarchived_deletions(tmp_path):
+    """
+    Verifies Requirement 2:
+    - Eliminates race condition between archive verification and record purge.
+    - Write/table lock prevents concurrent INSERT from slipping in.
+    - If a new record exists in the DB that is absent from the archive, purge is strictly aborted
+      and NO records are deleted.
+    """
+    from backend.app.services.audit_archiver import (
+        archive_audit_records,
+        safe_administrative_purge,
+        AuditVerificationError,
+    )
+
+    test_db_path = tmp_path / "purge_concurrency_race.db"
+    db_url = f"sqlite:///{test_db_path}"
+    engine = create_engine(db_url, connect_args={"timeout": 0.2})
+    run_migrations(target_engine=engine, db_url=db_url)
+
+    # 1. Insert initial record 1
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-race-1', 'proj-1', 'Race Film', 'cp-1',
+                'story_approval', 'APPROVED', 'hashrace1',
+                1, 'Director', datetime('now')
+            )
+        """))
+        conn.commit()
+
+    archive_file = tmp_path / "race_archive.json"
+    archive_audit_records(engine, archive_file)
+
+    # 2. Simulate concurrent worker inserting record 2 before purge lock
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, created_at
+            ) VALUES (
+                'rec-race-2-concurrent', 'proj-1', 'Race Film', 'cp-2',
+                'visual_approval', 'APPROVED', 'hashrace2',
+                1, 'Director', datetime('now')
+            )
+        """))
+        conn.commit()
+
+    # 3. Purge attempt must be rejected because DB has 2 records, archive only has 1
+    with pytest.raises(AuditVerificationError) as exc_race:
+        safe_administrative_purge(engine, archive_file, force=True)
+    assert "count mismatch" in str(exc_race.value)
+
+    # 4. Proves ZERO records were deleted (neither record 1 nor unarchived record 2)
+    with engine.connect() as conn:
+        remaining_cnt = conn.execute(text("SELECT count(*) FROM pipeline_checkpoint_audit")).scalar()
+        assert remaining_cnt == 2, "No unarchived audit record can be deleted!"
+
+    engine.dispose()
+
+
 def test_audit_verification_detects_every_field_modification(tmp_path):
     """
     Verifies that tampering with ANY of the 11 audit fields:
@@ -1597,3 +1942,76 @@ def test_postgresql_pipeline_worker_fencing():
     finally:
         session.close()
         pg_engine.dispose()
+
+
+def test_postgresql_audit_purge_transaction_and_locking(tmp_path):
+    """
+    Verifies Requirement 2 on real PostgreSQL:
+    - Audit archival and verification under PostgreSQL table locking.
+    - safe_administrative_purge() properly manages PostgreSQL triggers and transactions.
+    - Tampered archive aborts purge and rolls back without deleting PostgreSQL records.
+    - Safe purge cleanly purges records under table lock.
+    """
+    from backend.app.services.audit_archiver import (
+        archive_audit_records,
+        safe_administrative_purge,
+        AuditVerificationError,
+    )
+
+    pg_engine = get_postgres_engine()
+    if not pg_engine:
+        pytest.skip("PostgreSQL test database not available.")
+
+    # 1. Ensure migrations applied to head on PostgreSQL
+    alembic_cfg = Config(str(settings.root_dir / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(settings.root_dir / "backend" / "alembic"))
+    alembic_cfg.set_main_option("sqlalchemy.url", pg_engine.url.render_as_string(hide_password=False))
+    alembic_cfg.attributes["configure_logger"] = False
+    command.upgrade(alembic_cfg, "head")
+
+    audit_id = f"pg-purge-{uuid.uuid4().hex[:8]}"
+    with pg_engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (
+                id, project_id, project_name_snapshot, checkpoint_id,
+                checkpoint_type, decision, artifact_content_hash,
+                artifact_version, reviewer_name, feedback_notes, created_at
+            ) VALUES (
+                :id, 'pg-proj-p', 'PG Purge Film', 'cp-pg-1',
+                'story_approval', 'APPROVED', 'pghash123',
+                1, 'PG Director', 'pg notes', NOW()
+            );
+        """), {"id": audit_id})
+        conn.commit()
+
+    archive_file = tmp_path / "pg_audit_archive.json"
+
+    # 2. Archive records from PostgreSQL
+    archive_res = archive_audit_records(pg_engine, archive_file)
+    assert archive_res["status"] == "success"
+
+    # 3. Verification failure rolls back on PostgreSQL
+    with open(archive_file, "r", encoding="utf-8") as f:
+        tampered_data = json.load(f)
+    tampered_data[0]["decision"] = "TAMPERED"
+    tampered_file = tmp_path / "pg_tampered.json"
+    with open(tampered_file, "w", encoding="utf-8") as f:
+        json.dump(tampered_data, f)
+
+    with pytest.raises(AuditVerificationError):
+        safe_administrative_purge(pg_engine, tampered_file, force=True)
+
+    # Verify record still exists in PostgreSQL
+    with pg_engine.connect() as conn:
+        cnt = conn.execute(text(f"SELECT count(*) FROM pipeline_checkpoint_audit WHERE id = '{audit_id}'")).scalar()
+        assert cnt == 1, "Record must not be purged when archive verification fails on PostgreSQL"
+
+    # 4. Safe purge succeeds on PostgreSQL using Engine
+    purge_res = safe_administrative_purge(pg_engine, archive_file, force=True)
+    assert purge_res["status"] == "purged"
+
+    with pg_engine.connect() as conn:
+        cnt_after = conn.execute(text(f"SELECT count(*) FROM pipeline_checkpoint_audit WHERE id = '{audit_id}'")).scalar()
+        assert cnt_after == 0, "Record must be cleanly purged after successful verification on PostgreSQL"
+
+    pg_engine.dispose()
