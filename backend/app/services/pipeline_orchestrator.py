@@ -33,7 +33,11 @@ from backend.app.models.entities import (
     StudioJob, gen_uuid
 )
 from backend.app.services.job_manager import job_manager, JobOwnershipLostError
-from backend.app.schemas.pipeline import sanitize_error_text, sanitize_stage_metadata
+from backend.app.schemas.pipeline import (
+    sanitize_error_text,
+    sanitize_stage_metadata,
+    CheckpointDecisionRequest,
+)
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -72,6 +76,46 @@ CHECKPOINT_PREREQUISITE_STAGE = {
     "production_approval": "cinematic_prompts",
     "final_review": "audio_mixing",
 }
+
+# ---------------------------------------------------------------------------
+# State Transition Rules (M2.4)
+# ---------------------------------------------------------------------------
+
+ALLOWED_CHECKPOINT_TRANSITIONS: Dict[str, Set[str]] = {
+    "LOCKED": {"WAITING_FOR_APPROVAL"},
+    "WAITING_FOR_APPROVAL": {"APPROVED", "REJECTED", "STALE"},
+    "APPROVED": {"STALE"},
+    "REJECTED": {"STALE", "WAITING_FOR_APPROVAL"},
+    "STALE": {"WAITING_FOR_APPROVAL"},
+}
+
+ALLOWED_STAGE_TRANSITIONS: Dict[str, Set[str]] = {
+    "NOT_STARTED": {"IN_PROGRESS", "WAITING_FOR_APPROVAL", "COMPLETED"},
+    "IN_PROGRESS": {"COMPLETED", "FAILED", "WAITING_FOR_APPROVAL", "WAITING_FOR_EXTERNAL_MEDIA", "WAITING_FOR_USER_INPUT", "STALE"},
+    "WAITING_FOR_APPROVAL": {"COMPLETED", "WAITING_FOR_USER_INPUT", "STALE", "FAILED"},
+    "WAITING_FOR_EXTERNAL_MEDIA": {"IN_PROGRESS", "COMPLETED", "FAILED", "STALE"},
+    "WAITING_FOR_USER_INPUT": {"IN_PROGRESS", "WAITING_FOR_APPROVAL", "STALE"},
+    "COMPLETED": {"STALE", "IN_PROGRESS"},
+    "FAILED": {"IN_PROGRESS", "NOT_STARTED", "WAITING_FOR_APPROVAL"},
+    "STALE": {"IN_PROGRESS", "WAITING_FOR_APPROVAL"},
+}
+
+
+def validate_checkpoint_transition(current_status: str, target_status: str) -> bool:
+    """Validates if a checkpoint status transition is legally permitted."""
+    if current_status == target_status:
+        return True
+    allowed = ALLOWED_CHECKPOINT_TRANSITIONS.get(current_status, set())
+    return target_status in allowed
+
+
+def validate_stage_transition(current_status: str, target_status: str) -> bool:
+    """Validates if a stage status transition is legally permitted."""
+    if current_status == target_status:
+        return True
+    allowed = ALLOWED_STAGE_TRANSITIONS.get(current_status, set())
+    return target_status in allowed
+
 
 
 def is_pipeline_complete(db: Session, project_id: str) -> bool:
@@ -737,6 +781,375 @@ class PipelineOrchestrator:
         )
 
     @staticmethod
+    def validate_checkpoint_transition(current_status: str, target_status: str) -> bool:
+        return validate_checkpoint_transition(current_status, target_status)
+
+    @staticmethod
+    def validate_stage_transition(current_status: str, target_status: str) -> bool:
+        return validate_stage_transition(current_status, target_status)
+
+    @staticmethod
+    def get_story_review_data(db: Session, project_id: str) -> Dict[str, Any]:
+        """
+        Retrieves complete screenplay review data for human director approval.
+        Strictly read-only; performs no state modifications or database writes.
+        """
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project or project.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        cp = db.query(PipelineCheckpoint).filter(
+            PipelineCheckpoint.project_id == project_id,
+            PipelineCheckpoint.checkpoint_type == "story_approval"
+        ).first()
+        if not cp:
+            raise HTTPException(status_code=404, detail="Checkpoint 'story_approval' not found")
+
+        scenes = db.query(Scene).filter(Scene.project_id == project_id).order_by(Scene.order_index).all()
+        current_hash = PipelineOrchestrator.compute_artifact_hash(db, project_id, "screenplay")
+        is_hash_fresh = bool(
+            current_hash and cp.artifact_content_hash and current_hash == cp.artifact_content_hash
+        )
+
+        return {
+            "project_id": project.id,
+            "project_name": project.name,
+            "checkpoint_status": cp.status,
+            "artifact_version": cp.artifact_version,
+            "current_artifact_hash": current_hash,
+            "submitted_artifact_hash": cp.artifact_content_hash,
+            "is_hash_fresh": is_hash_fresh,
+            "scenes": [
+                {
+                    "scene_number": s.scene_number,
+                    "order_index": s.order_index,
+                    "slugline": s.slugline or "",
+                    "title": s.title or "",
+                    "summary": s.summary or "",
+                    "script_content": s.script_content or "",
+                    "estimated_duration": s.estimated_duration or 0,
+                }
+                for s in scenes
+            ]
+        }
+
+    @staticmethod
+    def submit_story_for_review(
+        db: Session,
+        project_id: str,
+        reviewer_name: str = "Director / User"
+    ) -> Dict[str, Any]:
+        """
+        Submits canonical screenplay artifact for human director approval.
+        Validates non-empty screenplay, computes SHA-256 hash, updates checkpoint and stage
+        to WAITING_FOR_APPROVAL, and logs SUBMITTED_FOR_REVIEW in compliance audit.
+        """
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project or project.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        # Verify pipeline is fully initialized
+        stages_count = db.query(PipelineStageState).filter(PipelineStageState.project_id == project_id).count()
+        cps_count = db.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == project_id).count()
+        if stages_count < 11 or cps_count < 4:
+            raise HTTPException(
+                status_code=400,
+                detail="Pipeline has not been initialized for this project."
+            )
+
+        # Validate non-empty screenplay
+        scenes = db.query(Scene).filter(Scene.project_id == project_id).order_by(Scene.order_index).all()
+        if not scenes:
+            raise HTTPException(status_code=400, detail="Cannot submit empty screenplay for review. Please add scenes first.")
+
+        has_content = any((s.script_content and s.script_content.strip()) or (s.slugline and s.slugline.strip()) for s in scenes)
+        if not has_content:
+            raise HTTPException(status_code=400, detail="Cannot submit empty screenplay for review. Scenes contain no script content.")
+
+        current_hash = PipelineOrchestrator.compute_artifact_hash(db, project_id, "screenplay")
+        if not current_hash:
+            raise HTTPException(status_code=400, detail="Cannot compute canonical hash for screenplay.")
+
+        cp_query = db.query(PipelineCheckpoint).filter(
+            PipelineCheckpoint.project_id == project_id,
+            PipelineCheckpoint.checkpoint_type == "story_approval"
+        )
+        if db.bind and db.bind.dialect.name == "postgresql":
+            cp_query = cp_query.with_for_update()
+        cp = cp_query.first()
+        if not cp:
+            raise HTTPException(status_code=404, detail="Checkpoint 'story_approval' not found")
+
+        # Validate legal transition
+        if not validate_checkpoint_transition(cp.status, "WAITING_FOR_APPROVAL"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Illegal transition: cannot submit checkpoint from status '{cp.status}' to 'WAITING_FOR_APPROVAL'"
+            )
+
+        # Idempotency check 1: already waiting with exact same hash
+        if cp.status == "WAITING_FOR_APPROVAL" and cp.artifact_content_hash == current_hash:
+            return {
+                "project_id": project.id,
+                "checkpoint_id": cp.id,
+                "checkpoint_type": cp.checkpoint_type,
+                "status": cp.status,
+                "artifact_version": cp.artifact_version,
+                "artifact_content_hash": cp.artifact_content_hash,
+                "submitted_at": cp.updated_at or cp.created_at,
+                "message": "Screenplay is already submitted and waiting for review."
+            }
+
+        # Idempotency check 2: already approved with identical hash
+        if cp.status == "APPROVED" and cp.artifact_content_hash == current_hash:
+            return {
+                "project_id": project.id,
+                "checkpoint_id": cp.id,
+                "checkpoint_type": cp.checkpoint_type,
+                "status": cp.status,
+                "artifact_version": cp.artifact_version,
+                "artifact_content_hash": cp.artifact_content_hash,
+                "submitted_at": cp.decided_at or cp.updated_at,
+                "message": "Screenplay is already approved with current content hash."
+            }
+
+        now = utc_now()
+        cp.status = "WAITING_FOR_APPROVAL"
+        cp.artifact_content_hash = current_hash
+        cp.updated_at = now
+        if cp.artifact_version < 1:
+            cp.artifact_version = 1
+
+        screenplay_stage = db.query(PipelineStageState).filter(
+            PipelineStageState.project_id == project_id,
+            PipelineStageState.stage_name == "screenplay"
+        ).first()
+        if screenplay_stage:
+            screenplay_stage.status = "WAITING_FOR_APPROVAL"
+            screenplay_stage.content_hash = current_hash
+            screenplay_stage.updated_at = now
+            screenplay_stage.error_message = None
+
+        project.current_pipeline_stage = "screenplay"
+        project.pipeline_overall_status = "in_progress"
+
+        audit = PipelineCheckpointAudit(
+            project_id=project.id,
+            project_name_snapshot=project.name,
+            checkpoint_id=cp.id,
+            checkpoint_type="story_approval",
+            decision="SUBMITTED_FOR_REVIEW",
+            artifact_content_hash=current_hash,
+            artifact_version=cp.artifact_version,
+            reviewer_name=reviewer_name,
+            feedback_notes="Screenplay submitted for human review."
+        )
+        db.add(audit)
+        db.commit()
+        db.refresh(cp)
+
+        return {
+            "project_id": project.id,
+            "checkpoint_id": cp.id,
+            "checkpoint_type": cp.checkpoint_type,
+            "status": cp.status,
+            "artifact_version": cp.artifact_version,
+            "artifact_content_hash": cp.artifact_content_hash,
+            "submitted_at": cp.updated_at,
+            "message": "Screenplay submitted successfully for review."
+        }
+
+    @staticmethod
+    def record_story_decision(
+        db: Session,
+        project_id: str,
+        request: CheckpointDecisionRequest
+    ) -> Dict[str, Any]:
+        """
+        Records human approval, rejection, or changes-requested decision with strict TOCTOU concurrency fencing.
+        Validates that expected artifact version and canonical hash match actual database state.
+        Raises 409 Conflict if artifact drifted since review was opened, invalidating checkpoint to STALE.
+        """
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project or project.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        cp_query = db.query(PipelineCheckpoint).filter(
+            PipelineCheckpoint.project_id == project_id,
+            PipelineCheckpoint.checkpoint_type == "story_approval"
+        )
+        if db.bind and db.bind.dialect.name == "postgresql":
+            cp_query = cp_query.with_for_update()
+        cp = cp_query.first()
+        if not cp:
+            raise HTTPException(status_code=404, detail="Checkpoint 'story_approval' not found")
+
+        # Idempotent re-approval check
+        if (
+            request.decision == "APPROVED"
+            and cp.status == "APPROVED"
+            and cp.artifact_content_hash == request.expected_artifact_hash
+            and cp.artifact_version == request.expected_artifact_version
+        ):
+            return {
+                "project_id": project.id,
+                "checkpoint_id": cp.id,
+                "checkpoint_type": cp.checkpoint_type,
+                "status": cp.status,
+                "decision": "APPROVED",
+                "artifact_version": cp.artifact_version,
+                "artifact_content_hash": cp.artifact_content_hash,
+                "reviewer_name": cp.reviewer_name,
+                "feedback_notes": cp.feedback_notes,
+                "decided_at": cp.decided_at or cp.updated_at
+            }
+
+        # Checkpoint must be in WAITING_FOR_APPROVAL
+        if cp.status != "WAITING_FOR_APPROVAL":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot record decision: checkpoint is in '{cp.status}' state, expected 'WAITING_FOR_APPROVAL'. Please submit for review first."
+            )
+
+        # Optimistic concurrency: verify artifact version matches reviewer view
+        if cp.artifact_version != request.expected_artifact_version:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Artifact version mismatch: expected version {request.expected_artifact_version}, but current version is {cp.artifact_version}. Screenplay was updated concurrently."
+            )
+
+        # Recompute fresh canonical hash from database
+        current_hash = PipelineOrchestrator.compute_artifact_hash(db, project_id, "screenplay")
+        if not current_hash:
+            raise HTTPException(status_code=400, detail="Cannot record decision: screenplay artifact is empty.")
+
+        # TOCTOU Drift Protection: check if content drifted
+        if current_hash != request.expected_artifact_hash or current_hash != cp.artifact_content_hash:
+            now = utc_now()
+            old_hash = cp.artifact_content_hash or current_hash
+            old_version = cp.artifact_version
+            cp.status = "STALE"
+            cp.artifact_version = old_version + 1
+            cp.updated_at = now
+
+            screenplay_stage = db.query(PipelineStageState).filter(
+                PipelineStageState.project_id == project_id,
+                PipelineStageState.stage_name == "screenplay"
+            ).first()
+            if screenplay_stage:
+                screenplay_stage.status = "STALE"
+                screenplay_stage.updated_at = now
+
+            audit = PipelineCheckpointAudit(
+                project_id=project.id,
+                project_name_snapshot=project.name,
+                checkpoint_id=cp.id,
+                checkpoint_type="story_approval",
+                decision="INVALIDATED",
+                artifact_content_hash=old_hash,
+                artifact_version=old_version,
+                reviewer_name="System / TOCTOU Guard",
+                feedback_notes="Screenplay content drifted between review inspection and decision. Checkpoint invalidated to STALE."
+            )
+            db.add(audit)
+            db.commit()
+            raise HTTPException(
+                status_code=409,
+                detail="Screenplay content has been modified since review was opened (hash mismatch). Approval state invalidated to STALE. Please review the updated screenplay."
+            )
+
+        now = utc_now()
+        decision = request.decision
+        reviewer = request.reviewer_name
+        notes = request.feedback_notes or ""
+        target_status = "APPROVED" if decision == "APPROVED" else "REJECTED"
+
+        # Atomic Compare-and-Swap (CAS) update to guard against concurrent decisions
+        cas_stmt = (
+            update(PipelineCheckpoint)
+            .where(
+                PipelineCheckpoint.id == cp.id,
+                PipelineCheckpoint.status == "WAITING_FOR_APPROVAL",
+                PipelineCheckpoint.artifact_version == request.expected_artifact_version
+            )
+            .values(
+                status=target_status,
+                artifact_content_hash=current_hash,
+                decided_at=now,
+                reviewer_name=reviewer,
+                feedback_notes=notes,
+                updated_at=now
+            )
+            .execution_options(synchronize_session=False)
+        )
+        res = db.execute(cas_stmt)
+        if res.rowcount == 0:
+            db.rollback()
+            refreshed = db.query(PipelineCheckpoint).filter(PipelineCheckpoint.id == cp.id).first()
+            if refreshed and refreshed.status != "WAITING_FOR_APPROVAL":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Checkpoint state was modified concurrently (current status: {refreshed.status})."
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="Concurrent modification conflict: artifact version or checkpoint status has changed."
+            )
+
+        screenplay_stage = db.query(PipelineStageState).filter(
+            PipelineStageState.project_id == project_id,
+            PipelineStageState.stage_name == "screenplay"
+        ).first()
+
+        if decision == "APPROVED":
+            if screenplay_stage:
+                screenplay_stage.status = "COMPLETED"
+                screenplay_stage.content_hash = current_hash
+                screenplay_stage.completed_at = now
+                screenplay_stage.error_message = None
+                screenplay_stage.updated_at = now
+
+            project.current_pipeline_stage = "character_design"
+            project.pipeline_overall_status = "in_progress"
+
+        elif decision in ("REJECTED", "REQUEST_CHANGES"):
+            if screenplay_stage:
+                screenplay_stage.status = "WAITING_FOR_USER_INPUT"
+                screenplay_stage.error_message = notes or f"Screenplay {decision.lower().replace('_', ' ')} during review."
+                screenplay_stage.updated_at = now
+
+            project.current_pipeline_stage = "screenplay"
+
+        audit = PipelineCheckpointAudit(
+            project_id=project.id,
+            project_name_snapshot=project.name,
+            checkpoint_id=cp.id,
+            checkpoint_type="story_approval",
+            decision=decision,
+            artifact_content_hash=current_hash,
+            artifact_version=cp.artifact_version,
+            reviewer_name=reviewer,
+            feedback_notes=notes
+        )
+        db.add(audit)
+        db.commit()
+        db.refresh(cp)
+
+
+        return {
+            "project_id": project.id,
+            "checkpoint_id": cp.id,
+            "checkpoint_type": cp.checkpoint_type,
+            "status": cp.status,
+            "decision": decision,
+            "artifact_version": cp.artifact_version,
+            "artifact_content_hash": cp.artifact_content_hash,
+            "reviewer_name": cp.reviewer_name,
+            "feedback_notes": cp.feedback_notes,
+            "decided_at": cp.decided_at
+        }
+
+    @staticmethod
     def record_checkpoint_decision(
         db: Session,
         project_id: str,
@@ -746,11 +1159,11 @@ class PipelineOrchestrator:
         reviewer_name: str = "Director / User"
     ) -> PipelineCheckpoint:
         """
-        Records human approval or rejection bound to current artifact content hash.
+        Records human approval, rejection, or changes-requested decision bound to current artifact content hash.
         Creates an immutable audit record in pipeline_checkpoint_audit.
         """
-        if decision not in ("APPROVED", "REJECTED"):
-            raise HTTPException(status_code=400, detail="Decision must be 'APPROVED' or 'REJECTED'")
+        if decision not in ("APPROVED", "REJECTED", "REQUEST_CHANGES"):
+            raise HTTPException(status_code=400, detail="Decision must be 'APPROVED', 'REJECTED', or 'REQUEST_CHANGES'")
 
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project or project.deleted_at is not None:
@@ -772,8 +1185,15 @@ class PipelineOrchestrator:
         if decision == "APPROVED" and cp.status == "APPROVED" and cp.artifact_content_hash == current_hash:
             return cp
 
+        target_status = "APPROVED" if decision == "APPROVED" else "REJECTED"
+        if not validate_checkpoint_transition(cp.status, target_status):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Illegal transition: cannot move checkpoint from '{cp.status}' to '{target_status}' directly. Screenplay must be submitted for review first."
+            )
+
         now = utc_now()
-        cp.status = decision
+        cp.status = target_status
         cp.artifact_content_hash = current_hash
         cp.decided_at = now
         cp.reviewer_name = reviewer_name
@@ -806,12 +1226,15 @@ class PipelineOrchestrator:
                     screenplay_stage.status = "COMPLETED"
                     screenplay_stage.content_hash = current_hash
                     screenplay_stage.completed_at = now
+                    screenplay_stage.error_message = None
+                    screenplay_stage.updated_at = now
                 project.current_pipeline_stage = "character_design"
                 project.pipeline_overall_status = "in_progress"
-            else:  # REJECTED
+            else:  # REJECTED or REQUEST_CHANGES
                 if screenplay_stage:
                     screenplay_stage.status = "WAITING_FOR_USER_INPUT"
-                    screenplay_stage.error_message = notes or "Screenplay rejected during review."
+                    screenplay_stage.error_message = notes or f"Screenplay {decision.lower().replace('_', ' ')} during review."
+                    screenplay_stage.updated_at = now
                 project.current_pipeline_stage = "screenplay"
 
         db.commit()
@@ -819,9 +1242,16 @@ class PipelineOrchestrator:
         return cp
 
     @staticmethod
-    def invalidate_downstream_stages(db: Session, project_id: str, changed_stage: str) -> None:
+    def invalidate_downstream_stages(
+        db: Session,
+        project_id: str,
+        changed_stage: str,
+        commit: bool = True
+    ) -> None:
         """
         Invalidates dependent approvals and downstream stages when upstream artifacts change.
+        Does not commit when commit=False, allowing callers to atomically bundle invalidation
+        with entity mutations in a single transaction.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project or project.deleted_at is not None:
@@ -837,23 +1267,38 @@ class PipelineOrchestrator:
             ).first()
 
             if cp and cp.status in ("APPROVED", "WAITING_FOR_APPROVAL"):
+                old_hash = cp.artifact_content_hash or "none"
+                old_version = cp.artifact_version
                 cp.status = "STALE"
-                cp.artifact_version += 1
+                cp.artifact_version = old_version + 1
                 cp.updated_at = now
 
-                # Audit invalidation
+                # Audit invalidation with old hash and old version
                 audit = PipelineCheckpointAudit(
                     project_id=project.id,
                     project_name_snapshot=project.name,
                     checkpoint_id=cp.id,
                     checkpoint_type=cp.checkpoint_type,
                     decision="INVALIDATED",
-                    artifact_content_hash=cp.artifact_content_hash or "none",
-                    artifact_version=cp.artifact_version,
+                    artifact_content_hash=old_hash,
+                    artifact_version=old_version,
                     reviewer_name="System / Invalidator",
                     feedback_notes="Screenplay modified upstream. Approval invalidated."
                 )
                 db.add(audit)
+            elif cp and cp.status == "REJECTED":
+                cp.status = "STALE"
+                cp.artifact_version += 1
+                cp.updated_at = now
+
+            # Invalidate screenplay stage if completed or waiting
+            screenplay_stage = db.query(PipelineStageState).filter(
+                PipelineStageState.project_id == project_id,
+                PipelineStageState.stage_name == "screenplay"
+            ).first()
+            if screenplay_stage and screenplay_stage.status in ("COMPLETED", "WAITING_FOR_APPROVAL"):
+                screenplay_stage.status = "STALE"
+                screenplay_stage.updated_at = now
 
             # Invalidate downstream stages
             downstream_names = [
@@ -882,7 +1327,11 @@ class PipelineOrchestrator:
                     dcp.updated_at = now
 
             project.current_pipeline_stage = "screenplay"
-            db.commit()
+            if commit:
+                db.commit()
+            else:
+                db.flush()
+
 
     @staticmethod
     def complete_pipeline_stage(

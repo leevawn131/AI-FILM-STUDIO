@@ -303,3 +303,72 @@ class PipelineStatusResponse(BaseModel):
     is_initialized: bool = Field(False, description="Whether the pipeline has been fully initialized with all 11 stages and 4 checkpoints")
     stages: List[PipelineStageResponse]
     checkpoints: List[PipelineCheckpointResponse]
+
+
+# ---------------------------------------------------------------------------
+# S4 M2.2 Story Approval & Gatekeeper Schemas
+# ---------------------------------------------------------------------------
+
+class StoryReviewSceneItem(BaseModel):
+    """Clean, public projection of a screenplay scene for human review."""
+    scene_number: int
+    order_index: int
+    slugline: str
+    title: str
+    summary: str
+    script_content: str
+    estimated_duration: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class StoryReviewResponse(BaseModel):
+    """Public read-only response for screenplay review and verification."""
+    project_id: str
+    project_name: str
+    checkpoint_status: str
+    artifact_version: int
+    current_artifact_hash: Optional[str] = None
+    submitted_artifact_hash: Optional[str] = None
+    is_hash_fresh: bool = False
+    scenes: List[StoryReviewSceneItem]
+
+
+class StorySubmitResponse(BaseModel):
+    """Confirmation of screenplay submission for human review."""
+    project_id: str
+    checkpoint_id: str
+    checkpoint_type: str
+    status: str
+    artifact_version: int
+    artifact_content_hash: str
+    submitted_at: datetime
+    message: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CheckpointDecisionRequest(BaseModel):
+    """Request payload for recording a director or human approval decision."""
+    decision: str = Field(..., pattern="^(APPROVED|REJECTED|REQUEST_CHANGES)$", description="Approval decision: APPROVED, REJECTED, or REQUEST_CHANGES")
+    expected_artifact_version: int = Field(..., gt=0, description="Artifact version present when reviewer inspected the submission")
+    expected_artifact_hash: str = Field(..., pattern="^[a-fA-F0-9]{64}$", description="Canonical SHA-256 hash expected by reviewer")
+    reviewer_name: str = Field("Director", min_length=1, max_length=128, description="Name or role of the reviewer")
+    feedback_notes: Optional[str] = Field(None, max_length=2000, description="Optional director feedback or revision instructions")
+
+
+class CheckpointDecisionResponse(BaseModel):
+    """Response confirming recorded approval decision."""
+    project_id: str
+    checkpoint_id: str
+    checkpoint_type: str
+    status: str
+    decision: str
+    artifact_version: int
+    artifact_content_hash: str
+    reviewer_name: str
+    feedback_notes: Optional[str] = None
+    decided_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+

@@ -11,8 +11,11 @@ import {
   deleteShot,
   optimizeShotPrompt,
   runContinuityCheck,
-  ContinuityReport
+  ContinuityReport,
+  fetchCheckpointDetail,
+  PipelineCheckpointDetail
 } from '../api/client';
+import { ViewTab } from '../components/Sidebar';
 import {
   Layers,
   Sparkles,
@@ -28,17 +31,22 @@ import {
   Video,
   Clock,
   Eye,
-  Settings
+  Settings,
+  Lock,
+  ArrowLeft,
+  AlertTriangle
 } from 'lucide-react';
 
 interface StoryboardViewProps {
   activeProject: Project | null;
   onRefreshProject: () => void;
+  onSelectView?: (view: ViewTab) => void;
 }
 
 export const StoryboardView: React.FC<StoryboardViewProps> = ({
   activeProject,
   onRefreshProject,
+  onSelectView,
 }) => {
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [selectedSceneId, setSelectedSceneId] = useState<string>('');
@@ -47,6 +55,11 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
   const [generating, setGenerating] = useState(false);
   const [shotCountToGen, setShotCountToGen] = useState(4);
   const [copiedShotId, setCopiedShotId] = useState<string | null>(null);
+
+  // Story Approval & Gatekeeper State
+  const [storyApproval, setStoryApproval] = useState<PipelineCheckpointDetail | null>(null);
+  const [loadingApproval, setLoadingApproval] = useState(false);
+  const [gatekeeperError, setGatekeeperError] = useState<string | null>(null);
 
   // Continuity check modal & state
   const [continuityReport, setContinuityReport] = useState<ContinuityReport | null>(null);
@@ -81,22 +94,51 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
     }
   };
 
+  const loadStoryApproval = async () => {
+    if (!activeProject) return;
+    setLoadingApproval(true);
+    try {
+      const cp = await fetchCheckpointDetail(activeProject.id, 'story_approval');
+      setStoryApproval(cp);
+    } catch (err) {
+      console.error('Failed to load story approval status:', err);
+      setStoryApproval(null);
+    } finally {
+      setLoadingApproval(false);
+    }
+  };
+
   useEffect(() => {
     loadScenesAndShots();
+    loadStoryApproval();
   }, [activeProject?.id, selectedSceneId]);
+
+  const isScreenplayApproved = storyApproval?.status === 'APPROVED' && storyApproval?.is_hash_fresh === true;
 
   const handleGenerateShots = async () => {
     if (!selectedSceneId) {
       alert('Please select a scene first.');
       return;
     }
+    if (!isScreenplayApproved) {
+      setGatekeeperError('Gatekeeper Security: Screenplay must be approved before generating storyboard shots.');
+      return;
+    }
     setGenerating(true);
+    setGatekeeperError(null);
     try {
       await generateShotsForScene(selectedSceneId, shotCountToGen);
       await loadScenesAndShots();
+      await loadStoryApproval();
       onRefreshProject();
     } catch (err: any) {
-      alert('Director breakdown failed: ' + (err.message || err));
+      const msg = err.message || String(err);
+      if (msg.includes('Gatekeeper') || msg.includes('approval') || msg.includes('403') || msg.includes('409') || msg.includes('locked')) {
+        setGatekeeperError(`Gatekeeper blocked shot generation: ${msg}`);
+        loadStoryApproval();
+      } else {
+        alert('Director breakdown failed: ' + msg);
+      }
     } finally {
       setGenerating(false);
     }
@@ -155,6 +197,11 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
   const handleAddManualShot = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeProject || !selectedSceneId) return;
+    if (!isScreenplayApproved) {
+      setGatekeeperError('Gatekeeper Security: Screenplay must be approved before adding storyboard shots.');
+      setShowAddModal(false);
+      return;
+    }
     try {
       await createShot({
         project_id: activeProject.id,
@@ -172,8 +219,15 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
       setNewPrompt('');
       await loadScenesAndShots();
       onRefreshProject();
-    } catch (err) {
-      alert('Failed to create shot: ' + err);
+    } catch (err: any) {
+      const msg = err.message || String(err);
+      if (msg.includes('Gatekeeper') || msg.includes('approval') || msg.includes('403') || msg.includes('409') || msg.includes('locked')) {
+        setGatekeeperError(`Gatekeeper blocked shot creation: ${msg}`);
+        setShowAddModal(false);
+        loadStoryApproval();
+      } else {
+        alert('Failed to create shot: ' + msg);
+      }
     }
   };
 
@@ -212,13 +266,87 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
 
           <button
             onClick={() => setShowAddModal(true)}
-            className="bg-studio-900 hover:bg-studio-800 text-cinema-gold border border-cinema-gold/30 px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition-all"
+            disabled={!isScreenplayApproved}
+            title={!isScreenplayApproved ? 'Screenplay must be approved before adding shots' : undefined}
+            className={`px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition-all ${
+              !isScreenplayApproved
+                ? 'bg-studio-900/50 text-slate-500 border border-studio-800 cursor-not-allowed opacity-60'
+                : 'bg-studio-900 hover:bg-studio-800 text-cinema-gold border border-cinema-gold/30'
+            }`}
           >
-            <Plus className="w-4 h-4" />
+            {!isScreenplayApproved ? <Lock className="w-4 h-4 text-slate-500" /> : <Plus className="w-4 h-4" />}
             <span>Add Shot</span>
           </button>
         </div>
       </div>
+
+      {/* Gatekeeper Security Banner */}
+      {!isScreenplayApproved && (
+        <div
+          className={`p-4 rounded-xl border flex flex-col md:flex-row md:items-center justify-between gap-4 transition-all shadow-lg ${
+            storyApproval?.status === 'STALE'
+              ? 'bg-amber-950/40 border-amber-500/40 text-amber-200'
+              : storyApproval?.status === 'WAITING_FOR_APPROVAL'
+              ? 'bg-blue-950/40 border-blue-500/40 text-blue-200'
+              : storyApproval?.status === 'REJECTED'
+              ? 'bg-rose-950/40 border-rose-500/40 text-rose-200'
+              : 'bg-studio-900 border-amber-500/30 text-amber-300'
+          }`}
+        >
+          <div className="flex items-start space-x-3">
+            <div className="p-2 rounded-lg bg-black/40 border border-white/10 text-cinema-gold shrink-0 mt-0.5">
+              <ShieldAlert className="w-5 h-5 text-amber-400" />
+            </div>
+            <div>
+              <div className="flex items-center space-x-2">
+                <span className="font-bold text-sm text-white">Gatekeeper Security Enforcement</span>
+                <span
+                  className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase ${
+                    storyApproval?.status === 'STALE'
+                      ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                      : storyApproval?.status === 'WAITING_FOR_APPROVAL'
+                      ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
+                      : storyApproval?.status === 'REJECTED'
+                      ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                      : 'bg-slate-700/50 text-slate-300 border border-slate-600'
+                  }`}
+                >
+                  {storyApproval?.status || 'LOCKED'}
+                </span>
+                {storyApproval && !storyApproval.is_hash_fresh && (
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                    HASH DRIFT DETECTED
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-300 mt-1 max-w-2xl">
+                {storyApproval?.status === 'STALE'
+                  ? 'Screenplay scenes were modified after previous approval. The approval token was invalidated to protect film continuity. Storyboard generation is locked until the revised screenplay is approved.'
+                  : storyApproval?.status === 'WAITING_FOR_APPROVAL'
+                  ? 'The screenplay has been submitted for review and is currently awaiting human approval. Storyboard shot generation will unlock once approved.'
+                  : storyApproval?.status === 'REJECTED'
+                  ? 'Screenplay was rejected during review. Please revise scenes in the Screenplay editor and re-submit.'
+                  : 'The screenplay must be submitted and approved before shots can be decomposed or added to the storyboard.'}
+              </p>
+              {gatekeeperError && (
+                <div className="mt-2 text-xs font-mono bg-rose-950/60 text-rose-300 p-2 rounded border border-rose-800/60">
+                  {gatekeeperError}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {onSelectView && (
+            <button
+              onClick={() => onSelectView('screenplay')}
+              className="bg-cinema-gold/20 hover:bg-cinema-gold/30 text-cinema-gold border border-cinema-gold/50 px-4 py-2 rounded-lg text-xs font-bold flex items-center space-x-2 shrink-0 transition-all self-start md:self-auto"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <span>Return to Screenplay to Review & Approve</span>
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Scene Selector & Director Agent Generator Bar */}
       <div className="p-4 rounded-xl bg-studio-900 border border-studio-800 flex flex-wrap items-center justify-between gap-4">
@@ -253,14 +381,16 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
               max={8}
               value={shotCountToGen}
               onChange={(e) => setShotCountToGen(Number(e.target.value))}
-              className="w-14 bg-studio-950 border border-studio-700 rounded px-2 py-1 text-xs text-white font-mono text-center"
+              disabled={!isScreenplayApproved}
+              className="w-14 bg-studio-950 border border-studio-700 rounded px-2 py-1 text-xs text-white font-mono text-center disabled:opacity-50"
             />
             <button
               onClick={handleGenerateShots}
-              disabled={generating}
-              className="bg-gradient-to-r from-purple-600 to-indigo-600 hover:opacity-90 text-white px-4 py-1.5 rounded-lg text-xs font-bold flex items-center space-x-1.5 shadow-md shadow-purple-900/20 transition-all disabled:opacity-50"
+              disabled={generating || !isScreenplayApproved}
+              title={!isScreenplayApproved ? 'Screenplay must be approved before generating shots' : undefined}
+              className="bg-gradient-to-r from-purple-600 to-indigo-600 hover:opacity-90 text-white px-4 py-1.5 rounded-lg text-xs font-bold flex items-center space-x-1.5 shadow-md shadow-purple-900/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <Wand2 className="w-3.5 h-3.5" />
+              {!isScreenplayApproved ? <Lock className="w-3.5 h-3.5" /> : <Wand2 className="w-3.5 h-3.5" />}
               <span>{generating ? 'Deconstructing...' : 'Director Agent Breakdown'}</span>
             </button>
           </div>
@@ -544,9 +674,15 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
           <div className="col-span-2 p-12 text-center text-slate-500 text-xs font-mono space-y-3">
             <Layers className="w-8 h-8 text-slate-600 mx-auto" />
             <p>No shots created for this scene yet.</p>
-            <p className="text-slate-400">
-              Click <strong className="text-cinema-gold">"Director Agent Breakdown"</strong> above to automatically decompose the scene into Flow shots!
-            </p>
+            {isScreenplayApproved ? (
+              <p className="text-slate-400">
+                Click <strong className="text-cinema-gold">"Director Agent Breakdown"</strong> above to automatically decompose the scene into Flow shots!
+              </p>
+            ) : (
+              <p className="text-amber-400/90 font-medium">
+                Storyboard generation is locked by the Server-side Gatekeeper until the screenplay is approved.
+              </p>
+            )}
           </div>
         )}
       </div>

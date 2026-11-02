@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from backend.app.main import app
+from backend.app.main import app, seed_initial_demo_if_empty
 from backend.app.database import init_db
 
 client = TestClient(app)
@@ -8,6 +8,9 @@ client = TestClient(app)
 @pytest.fixture(scope="module", autouse=True)
 def setup_test_db():
     init_db()
+    seed_initial_demo_if_empty(force=True)
+
+
 
 def test_health_check():
     response = client.get("/api/health")

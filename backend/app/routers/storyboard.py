@@ -11,6 +11,7 @@ from backend.app.agents.cinematographer_agent import cinematographer_agent
 from backend.app.agents.continuity_agent import continuity_agent
 from backend.app.services.cost_controller import cost_controller
 from backend.app.services.job_manager import job_manager, sanitize_error_message
+from backend.app.services.gatekeeper import gatekeeper
 
 router = APIRouter(prefix="/api/storyboard", tags=["storyboard"])
 
@@ -61,9 +62,8 @@ def list_shots(project_id: str, scene_id: Optional[str] = Query(None), db: Sessi
 
 @router.post("", response_model=ShotResponse, status_code=201)
 def create_shot(data: ShotCreate, db: Session = Depends(get_db)):
-    scene = db.query(Scene).filter(Scene.id == data.scene_id).first()
-    if not scene:
-        raise HTTPException(status_code=404, detail="Scene not found")
+    # Gatekeeper check: validates scene existence, cross-project consistency, and story approval
+    scene = gatekeeper.verify_scene_approval(db=db, scene_id=data.scene_id, expected_project_id=data.project_id)
 
     last_shot = db.query(Shot).filter(Shot.scene_id == data.scene_id).order_by(Shot.order_index.desc()).first()
     next_num = (last_shot.shot_number + 1) if last_shot else 1
@@ -97,15 +97,15 @@ def create_shot(data: ShotCreate, db: Session = Depends(get_db)):
 
 @router.post("/generate/{scene_id}", response_model=List[ShotResponse])
 def generate_shots_for_scene(scene_id: str, req: GenerateShotsRequest, db: Session = Depends(get_db)):
-    scene = db.query(Scene).filter(Scene.id == scene_id).first()
-    if not scene:
-        raise HTTPException(status_code=404, detail="Scene not found")
+    # Gatekeeper check: validates scene existence and active story approval with exact hash match
+    scene = gatekeeper.verify_scene_approval(db=db, scene_id=scene_id)
 
     project = db.query(Project).filter(Project.id == scene.project_id).first()
-    if not project:
+    if not project or project.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Project not found")
 
     job_payload = {"scene_id": scene.id, "count": req.shot_count}
+
     job, action = job_manager.prepare_or_claim_job(
         db=db,
         project_id=project.id,

@@ -602,6 +602,8 @@ def test_pg_concurrent_recover_staged_uploads_multi_instance(pg_session_factory,
         abandoned_untracked.write_bytes(b"pg_abandoned_untracked_bytes")
         old_ts = time.time() - 7200
         os.utime(abandoned_untracked, (old_ts, old_ts))
+        session.commit()
+
 
     def pg_worker_recovery(w_idx: int):
         with pg_session_factory() as s:

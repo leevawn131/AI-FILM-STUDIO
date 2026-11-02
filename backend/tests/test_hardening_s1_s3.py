@@ -215,7 +215,20 @@ def test_task2_idempotent_flow_credit_recording_and_concurrency():
     assert len(scenes) > 0
     scene_id = scenes[0]["id"]
 
+    # Ensure story_approval is approved for project_id to satisfy Gatekeeper
+    cp_info = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval").json()
+    if cp_info.get("status") != "APPROVED" or not cp_info.get("is_hash_fresh"):
+        client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/submit")
+        rev = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/review").json()
+        client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/decision", json={
+            "decision": "APPROVED",
+            "expected_artifact_version": rev["artifact_version"],
+            "expected_artifact_hash": rev["current_artifact_hash"],
+            "reviewer_name": "Director"
+        })
+
     # Create a fresh isolated shot to test accounting lifecycle cleanly
+
     fresh_shot_res = client.post(
         "/api/storyboard",
         json={

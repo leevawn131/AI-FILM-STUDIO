@@ -738,3 +738,129 @@ export async function launchExportRender(
   if (!res.ok) throw new Error('Failed to launch export render');
   return res.json();
 }
+
+// ---------------------------------------------------------------------------
+// S4 M2.2 Story Approval & Gatekeeper Client Methods
+// ---------------------------------------------------------------------------
+
+export interface StoryReviewSceneItem {
+  scene_number: number;
+  order_index: number;
+  slugline: string;
+  title: string;
+  summary: string;
+  script_content: string;
+  estimated_duration: number;
+}
+
+export interface StoryReviewData {
+  project_id: string;
+  project_name: string;
+  checkpoint_status: string;
+  artifact_version: number;
+  current_artifact_hash: string | null;
+  submitted_artifact_hash: string | null;
+  is_hash_fresh: boolean;
+  scenes: StoryReviewSceneItem[];
+}
+
+export interface StorySubmitResponse {
+  project_id: string;
+  checkpoint_id: string;
+  checkpoint_type: string;
+  status: string;
+  artifact_version: number;
+  artifact_content_hash: string;
+  submitted_at: string;
+  message: string;
+}
+
+export interface CheckpointDecisionPayload {
+  decision: 'APPROVED' | 'REJECTED' | 'REQUEST_CHANGES';
+  expected_artifact_version: number;
+  expected_artifact_hash: string;
+  reviewer_name: string;
+  feedback_notes?: string;
+}
+
+export interface CheckpointDecisionResponse {
+  project_id: string;
+  checkpoint_id: string;
+  checkpoint_type: string;
+  status: string;
+  decision: string;
+  artifact_version: number;
+  artifact_content_hash: string;
+  reviewer_name: string;
+  feedback_notes?: string;
+  decided_at: string;
+}
+
+export interface PipelineCheckpointDetail {
+  id: string;
+  project_id: string;
+  checkpoint_type: string;
+  status: string;
+  artifact_type: string;
+  artifact_version: number;
+  artifact_content_hash: string | null;
+  current_artifact_hash?: string | null;
+  is_hash_fresh?: boolean;
+  reviewer_name: string;
+  feedback_notes?: string;
+  decided_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function fetchStoryReview(projectId: string): Promise<StoryReviewData> {
+  const res = await fetch(`${API_BASE}/pipeline/${projectId}/checkpoints/story_approval/review`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to fetch story review data');
+  }
+  return res.json();
+}
+
+export async function submitStoryForReview(projectId: string): Promise<StorySubmitResponse> {
+  const res = await fetch(`${API_BASE}/pipeline/${projectId}/checkpoints/story_approval/submit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to submit story for review');
+  }
+  return res.json();
+}
+
+export async function decideStoryApproval(
+  projectId: string,
+  payload: CheckpointDecisionPayload
+): Promise<CheckpointDecisionResponse> {
+  const res = await fetch(`${API_BASE}/pipeline/${projectId}/checkpoints/story_approval/decision`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const errorObj: any = new Error(err.detail || 'Failed to record decision');
+    errorObj.status = res.status;
+    throw errorObj;
+  }
+  return res.json();
+}
+
+export async function fetchCheckpointDetail(
+  projectId: string,
+  checkpointType: string
+): Promise<PipelineCheckpointDetail> {
+  const res = await fetch(`${API_BASE}/pipeline/${projectId}/checkpoints/${checkpointType}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to fetch checkpoint ${checkpointType}`);
+  }
+  return res.json();
+}
+

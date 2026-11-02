@@ -20,10 +20,59 @@ from backend.app.schemas.pipeline import (
     PipelineStatusResponse,
     PipelineStageDetailResponse,
     PipelineCheckpointDetailResponse,
-    PipelineAuditHistoryResponse
+    PipelineAuditHistoryResponse,
+    StoryReviewResponse,
+    StorySubmitResponse,
+    CheckpointDecisionRequest,
+    CheckpointDecisionResponse,
 )
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
+
+
+# ---------------------------------------------------------------------------
+# S4 M2.2 Story Approval Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{project_id}/checkpoints/story_approval/review",
+    response_model=StoryReviewResponse,
+    summary="Retrieve screenplay data for approval review",
+    description="Returns ordered scenes, canonical content hash, current approval status, and token metadata for human review."
+)
+def get_story_review(
+    project_id: str,
+    db: Session = Depends(get_db)
+):
+    return pipeline_orchestrator.get_story_review_data(db, project_id)
+
+
+@router.post(
+    "/{project_id}/checkpoints/story_approval/submit",
+    response_model=StorySubmitResponse,
+    summary="Submit screenplay for human director approval",
+    description="Transitions screenplay stage and checkpoint to WAITING_FOR_APPROVAL and records compliance audit."
+)
+def submit_story_for_review(
+    project_id: str,
+    db: Session = Depends(get_db)
+):
+    return pipeline_orchestrator.submit_story_for_review(db, project_id)
+
+
+@router.post(
+    "/{project_id}/checkpoints/story_approval/decision",
+    response_model=CheckpointDecisionResponse,
+    summary="Record human approval or rejection decision",
+    description="Applies director decision (APPROVED, REJECTED, REQUEST_CHANGES) with optimistic concurrency checks."
+)
+def decide_story_approval(
+    project_id: str,
+    request: CheckpointDecisionRequest,
+    db: Session = Depends(get_db)
+):
+    return pipeline_orchestrator.record_story_decision(db, project_id, request)
+
 
 
 @router.get(

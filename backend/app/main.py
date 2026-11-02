@@ -5,7 +5,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from backend.app.config import settings
 from backend.app.database import init_db, SessionLocal
-from backend.app.models.entities import Project, Character, Location, Scene, Shot
+from backend.app.models.entities import (
+    Project, Character, Location, Scene, Shot,
+    PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit
+)
 from backend.app.services.pipeline_orchestrator import initialize_project_pipeline
 from backend.app.routers import projects, dashboard, cost, screenplay, storyboard, characters, locations, flow_handoff, media, editor, audio, export, system, jobs, pipeline
 
@@ -15,8 +18,9 @@ def seed_initial_demo_if_empty(force: bool = False):
 
     db = SessionLocal()
     try:
-        count = db.query(Project).count()
+        count = db.query(Project).filter(Project.deleted_at.is_(None)).count()
         if count == 0:
+
             demo = Project(
                 name="Cyber Horizon: Echoes of 2088",
                 logline="A rogue neural architect infiltrates a submerged data spire to recover the fragmented consciousness of humanity's first artificial sentience.",
@@ -131,8 +135,51 @@ FADE TO BLACK.
 
             # Atomically initialize pipeline stages and checkpoints within the same transaction
             initialize_project_pipeline(demo.id, db, auto_commit=False)
+
+            # Pre-approve demo story checkpoint matching seeded scene content
+            from backend.app.services.pipeline_orchestrator import PipelineOrchestrator, utc_now
+            current_hash = PipelineOrchestrator.compute_artifact_hash(db, demo.id, "screenplay")
+            if current_hash:
+                cp = db.query(PipelineCheckpoint).filter(
+                    PipelineCheckpoint.project_id == demo.id,
+                    PipelineCheckpoint.checkpoint_type == "story_approval"
+                ).first()
+                if cp:
+                    now = utc_now()
+                    cp.status = "APPROVED"
+                    cp.artifact_content_hash = current_hash
+                    cp.decided_at = now
+                    cp.reviewer_name = "Lead Director"
+                    cp.feedback_notes = "Initial demo screenplay pre-approved."
+                    cp.updated_at = now
+
+                    screenplay_stage = db.query(PipelineStageState).filter(
+                        PipelineStageState.project_id == demo.id,
+                        PipelineStageState.stage_name == "screenplay"
+                    ).first()
+                    if screenplay_stage:
+                        screenplay_stage.status = "COMPLETED"
+                        screenplay_stage.content_hash = current_hash
+                        screenplay_stage.completed_at = now
+
+                    demo.current_pipeline_stage = "character_design"
+
+                    audit = PipelineCheckpointAudit(
+                        project_id=demo.id,
+                        project_name_snapshot=demo.name,
+                        checkpoint_id=cp.id,
+                        checkpoint_type="story_approval",
+                        decision="APPROVED",
+                        artifact_content_hash=current_hash,
+                        artifact_version=1,
+                        reviewer_name="Lead Director",
+                        feedback_notes="Initial demo screenplay pre-approved."
+                    )
+                    db.add(audit)
+
             db.commit()
             db.refresh(demo)
+
 
             # Scaffold folders only after successful atomic commit
             p_dir = settings.projects_dir / demo.id

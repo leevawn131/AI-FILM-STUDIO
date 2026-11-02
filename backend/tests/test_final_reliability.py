@@ -1011,11 +1011,22 @@ def test_task4_flow_attempt_validation_and_concurrency(tmp_path):
     project_id = p_res.json()["id"]
 
     try:
-        scene_res = client.post("/api/scenes", json={"project_id": project_id, "title": "Opening Scene"})
+        scene_res = client.post("/api/scenes", json={"project_id": project_id, "title": "Opening Scene", "script_content": "INT. LAB - DAY\nAction."})
         assert scene_res.status_code in (200, 201)
         scene_id = scene_res.json()["id"]
 
+        # Submit and approve screenplay to satisfy Gatekeeper
+        client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/submit")
+        rev = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/review").json()
+        client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/decision", json={
+            "decision": "APPROVED",
+            "expected_artifact_version": rev["artifact_version"],
+            "expected_artifact_hash": rev["current_artifact_hash"],
+            "reviewer_name": "Director"
+        })
+
         shot1_res = client.post("/api/storyboard", json={"project_id": project_id, "scene_id": scene_id, "shot_number": 1, "shot_code": "SC1_SH1"})
+
         assert shot1_res.status_code == 201
         shot1_id = shot1_res.json()["id"]
 

@@ -28,7 +28,18 @@ def test_screenplay_and_storyboard_workflow():
     assert new_scene["project_id"] == project_id
     new_scene_id = new_scene["id"]
 
+    # Submit and approve updated screenplay before breakdown (satisfying Gatekeeper)
+    client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/submit")
+    rev = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/review").json()
+    client.post(f"/api/pipeline/{project_id}/checkpoints/story_approval/decision", json={
+        "decision": "APPROVED",
+        "expected_artifact_version": rev["artifact_version"],
+        "expected_artifact_hash": rev["current_artifact_hash"],
+        "reviewer_name": "Director"
+    })
+
     # 4. Director Agent breakdown for the new scene
+
     breakdown_res = client.post(f"/api/storyboard/generate/{new_scene_id}", json={"shot_count": 3})
     assert breakdown_res.status_code == 200
     shots = breakdown_res.json()

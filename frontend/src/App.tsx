@@ -142,6 +142,7 @@ export const App: React.FC = () => {
                 <StoryboardView
                   activeProject={activeProject}
                   onRefreshProject={loadProjects}
+                  onSelectView={setCurrentView}
                 />
               )}
 
