@@ -9,6 +9,12 @@ Canonical Single Source of Truth:
 - PipelineCheckpointAudit: Immutable, append-only compliance journal.
 - Project.current_pipeline_stage & Project.pipeline_overall_status: Derived projections
   updated transactionally by orchestrator operations.
+
+SECURITY & AUTHORIZATION NOTICE:
+Pipeline endpoints and orchestrator methods currently use project ID scoping but do not
+enforce user-level project ownership. Cross-project query filtering is not equivalent
+to user authorization. This limitation must be addressed when multi-user access or public
+API exposure is introduced.
 """
 
 import json
@@ -322,6 +328,16 @@ class PipelineOrchestrator:
         stages = db.query(PipelineStageState).filter(PipelineStageState.project_id == project_id).all()
         checkpoints = db.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == project_id).all()
 
+        # Validate active_job_ids strictly against this project
+        candidate_job_ids = [s.active_job_id for s in stages if s.active_job_id]
+        valid_job_ids = set()
+        if candidate_job_ids:
+            matching_jobs = db.query(StudioJob.id).filter(
+                StudioJob.id.in_(candidate_job_ids),
+                StudioJob.project_id == project_id
+            ).all()
+            valid_job_ids = {j[0] for j in matching_jobs}
+
         stage_order = {name: idx for idx, name in enumerate(PIPELINE_STAGES)}
         sorted_stages = sorted(stages, key=lambda s: stage_order.get(s.stage_name, 99))
 
@@ -344,7 +360,7 @@ class PipelineOrchestrator:
                     "stage_name": s.stage_name,
                     "status": s.status,
                     "order_index": stage_order.get(s.stage_name, 0) + 1,
-                    "active_job_id": s.active_job_id,
+                    "active_job_id": s.active_job_id if s.active_job_id in valid_job_ids else None,
                     "retry_count": s.retry_count,
                     "content_hash": s.content_hash,
                     "consumed_input_hash": s.consumed_input_hash,
@@ -407,12 +423,14 @@ class PipelineOrchestrator:
         stage_order = {name: idx for idx, name in enumerate(PIPELINE_STAGES)}
 
         active_job_dict = None
+        safe_active_job_id = None
         if stage.active_job_id:
             job = db.query(StudioJob).filter(
                 StudioJob.id == stage.active_job_id,
                 StudioJob.project_id == project_id
             ).first()
             if job:
+                safe_active_job_id = job.id
                 active_job_dict = {
                     "id": job.id,
                     "job_type": job.job_type,
@@ -451,7 +469,7 @@ class PipelineOrchestrator:
             "stage_name": stage.stage_name,
             "status": stage.status,
             "order_index": stage_order.get(stage.stage_name, 0) + 1,
-            "active_job_id": stage.active_job_id,
+            "active_job_id": safe_active_job_id,
             "retry_count": stage.retry_count,
             "content_hash": stage.content_hash,
             "consumed_input_hash": stage.consumed_input_hash,

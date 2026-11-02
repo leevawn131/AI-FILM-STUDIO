@@ -664,94 +664,146 @@ def test_uninitialized_and_partial_pipeline_read_only_zero_mutation(test_db_sess
 
 def test_safe_public_projection_redacts_sensitive_metadata_and_errors(test_db_session):
     """
-    Verifies Requirement 2: Safe Public Projections.
-    - Sanitizes stage_metadata: strips worker_id, fencing_token, internal payloads, file paths.
-    - Sanitizes error_message: redacts file paths, API keys, bearer tokens, DB credentials.
-    - Preserves safe frontend fields (e.g. model, resolution, retry_count, content hashes).
+    Verifies Requirement 1:
+    - Strict public allowlist for stage_metadata: unknown fields and sensitive keys are removed by default.
+    - Tests explicit removal of:
+      * private_key
+      * raw_prompt
+      * provider_response
+      * request_headers
+      * source_path
+      * artifact_uri
+      * /mnt, /opt, /srv, /workspace paths
+      * GitHub tokens and AWS-style credentials
+      * Nested sensitive fields
+      * Unknown metadata fields
+    - Tests controlled, user-safe error messages.
+    - Asserts that NO sentinel secret appears anywhere in serialized API responses.
     """
     session, engine = test_db_session
 
-    create_res = client.post("/api/projects", json={"name": "Sanitization Test Film"})
+    create_res = client.post("/api/projects", json={"name": "Allowlist Sanitization Film"})
     project_id = create_res.json()["id"]
 
-    # Inject sensitive data into a stage
+    sentinels = {
+        "private_key": "-----BEGIN RSA PRIVATE KEY-----\nSENTINEL_PRIVKEY_SECRET_DATA_999\n-----END RSA PRIVATE KEY-----",
+        "raw_prompt": "SENTINEL_RAW_PROMPT_SECRET_INSTRUCTIONS_DO_NOT_LEAK",
+        "provider_response": {"candidates": [{"content": "SENTINEL_PROVIDER_INTERNAL_BODY_123"}]},
+        "request_headers": {"Authorization": "Bearer SENTINEL_BEARER_AUTH_HEADER_456"},
+        "source_path": "/opt/internal/film/SENTINEL_SOURCE_FILE.mp4",
+        "artifact_uri": "s3://sentinel-storage-bucket/SENTINEL_INTERNAL_ARTIFACT.bin",
+        "mnt_path_val": "/mnt/nfs/share/SENTINEL_MNT_SECRET_ASSET.mov",
+        "srv_path_val": "/srv/confidential/SENTINEL_SRV_SECRET_DATA.txt",
+        "workspace_path_val": "/workspace/ai-film-studio/SENTINEL_WORKSPACE_SECRET.py",
+        "github_token": "ghp_SENTINELGITHUBTOKEN0123456789abcdef",
+        "aws_key": "AKIASENTINELAWSKEY",
+        "aws_secret": "SENTINEL_AWS_SECRET_KEY_ABCDEF123456789",
+        "nested_secret": "SENTINEL_NESTED_SECRET_PAYLOAD_888",
+        "unknown_field": "SENTINEL_UNKNOWN_DEBUG_METADATA_VALUE_777",
+        "error_traceback": "Traceback (most recent call last):\n  File \"/opt/backend/worker.py\", line 99\nConnectionError: DB postgresql://admin:SENTINEL_DB_SECRET_PASS@db:5432 failed"
+    }
+
+    # Inject into stage
     stage = session.query(PipelineStageState).filter(
         PipelineStageState.project_id == project_id,
         PipelineStageState.stage_name == "screenplay"
     ).first()
 
-    sensitive_metadata = {
-        "worker_id": "gpu-worker-us-central-99",
-        "fencing_token": 999123,
-        "payload": {"prompt": "cinematic prompt", "internal_secret": "sk-proj-supersecretkey123456789"},
-        "disk_path": "/var/data/models/weights.bin",
+    raw_metadata = {
+        # Prohibited top-level sensitive keys
+        "private_key": sentinels["private_key"],
+        "raw_prompt": sentinels["raw_prompt"],
+        "provider_response": sentinels["provider_response"],
+        "request_headers": sentinels["request_headers"],
+        "source_path": sentinels["source_path"],
+        "artifact_uri": sentinels["artifact_uri"],
+        "unknown_debug_field": sentinels["unknown_field"],
+        "aws_secret": sentinels["aws_secret"],
+        # Allowed fields with embedded paths and credentials that must be redacted
         "model": "screenplay-gpt-v4",
         "resolution": "4K",
-        "safe_summary": "Script draft generated at /home/leevawn/output.fdr"
+        "generation_summary": (
+            f"Drafted screenplay with {sentinels['github_token']} and {sentinels['aws_key']} "
+            f"saved at {sentinels['mnt_path_val']} and {sentinels['srv_path_val']}"
+        ),
+        "summary": {
+            "act_count": 3,
+            "raw_prompt": sentinels["raw_prompt"],  # Nested sensitive field
+            "private_key": sentinels["nested_secret"],  # Nested sensitive field
+            "note": f"Completed at {sentinels['workspace_path_val']}"
+        }
     }
-    sensitive_error = (
-        'Traceback (most recent call last):\n'
-        '  File "/home/leevawn/Phim/backend/worker.py", line 123, in execute\n'
-        '    raise ConnectionError("DB postgresql://admin:topsecretpass@db.internal:5432/film failed with sk-ant-api03-12345678901234567890")'
-    )
 
-    stage.stage_metadata = json.dumps(sensitive_metadata)
-    stage.error_message = sensitive_error
+    stage.stage_metadata = json.dumps(raw_metadata)
+    stage.error_message = sentinels["error_traceback"]
     session.commit()
 
-    # Query complete pipeline state
+    # Query 1: Pipeline status overview
     pipe_res = client.get(f"/api/pipeline/{project_id}")
     assert pipe_res.status_code == 200
+    pipe_text = pipe_res.text
     pipe_data = pipe_res.json()
-    sc_stage = next(s for s in pipe_data["stages"] if s["stage_name"] == "screenplay")
 
-    meta = sc_stage["stage_metadata"]
-    assert "worker_id" not in meta
-    assert "fencing_token" not in meta
-    assert "payload" not in meta
-    assert "disk_path" not in meta
-    assert meta["model"] == "screenplay-gpt-v4"
-    assert meta["resolution"] == "4K"
-    assert "[REDACTED_PATH]" in meta["safe_summary"]
-    assert "/home/leevawn" not in meta["safe_summary"]
-
-    err = sc_stage["error_message"]
-    assert "topsecretpass" not in err
-    assert "[REDACTED_PASS]" in err
-    assert "[REDACTED_API_KEY]" in err
-    assert "sk-ant-api03" not in err
-    assert "/home/leevawn" not in err
-
-    # Query individual stage detail
+    # Query 2: Individual stage detail
     detail_res = client.get(f"/api/pipeline/{project_id}/stages/screenplay")
     assert detail_res.status_code == 200
+    detail_text = detail_res.text
     detail_data = detail_res.json()
-    assert "worker_id" not in detail_data["stage_metadata"]
-    assert "topsecretpass" not in detail_data["error_message"]
+
+    # Check both serialized responses: NONE of the sentinel secrets may appear!
+    for label, sentinel in sentinels.items():
+        if isinstance(sentinel, str):
+            assert sentinel not in pipe_text, f"Sentinel '{label}' leaked in pipeline overview response!"
+            assert sentinel not in detail_text, f"Sentinel '{label}' leaked in stage detail response!"
+
+    # Verify that safe allowlisted fields ARE present and preserved
+    sc_stage = next(s for s in pipe_data["stages"] if s["stage_name"] == "screenplay")
+    meta = sc_stage["stage_metadata"]
+    assert meta["model"] == "screenplay-gpt-v4"
+    assert meta["resolution"] == "4K"
+    assert "[REDACTED_PATH]" in meta["generation_summary"]
+    assert "[REDACTED_TOKEN]" in meta["generation_summary"]
+    assert "[REDACTED_CREDENTIAL]" in meta["generation_summary"]
+    assert meta["summary"]["act_count"] == 3
+    assert "[REDACTED_PATH]" in meta["summary"]["note"]
+    assert "raw_prompt" not in meta["summary"]
+    assert "private_key" not in meta["summary"]
+    assert "unknown_debug_field" not in meta
+
+    # Verify error message is a controlled, user-safe message
+    assert sc_stage["error_message"] == "External service connection failure. Please retry."
+    assert detail_data["error_message"] == "External service connection failure. Please retry."
 
 
 def test_cross_project_job_isolation(test_db_session):
     """
     Verifies Requirement 2:
-    - active StudioJob lookup strictly validates StudioJob.project_id == project_id.
-    - Stage referencing a job belonging to another project never exposes that job.
+    - active_job_id cross-project leakage prevention.
+    - If Project A stage points to Project B's StudioJob:
+      * Pipeline overview for A must return active_job_id = null.
+      * Stage detail for A must return active_job_id = null.
+      * Stage detail for A must return active_job = null.
+      * Project B's job ID and worker information must NOT appear anywhere in Project A's serialized responses.
     """
     session, engine = test_db_session
 
-    res_a = client.post("/api/projects", json={"name": "Project A"})
+    res_a = client.post("/api/projects", json={"name": "Project Alpha Isolation"})
     id_a = res_a.json()["id"]
 
-    res_b = client.post("/api/projects", json={"name": "Project B"})
+    res_b = client.post("/api/projects", json={"name": "Project Beta Isolation"})
     id_b = res_b.json()["id"]
+
+    foreign_job_id = f"foreign-job-{uuid.uuid4()}"
+    foreign_worker_id = "foreign-gpu-worker-secret-999"
 
     # Create StudioJob belonging to Project B
     job_b = StudioJob(
-        id=str(uuid.uuid4()),
+        id=foreign_job_id,
         project_id=id_b,
         job_type="cinematic_prompt_agent",
         idempotency_key=f"idemp-{uuid.uuid4().hex[:8]}",
         status="RUNNING",
-        worker_id="worker_b",
+        worker_id=foreign_worker_id,
         fencing_token=1,
         created_at=utc_now(),
         updated_at=utc_now()
@@ -767,12 +819,25 @@ def test_cross_project_job_isolation(test_db_session):
     stage_a.active_job_id = job_b.id
     session.commit()
 
-    # Read Project A stage detail: active_job must be None
-    res = client.get(f"/api/pipeline/{id_a}/stages/cinematic_prompts")
-    assert res.status_code == 200
-    data = res.json()
-    assert data["active_job_id"] == job_b.id
-    assert data["active_job"] is None  # Must NOT leak Project B's job!
+    # 1. Pipeline overview for A
+    res_overview = client.get(f"/api/pipeline/{id_a}")
+    assert res_overview.status_code == 200
+    overview_text = res_overview.text
+    overview_data = res_overview.json()
+    cp_stage = next(s for s in overview_data["stages"] if s["stage_name"] == "cinematic_prompts")
+    assert cp_stage["active_job_id"] is None
+    assert foreign_job_id not in overview_text
+    assert foreign_worker_id not in overview_text
+
+    # 2. Stage detail for A
+    res_detail = client.get(f"/api/pipeline/{id_a}/stages/cinematic_prompts")
+    assert res_detail.status_code == 200
+    detail_text = res_detail.text
+    detail_data = res_detail.json()
+    assert detail_data["active_job_id"] is None
+    assert detail_data["active_job"] is None
+    assert foreign_job_id not in detail_text
+    assert foreign_worker_id not in detail_text
 
 
 def test_hash_freshness_semantics_four_cases(test_db_session):
@@ -906,41 +971,127 @@ def test_audit_history_pagination_tie_breaker(test_db_session):
 
 def test_read_only_contract_does_not_mutate_data(test_db_session):
     """
-    Verifies Requirement 4:
-    - GET requests to all read endpoints never mutate data, modify stage status,
-      or generate spurious compliance audit entries.
+    Verifies Requirement 3: Deep read-only state immutability.
+    - Snapshots entire relevant database state (all rows and column values across Project,
+      PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit, StudioJob, Scene).
+    - Invokes every M2.1 GET endpoint across:
+      1) Initialized project
+      2) Uninitialized project
+      3) Partially initialized project
+    - Asserts that post-invocation database state is 100% identical (zero inserts, updates, deletes, or mutations).
     """
     session, engine = test_db_session
+    from sqlalchemy import inspect as sa_inspect
 
-    create_res = client.post("/api/projects", json={"name": "Immutability Read Film"})
-    project_id = create_res.json()["id"]
+    # 1. Create initialized project via client
+    create_res = client.post("/api/projects", json={"name": "Initialized Read Film"})
+    init_proj_id = create_res.json()["id"]
 
-    # Baseline counts
-    audit_count_before = session.query(PipelineCheckpointAudit).count()
-    stage_count_before = session.query(PipelineStageState).count()
-    cp_count_before = session.query(PipelineCheckpoint).count()
+    # Add a scene and an approved checkpoint to initialized project for full endpoint coverage
+    scene = Scene(
+        id=str(uuid.uuid4()),
+        project_id=init_proj_id,
+        scene_number=1,
+        slugline="INT. READONLY - DAY",
+        script_content="INT. READONLY - DAY\nTesting immutable read state.",
+        order_index=1
+    )
+    session.add(scene)
+    session.commit()
+    pipeline_orchestrator.record_checkpoint_decision(
+        session, init_proj_id, "story_approval", "APPROVED", notes="Initial approval"
+    )
 
-    # Invoke all read endpoints multiple times
-    for _ in range(3):
-        r1 = client.get(f"/api/pipeline/{project_id}")
+    # 2. Create uninitialized project directly via ORM
+    uninit_proj = Project(
+        id=str(uuid.uuid4()),
+        name="Uninitialized Read Film",
+        budget_total=100.0,
+        budget_spent=0.0
+    )
+    session.add(uninit_proj)
+
+    # 3. Create partially initialized project with 1 stage only
+    part_proj = Project(
+        id=str(uuid.uuid4()),
+        name="Partial Read Film",
+        budget_total=200.0,
+        budget_spent=0.0
+    )
+    part_stage = PipelineStageState(
+        id=str(uuid.uuid4()),
+        project_id=part_proj.id,
+        stage_name="story_development",
+        status="NOT_STARTED",
+        created_at=utc_now(),
+        updated_at=utc_now()
+    )
+    session.add_all([part_proj, part_stage])
+    session.commit()
+
+    def snapshot_db() -> Dict[str, Any]:
+        session.expire_all()
+        def row_dict(obj):
+            cols = sa_inspect(obj).mapper.column_attrs
+            return {c.key: getattr(obj, c.key) for c in cols}
+
+        return {
+            "projects": [row_dict(p) for p in session.query(Project).order_by(Project.id).all()],
+            "stages": [row_dict(s) for s in session.query(PipelineStageState).order_by(PipelineStageState.id).all()],
+            "checkpoints": [row_dict(c) for c in session.query(PipelineCheckpoint).order_by(PipelineCheckpoint.id).all()],
+            "audits": [row_dict(a) for a in session.query(PipelineCheckpointAudit).order_by(PipelineCheckpointAudit.id).all()],
+            "jobs": [row_dict(j) for j in session.query(StudioJob).order_by(StudioJob.id).all()],
+            "scenes": [row_dict(sc) for sc in session.query(Scene).order_by(Scene.id).all()],
+        }
+
+    snapshot_before = snapshot_db()
+
+    # Invoke all M2.1 GET endpoints multiple times
+    for _ in range(2):
+        # A. Initialized project endpoints
+        r1 = client.get(f"/api/pipeline/{init_proj_id}")
         assert r1.status_code == 200
+        for stage_name in PIPELINE_STAGES:
+            r_st = client.get(f"/api/pipeline/{init_proj_id}/stages/{stage_name}")
+            assert r_st.status_code == 200
+        for cp_type, _ in PIPELINE_CHECKPOINTS:
+            r_cp = client.get(f"/api/pipeline/{init_proj_id}/checkpoints/{cp_type}")
+            assert r_cp.status_code == 200
+            r_aud = client.get(f"/api/pipeline/{init_proj_id}/checkpoints/{cp_type}/audit")
+            assert r_aud.status_code == 200
+        r_all_aud = client.get(f"/api/pipeline/{init_proj_id}/audit")
+        assert r_all_aud.status_code == 200
 
-        r2 = client.get(f"/api/pipeline/{project_id}/stages/screenplay")
-        assert r2.status_code == 200
+        # B. Uninitialized project endpoints
+        u1 = client.get(f"/api/pipeline/{uninit_proj.id}")
+        assert u1.status_code == 200
+        u2 = client.get(f"/api/pipeline/{uninit_proj.id}/stages/screenplay")
+        assert u2.status_code == 404
+        u3 = client.get(f"/api/pipeline/{uninit_proj.id}/checkpoints/story_approval")
+        assert u3.status_code == 404
+        u4 = client.get(f"/api/pipeline/{uninit_proj.id}/checkpoints/story_approval/audit")
+        assert u4.status_code == 200
+        u5 = client.get(f"/api/pipeline/{uninit_proj.id}/audit")
+        assert u5.status_code == 200
 
-        r3 = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval")
-        assert r3.status_code == 200
+        # C. Partially initialized project endpoints
+        p1 = client.get(f"/api/pipeline/{part_proj.id}")
+        assert p1.status_code == 200
+        p2 = client.get(f"/api/pipeline/{part_proj.id}/stages/story_development")
+        assert p2.status_code == 200
+        p3 = client.get(f"/api/pipeline/{part_proj.id}/stages/screenplay")
+        assert p3.status_code == 404
+        p4 = client.get(f"/api/pipeline/{part_proj.id}/checkpoints/story_approval")
+        assert p4.status_code == 404
+        p5 = client.get(f"/api/pipeline/{part_proj.id}/checkpoints/story_approval/audit")
+        assert p5.status_code == 200
+        p6 = client.get(f"/api/pipeline/{part_proj.id}/audit")
+        assert p6.status_code == 200
 
-        r4 = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/audit")
-        assert r4.status_code == 200
+    snapshot_after = snapshot_db()
 
-        r5 = client.get(f"/api/pipeline/{project_id}/audit")
-        assert r5.status_code == 200
-
-    # Assert completely unchanged database state
-    assert session.query(PipelineCheckpointAudit).count() == audit_count_before
-    assert session.query(PipelineStageState).count() == stage_count_before
-    assert session.query(PipelineCheckpoint).count() == cp_count_before
+    # Compare complete deep snapshot
+    assert snapshot_after == snapshot_before, "Database state was mutated during read requests!"
 
 
 def test_postgresql_read_api_compatibility():

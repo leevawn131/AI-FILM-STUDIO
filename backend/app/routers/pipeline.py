@@ -2,6 +2,12 @@
 Pipeline Read API Router.
 Provides read-only access to project pipeline states, stages, approval checkpoints,
 and immutable compliance audit journals.
+
+SECURITY & AUTHORIZATION NOTICE:
+Pipeline endpoints currently use project ID scoping but do not enforce user-level project ownership.
+Cross-project query filtering is not equivalent to user authorization.
+This must be addressed when the application introduces multi-user access or exposes the API
+beyond its trusted deployment boundary.
 """
 
 from typing import Optional

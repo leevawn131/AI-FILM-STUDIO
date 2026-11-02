@@ -543,6 +543,15 @@ def require_checkpoint(checkpoint_type: str):
 - `POST /api/flow-handoff/generate/{project_id}` -> `Depends(require_checkpoint("production_approval"))`
 - `POST /api/export/render/{project_id}` -> `Depends(require_checkpoint("final_review"))`
 
+### 5.4 Authorization Boundary & Single-Tenant Scope Limitations
+
+> [!WARNING]
+> **Known Architectural Limitation — Single-Tenant Project Scoping vs. User Authorization:**
+> - Pipeline endpoints currently use `project_id` scoping to isolate project state and associated background jobs, but do **not** enforce user-level project ownership or authentication.
+> - The existing codebase does not include a `User` or `Account` model; reviewer names in checkpoints and audit logs are nominal snapshot strings.
+> - **Cross-project query filtering is not equivalent to user authorization.**
+> - When the application introduces multi-tenant/multi-user collaboration, or exposes the API beyond a trusted local/internal boundary, a dedicated authentication and authorization layer (e.g. JWT authentication, project ownership tables, and RBAC / ABAC enforcement) must be implemented.
+
 ---
 
 ## 6. Frontend Workflow & User Experience Design

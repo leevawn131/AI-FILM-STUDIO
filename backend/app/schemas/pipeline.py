@@ -1,55 +1,74 @@
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 import json
 import re
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
-SENSITIVE_KEY_SUBSTRINGS = {
-    "worker", "fencing", "lease", "payload", "internal",
-    "token", "secret", "password", "api_key", "apikey",
-    "auth", "credential", "traceback", "stack_trace",
-    "filepath", "file_path", "local_path", "disk_path",
-    "storage_path", "db_url", "database_url", "connection_string",
-    "root_dir", "absolute_path"
+# ---------------------------------------------------------------------------
+# Strict Public Metadata Allowlist
+# ---------------------------------------------------------------------------
+# Only explicitly approved top-level and nested fields are exposed to public clients.
+# Unknown keys are dropped by default to prevent leakage of internal state,
+# provider responses, raw prompts, headers, or private keys.
+# ---------------------------------------------------------------------------
+
+ALLOWED_METADATA_FIELDS = {
+    "model",
+    "resolution",
+    "aspect_ratio",
+    "duration_seconds",
+    "frame_rate",
+    "fps",
+    "act_count",
+    "scene_count",
+    "estimated_pages",
+    "generation_summary",
+    "summary",
+    "quality",
+    "style",
+    "format",
+    "output_format",
+    "version",
+    "script_version",
+    "progress_percent",
+    "safe_notes",
+    "note",
 }
 
+# Regex patterns for redacting any secrets that might be embedded in allowed text values
+PATH_PATTERN = re.compile(
+    r"(/(?:home|tmp|var|etc|opt|srv|mnt|workspace|Users|root)/[^\s:\"']+|[A-Za-z]:\\[^\s:\"']+)",
+    re.IGNORECASE
+)
+KEY_PATTERNS = [
+    (re.compile(r"sk-[a-zA-Z0-9_\-]{10,}", re.IGNORECASE), "[REDACTED_API_KEY]"),
+    (re.compile(r"AIza[0-9A-Za-z_\-]{15,}", re.IGNORECASE), "[REDACTED_API_KEY]"),
+    (re.compile(r"ghp_[a-zA-Z0-9]{15,}|github_pat_[a-zA-Z0-9_]{15,}", re.IGNORECASE), "[REDACTED_TOKEN]"),
+    (re.compile(r"AKIA[0-9A-Za-z]{8,}", re.IGNORECASE), "[REDACTED_CREDENTIAL]"),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{10,}", re.IGNORECASE), "Bearer [REDACTED_TOKEN]"),
+    (re.compile(r"(?i)(?:password|passwd|pwd|secret|token|api_key|access_key|private_key|aws_secret)\s*[:=]\s*['\"]?[^\s'\"]+['\"]?"), "[REDACTED_SECRET]"),
+    (re.compile(r"(?i)(?:postgres(?:ql)?|mysql|sqlite|mongodb|redis)://[^:\s]+:[^@\s]+@"), "[REDACTED_CONNECTION]@"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL), "[REDACTED_PRIVATE_KEY]"),
+]
 
-def is_sensitive_key(k: Any) -> bool:
-    kl = str(k).lower().replace("-", "_")
-    return any(sub in kl for sub in SENSITIVE_KEY_SUBSTRINGS)
 
-
-def sanitize_error_text(text: Optional[str]) -> Optional[str]:
-    """Redacts internal stack traces, API keys, credentials, and local filesystem paths."""
+def sanitize_text_value(text: str) -> str:
+    """Redacts filesystem paths and credential patterns from text values."""
     if not text:
         return text
-
-    # If Python traceback, extract clean summary to avoid exposing internal frame logic
-    if "Traceback (most recent call last):" in text:
-        lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-        last_line = lines[-1] if lines else "Internal processing error"
-        text = f"Pipeline execution error: {last_line}"
-
-    # Redact API keys and authorization tokens
-    text = re.sub(r"sk-[a-zA-Z0-9_\-]{15,}", "[REDACTED_API_KEY]", text)
-    text = re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "[REDACTED_API_KEY]", text)
-    text = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{15,}", "Bearer [REDACTED_TOKEN]", text)
-    text = re.sub(r"(?i)(password|passwd|pwd|secret|token|api_key)=['\"][^'\"]+['\"]", r"\1='[REDACTED]'", text)
-    text = re.sub(r"(?i)(postgres(?:ql)?|mysql|sqlite)://[^:\s]+:[^@\s]+@", r"\1://[REDACTED_USER]:[REDACTED_PASS]@", text)
-
-    # Redact local filesystem paths
-    text = re.sub(r"(/home/[a-zA-Z0-9_.\-]+/[^\s:\"']+)", "[REDACTED_PATH]", text)
-    text = re.sub(r"(/tmp/[^\s:\"']+)", "[REDACTED_PATH]", text)
-    text = re.sub(r"(/var/[^\s:\"']+)", "[REDACTED_PATH]", text)
-    text = re.sub(r"(/etc/[^\s:\"']+)", "[REDACTED_PATH]", text)
-    text = re.sub(r"([A-Za-z]:\\[^\s:\"']+)", "[REDACTED_PATH]", text)
-
+    text = PATH_PATTERN.sub("[REDACTED_PATH]", text)
+    for pat, repl in KEY_PATTERNS:
+        text = pat.sub(repl, text)
     return text
 
 
 def sanitize_stage_metadata(v: Any) -> Optional[Dict[str, Any]]:
-    """Sanitizes stage metadata dictionary, removing sensitive internal keys and redacting text."""
+    """
+    Projects stage metadata through a strict public allowlist.
+    Unknown fields, internal responses, raw prompts, headers, private keys,
+    and filesystem paths are strictly stripped.
+    """
     if v is None:
         return None
     if isinstance(v, str):
@@ -57,31 +76,115 @@ def sanitize_stage_metadata(v: Any) -> Optional[Dict[str, Any]]:
             parsed = json.loads(v)
             if isinstance(parsed, dict):
                 v = parsed
-            elif isinstance(parsed, list):
-                v = {"items": parsed}
             else:
-                return {"note": sanitize_error_text(str(v))}
+                return {"summary": sanitize_text_value(str(v))}
         except Exception:
-            return {"note": sanitize_error_text(v)}
+            return {"summary": sanitize_text_value(v)}
 
     if not isinstance(v, dict):
         return None
 
-    def _sanitize(val: Any) -> Any:
-        if isinstance(val, dict):
-            return {
-                k: _sanitize(item)
-                for k, item in val.items()
-                if not is_sensitive_key(k)
-            }
-        elif isinstance(val, list):
-            return [_sanitize(item) for item in val]
-        elif isinstance(val, str):
-            return sanitize_error_text(val)
-        else:
-            return val
+    out: Dict[str, Any] = {}
+    for k, val in v.items():
+        # Strict allowlist check: drop all unknown keys
+        if k not in ALLOWED_METADATA_FIELDS:
+            continue
 
-    return _sanitize(v)
+        if isinstance(val, (int, float, bool)):
+            out[k] = val
+        elif isinstance(val, str):
+            out[k] = sanitize_text_value(val)
+        elif isinstance(val, list):
+            # Only allow lists of primitive types
+            clean_list = [
+                sanitize_text_value(item) if isinstance(item, str) else item
+                for item in val
+                if isinstance(item, (int, float, bool, str))
+            ]
+            if clean_list:
+                out[k] = clean_list
+        elif isinstance(val, dict):
+            # For nested dictionaries within allowed fields, enforce allowlist recursively
+            sub_dict: Dict[str, Any] = {}
+            for sub_k, sub_val in val.items():
+                if sub_k in ALLOWED_METADATA_FIELDS:
+                    if isinstance(sub_val, (int, float, bool)):
+                        sub_dict[sub_k] = sub_val
+                    elif isinstance(sub_val, str):
+                        sub_dict[sub_k] = sanitize_text_value(sub_val)
+            if sub_dict:
+                out[k] = sub_dict
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Controlled User-Safe Error Sanitization
+# ---------------------------------------------------------------------------
+# Rather than relying solely on regex redaction, error messages are classified
+# into controlled, user-safe failure states.
+# Raw exception names, internal tracebacks, and technical indicators are never exposed.
+# ---------------------------------------------------------------------------
+
+SAFE_PATTERNS = [
+    # Match user-intended business messages without internal technical details
+    re.compile(r"^[A-Za-z0-9\s.,'!?:;()_\-]+$")
+]
+
+TECHNICAL_INDICATORS = [
+    "traceback", "exception", "error:", "errno", "failed with", "raise ",
+    "file \"", ".py", ".json", ".bin", ".env", ".pem", ".key",
+    "/", "\\", "c:\\", "http://", "https://", "postgresql://", "sqlite://",
+    "token", "secret", "password", "key", "auth", "bearer", "credential",
+    "header", "socket", "connection", "query", "syntax", "nullpointer",
+    "segfault", "panic", "select ", "insert ", "update ", "delete ",
+    "private_key", "raw_prompt", "provider_response", "request_headers",
+    "source_path", "artifact_uri", "ghp_", "akia"
+]
+
+
+def classify_controlled_error(lower: str) -> str:
+    """Returns a controlled, user-safe failure state without exposing internal details."""
+    if "timeout" in lower or "timed out" in lower:
+        return "Operation timed out. Please retry the stage."
+    elif "rate limit" in lower or "quota" in lower or "429" in lower:
+        return "Provider quota or rate limit exceeded. Please retry later."
+    elif "reject" in lower or "denied" in lower or "policy" in lower or "safety" in lower:
+        return "Content or request was rejected by review policy."
+    elif "connection" in lower or "network" in lower or "unreachable" in lower or "dns" in lower:
+        return "External service connection failure. Please retry."
+    elif "memory" in lower or "oom" in lower or "killed" in lower:
+        return "Resource limit exceeded during processing."
+    elif "validation" in lower or "invalid input" in lower or "schema" in lower:
+        return "Stage input validation failed."
+    else:
+        return "Stage execution failed. Please retry the operation."
+
+
+def sanitize_error_text(text: Optional[str]) -> Optional[str]:
+    """
+    Returns controlled, user-safe error messages.
+    Never exposes arbitrary raw exceptions or traceback excerpts.
+    """
+    if not text:
+        return text
+
+    stripped = text.strip()
+    lower = stripped.lower()
+
+    # If it is multiline or contains traceback or code syntax
+    if "\n" in stripped or "traceback" in lower or "raise " in lower:
+        return classify_controlled_error(lower)
+
+    # Check if any technical indicator, path, or credential indicator exists
+    if any(ind in lower for ind in TECHNICAL_INDICATORS):
+        return classify_controlled_error(lower)
+
+    # If it's a short, clean single-line business message (e.g. director review note)
+    if len(stripped) <= 200 and SAFE_PATTERNS[0].match(stripped):
+        return stripped
+
+    return classify_controlled_error(lower)
 
 
 class JobSummaryResponse(BaseModel):
