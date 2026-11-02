@@ -1451,8 +1451,19 @@ def test_legacy_project_self_healing_missing_checkpoints(db_session, clean_proje
 
     assert not is_pipeline_complete(db_session, clean_project.id)
 
+    # 1. Strict read-only GET must NOT self-heal or mutate DB
+    status_before = PipelineOrchestrator.get_pipeline_status(db_session, clean_project.id)
+    assert status_before["is_initialized"] is False
+    assert len(status_before["checkpoints"]) == 0
+    assert not is_pipeline_complete(db_session, clean_project.id)
+
+    # 2. Explicit initialization / backfill flow
+    initialize_project_pipeline(clean_project.id, db_session)
+    assert is_pipeline_complete(db_session, clean_project.id)
+
     status = PipelineOrchestrator.get_pipeline_status(db_session, clean_project.id)
     assert len(status["checkpoints"]) == 4
+    assert status["is_initialized"] is True
     assert is_pipeline_complete(db_session, clean_project.id)
 
     screenplay_st = db_session.query(PipelineStageState).filter(
@@ -1486,8 +1497,19 @@ def test_legacy_project_self_healing_missing_stages(db_session, clean_project):
 
     assert not is_pipeline_complete(db_session, clean_project.id)
 
+    # 1. Strict read-only GET must NOT self-heal or mutate DB
+    status_before = PipelineOrchestrator.get_pipeline_status(db_session, clean_project.id)
+    assert status_before["is_initialized"] is False
+    assert len(status_before["stages"]) == 0
+    assert not is_pipeline_complete(db_session, clean_project.id)
+
+    # 2. Explicit initialization / backfill flow
+    initialize_project_pipeline(clean_project.id, db_session)
+    assert is_pipeline_complete(db_session, clean_project.id)
+
     status = PipelineOrchestrator.get_pipeline_status(db_session, clean_project.id)
     assert len(status["stages"]) == 11
+    assert status["is_initialized"] is True
     assert is_pipeline_complete(db_session, clean_project.id)
 
     story_cp = db_session.query(PipelineCheckpoint).filter(

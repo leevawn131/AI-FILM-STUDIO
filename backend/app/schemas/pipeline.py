@@ -1,7 +1,87 @@
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import json
+import re
 from pydantic import BaseModel, Field, ConfigDict, field_validator
+
+
+SENSITIVE_KEY_SUBSTRINGS = {
+    "worker", "fencing", "lease", "payload", "internal",
+    "token", "secret", "password", "api_key", "apikey",
+    "auth", "credential", "traceback", "stack_trace",
+    "filepath", "file_path", "local_path", "disk_path",
+    "storage_path", "db_url", "database_url", "connection_string",
+    "root_dir", "absolute_path"
+}
+
+
+def is_sensitive_key(k: Any) -> bool:
+    kl = str(k).lower().replace("-", "_")
+    return any(sub in kl for sub in SENSITIVE_KEY_SUBSTRINGS)
+
+
+def sanitize_error_text(text: Optional[str]) -> Optional[str]:
+    """Redacts internal stack traces, API keys, credentials, and local filesystem paths."""
+    if not text:
+        return text
+
+    # If Python traceback, extract clean summary to avoid exposing internal frame logic
+    if "Traceback (most recent call last):" in text:
+        lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+        last_line = lines[-1] if lines else "Internal processing error"
+        text = f"Pipeline execution error: {last_line}"
+
+    # Redact API keys and authorization tokens
+    text = re.sub(r"sk-[a-zA-Z0-9_\-]{15,}", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{15,}", "Bearer [REDACTED_TOKEN]", text)
+    text = re.sub(r"(?i)(password|passwd|pwd|secret|token|api_key)=['\"][^'\"]+['\"]", r"\1='[REDACTED]'", text)
+    text = re.sub(r"(?i)(postgres(?:ql)?|mysql|sqlite)://[^:\s]+:[^@\s]+@", r"\1://[REDACTED_USER]:[REDACTED_PASS]@", text)
+
+    # Redact local filesystem paths
+    text = re.sub(r"(/home/[a-zA-Z0-9_.\-]+/[^\s:\"']+)", "[REDACTED_PATH]", text)
+    text = re.sub(r"(/tmp/[^\s:\"']+)", "[REDACTED_PATH]", text)
+    text = re.sub(r"(/var/[^\s:\"']+)", "[REDACTED_PATH]", text)
+    text = re.sub(r"(/etc/[^\s:\"']+)", "[REDACTED_PATH]", text)
+    text = re.sub(r"([A-Za-z]:\\[^\s:\"']+)", "[REDACTED_PATH]", text)
+
+    return text
+
+
+def sanitize_stage_metadata(v: Any) -> Optional[Dict[str, Any]]:
+    """Sanitizes stage metadata dictionary, removing sensitive internal keys and redacting text."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            if isinstance(parsed, dict):
+                v = parsed
+            elif isinstance(parsed, list):
+                v = {"items": parsed}
+            else:
+                return {"note": sanitize_error_text(str(v))}
+        except Exception:
+            return {"note": sanitize_error_text(v)}
+
+    if not isinstance(v, dict):
+        return None
+
+    def _sanitize(val: Any) -> Any:
+        if isinstance(val, dict):
+            return {
+                k: _sanitize(item)
+                for k, item in val.items()
+                if not is_sensitive_key(k)
+            }
+        elif isinstance(val, list):
+            return [_sanitize(item) for item in val]
+        elif isinstance(val, str):
+            return sanitize_error_text(val)
+        else:
+            return val
+
+    return _sanitize(v)
 
 
 class JobSummaryResponse(BaseModel):
@@ -12,6 +92,11 @@ class JobSummaryResponse(BaseModel):
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("error_message", mode="before")
+    @classmethod
+    def clean_error_message(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_error_text(v)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -36,17 +121,13 @@ class PipelineStageResponse(BaseModel):
 
     @field_validator("stage_metadata", mode="before")
     @classmethod
-    def parse_stage_metadata(cls, v: Any) -> Optional[Dict[str, Any]]:
-        if v is None:
-            return None
-        if isinstance(v, dict):
-            return v
-        if isinstance(v, str):
-            try:
-                return json.loads(v)
-            except Exception:
-                return {"raw": v}
-        return None
+    def parse_and_sanitize_metadata(cls, v: Any) -> Optional[Dict[str, Any]]:
+        return sanitize_stage_metadata(v)
+
+    @field_validator("error_message", mode="before")
+    @classmethod
+    def clean_error_message(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_error_text(v)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -116,5 +197,6 @@ class PipelineStatusResponse(BaseModel):
     project_name: str
     current_pipeline_stage: str
     pipeline_overall_status: str
+    is_initialized: bool = Field(False, description="Whether the pipeline has been fully initialized with all 11 stages and 4 checkpoints")
     stages: List[PipelineStageResponse]
     checkpoints: List[PipelineCheckpointResponse]

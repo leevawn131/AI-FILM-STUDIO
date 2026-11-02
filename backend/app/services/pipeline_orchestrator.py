@@ -27,6 +27,7 @@ from backend.app.models.entities import (
     StudioJob, gen_uuid
 )
 from backend.app.services.job_manager import job_manager, JobOwnershipLostError
+from backend.app.schemas.pipeline import sanitize_error_text, sanitize_stage_metadata
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -312,16 +313,11 @@ class PipelineOrchestrator:
     def get_pipeline_status(db: Session, project_id: str) -> Dict[str, Any]:
         """
         Retrieves complete pipeline status, active stage, and checkpoints.
-        Self-healing: initializes any missing stage or checkpoint records for legacy projects.
+        Strict read-only: never mutates or commits database state for uninitialized projects.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project or project.deleted_at is not None:
             raise HTTPException(status_code=404, detail="Project not found")
-
-        # Self-healing for legacy or partially initialized projects
-        if not is_pipeline_complete(db, project_id):
-            initialize_project_pipeline(project_id, db, auto_commit=True)
-            db.refresh(project)
 
         stages = db.query(PipelineStageState).filter(PipelineStageState.project_id == project_id).all()
         checkpoints = db.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == project_id).all()
@@ -332,11 +328,15 @@ class PipelineOrchestrator:
         cp_order = {cp[0]: idx for idx, cp in enumerate(PIPELINE_CHECKPOINTS)}
         sorted_checkpoints = sorted(checkpoints, key=lambda c: cp_order.get(c.checkpoint_type, 99))
 
+        is_initialized = is_pipeline_complete(db, project_id)
+        overall_status = project.pipeline_overall_status or ("uninitialized" if not is_initialized else "not_started")
+
         return {
             "project_id": project.id,
             "project_name": project.name,
             "current_pipeline_stage": project.current_pipeline_stage,
-            "pipeline_overall_status": project.pipeline_overall_status,
+            "pipeline_overall_status": overall_status,
+            "is_initialized": is_initialized,
             "stages": [
                 {
                     "id": s.id,
@@ -348,8 +348,8 @@ class PipelineOrchestrator:
                     "retry_count": s.retry_count,
                     "content_hash": s.content_hash,
                     "consumed_input_hash": s.consumed_input_hash,
-                    "error_message": s.error_message,
-                    "stage_metadata": s.stage_metadata,
+                    "error_message": sanitize_error_text(s.error_message),
+                    "stage_metadata": sanitize_stage_metadata(s.stage_metadata),
                     "started_at": s.started_at,
                     "completed_at": s.completed_at,
                     "created_at": s.created_at,
@@ -381,6 +381,7 @@ class PipelineOrchestrator:
         """
         Retrieves detailed information for an individual pipeline stage,
         including associated background job information and associated checkpoint.
+        Strict read-only: never mutates database state.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project or project.deleted_at is not None:
@@ -392,29 +393,31 @@ class PipelineOrchestrator:
                 detail=f"Stage '{stage_name}' not found. Valid stages: {', '.join(PIPELINE_STAGES)}"
             )
 
-        if not is_pipeline_complete(db, project_id):
-            initialize_project_pipeline(project_id, db, auto_commit=True)
-            db.refresh(project)
-
         stage = db.query(PipelineStageState).filter(
             PipelineStageState.project_id == project_id,
             PipelineStageState.stage_name == stage_name
         ).first()
 
         if not stage:
-            raise HTTPException(status_code=404, detail=f"Stage '{stage_name}' not found for project '{project_id}'")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Stage '{stage_name}' has not been initialized for project '{project_id}'"
+            )
 
         stage_order = {name: idx for idx, name in enumerate(PIPELINE_STAGES)}
 
         active_job_dict = None
         if stage.active_job_id:
-            job = db.query(StudioJob).filter(StudioJob.id == stage.active_job_id).first()
+            job = db.query(StudioJob).filter(
+                StudioJob.id == stage.active_job_id,
+                StudioJob.project_id == project_id
+            ).first()
             if job:
                 active_job_dict = {
                     "id": job.id,
                     "job_type": job.job_type,
                     "status": job.status,
-                    "error_message": job.error_message,
+                    "error_message": sanitize_error_text(job.error_message),
                     "created_at": job.created_at,
                     "updated_at": job.updated_at,
                 }
@@ -452,8 +455,8 @@ class PipelineOrchestrator:
             "retry_count": stage.retry_count,
             "content_hash": stage.content_hash,
             "consumed_input_hash": stage.consumed_input_hash,
-            "error_message": stage.error_message,
-            "stage_metadata": stage.stage_metadata,
+            "error_message": sanitize_error_text(stage.error_message),
+            "stage_metadata": sanitize_stage_metadata(stage.stage_metadata),
             "started_at": stage.started_at,
             "completed_at": stage.completed_at,
             "created_at": stage.created_at,
@@ -466,6 +469,7 @@ class PipelineOrchestrator:
     def get_checkpoint_detail(db: Session, project_id: str, checkpoint_type: str) -> Dict[str, Any]:
         """
         Retrieves detailed approval checkpoint state, hash freshness, and latest audit decision.
+        Strict read-only: never mutates database state.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project or project.deleted_at is not None:
@@ -478,39 +482,49 @@ class PipelineOrchestrator:
                 detail=f"Checkpoint '{checkpoint_type}' not found. Valid checkpoints: {', '.join(valid_cp_types)}"
             )
 
-        if not is_pipeline_complete(db, project_id):
-            initialize_project_pipeline(project_id, db, auto_commit=True)
-            db.refresh(project)
-
         cp = db.query(PipelineCheckpoint).filter(
             PipelineCheckpoint.project_id == project_id,
             PipelineCheckpoint.checkpoint_type == checkpoint_type
         ).first()
 
         if not cp:
-            raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_type}' not found for project '{project_id}'")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Checkpoint '{checkpoint_type}' has not been initialized for project '{project_id}'"
+            )
 
-        # Fresh hash calculation (where supported)
+        # Fresh hash calculation (distinguishing unsupported hashing vs missing artifact)
+        hashing_supported = True
         current_hash = None
         try:
             current_hash = PipelineOrchestrator.compute_artifact_hash(db, project_id, cp.artifact_type)
         except NotImplementedError:
+            hashing_supported = False
             current_hash = None
 
-        is_fresh = None
-        if cp.artifact_content_hash and current_hash:
-            is_fresh = (cp.artifact_content_hash == current_hash)
-        elif cp.status == "APPROVED" and not current_hash:
-            is_fresh = False
+        is_fresh: Optional[bool] = None
+        if not hashing_supported:
+            # Cannot verify hash freshness because hashing is not implemented for this artifact type
+            is_fresh = None
+        elif not cp.artifact_content_hash:
+            # Checkpoint does not yet have an approved baseline hash to compare against
+            is_fresh = None
+        else:
+            # Hashing is supported and checkpoint has an approved hash
+            if current_hash is not None:
+                is_fresh = (cp.artifact_content_hash == current_hash)
+            else:
+                # Artifact was previously approved with a hash, but current artifact content is missing
+                is_fresh = False
 
-        # Latest audit record
+        # Latest audit record with tie-breaker
         latest_audit = (
             db.query(PipelineCheckpointAudit)
             .filter(
                 PipelineCheckpointAudit.project_id == project_id,
                 PipelineCheckpointAudit.checkpoint_type == checkpoint_type
             )
-            .order_by(PipelineCheckpointAudit.created_at.desc())
+            .order_by(PipelineCheckpointAudit.created_at.desc(), PipelineCheckpointAudit.id.desc())
             .first()
         )
 
@@ -584,7 +598,7 @@ class PipelineOrchestrator:
 
         total = query.count()
         records = (
-            query.order_by(PipelineCheckpointAudit.created_at.desc())
+            query.order_by(PipelineCheckpointAudit.created_at.desc(), PipelineCheckpointAudit.id.desc())
             .offset(offset)
             .limit(limit)
             .all()
@@ -640,7 +654,7 @@ class PipelineOrchestrator:
 
         total = query.count()
         records = (
-            query.order_by(PipelineCheckpointAudit.created_at.desc())
+            query.order_by(PipelineCheckpointAudit.created_at.desc(), PipelineCheckpointAudit.id.desc())
             .offset(offset)
             .limit(limit)
             .all()

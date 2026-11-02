@@ -34,14 +34,19 @@ Validates:
    - Runs against SQLite and PostgreSQL.
 """
 
+import os
+import json
 import uuid
 from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+from alembic.config import Config
+from alembic import command
 
 from backend.app.main import app
+from backend.app.config import settings
 from backend.app.database import get_db, init_db, run_migrations
 from backend.app.models.entities import (
     Base, Project, Scene, Shot, Character, Location,
@@ -114,6 +119,7 @@ def test_get_complete_pipeline_state_success(test_db_session):
     assert data["project_name"] == "Canonical Pipeline Project"
     assert data["current_pipeline_stage"] == "story_development"
     assert data["pipeline_overall_status"] == "in_progress"
+    assert data["is_initialized"] is True
 
     # Verify exactly 11 stages in canonical order
     stages = data["stages"]
@@ -557,41 +563,345 @@ def test_cross_project_isolation_and_security(test_db_session):
     assert res_audit_b.json()["items"] == []
 
 
-def test_self_healing_missing_or_incomplete_pipeline_data(test_db_session):
+def test_uninitialized_and_partial_pipeline_read_only_zero_mutation(test_db_session):
     """
-    Verifies Requirement 4:
-    - Safely self-heals projects with missing pipeline stage or checkpoint data.
+    Verifies Requirement 1: Strict read-only API with ZERO database mutations.
+    - Legacy uninitialized projects return is_initialized=False, empty stages, empty checkpoints.
+    - Partially initialized projects return is_initialized=False and existing stages only.
+    - Calling all GET endpoints produces zero INSERTs, zero UPDATEs, zero COMMITs.
     """
     session, engine = test_db_session
 
-    # Create project directly via ORM without initializing pipeline
-    legacy_proj = Project(
+    # 1. Create uninitialized project directly via ORM without initializing pipeline
+    uninit_proj = Project(
         id=str(uuid.uuid4()),
         name="Legacy Uninitialized Film",
         budget_total=100.0,
         budget_spent=0.0
     )
-    session.add(legacy_proj)
+    # 2. Create partially initialized project with only 1 stage
+    partial_proj = Project(
+        id=str(uuid.uuid4()),
+        name="Partial Film",
+        budget_total=150.0,
+        budget_spent=0.0
+    )
+    partial_stage = PipelineStageState(
+        id=str(uuid.uuid4()),
+        project_id=partial_proj.id,
+        stage_name="story_development",
+        status="NOT_STARTED",
+        created_at=utc_now(),
+        updated_at=utc_now()
+    )
+    session.add_all([uninit_proj, partial_proj, partial_stage])
     session.commit()
 
-    # Verify no stages exist
-    stage_cnt = session.query(PipelineStageState).filter(PipelineStageState.project_id == legacy_proj.id).count()
-    assert stage_cnt == 0
+    # Record exact baseline counts
+    stage_cnt_before = session.query(PipelineStageState).count()
+    cp_cnt_before = session.query(PipelineCheckpoint).count()
+    audit_cnt_before = session.query(PipelineCheckpointAudit).count()
 
-    # Read API must transparently self-heal the pipeline
-    res = client.get(f"/api/pipeline/{legacy_proj.id}")
+    # Call all GET endpoints on uninitialized project
+    res_status_uninit = client.get(f"/api/pipeline/{uninit_proj.id}")
+    assert res_status_uninit.status_code == 200
+    data_uninit = res_status_uninit.json()
+    assert data_uninit["is_initialized"] is False
+    assert data_uninit["stages"] == []
+    assert data_uninit["checkpoints"] == []
+
+    # Individual stage on uninitialized project returns 404 (not initialized)
+    res_stage_uninit = client.get(f"/api/pipeline/{uninit_proj.id}/stages/screenplay")
+    assert res_stage_uninit.status_code == 404
+    assert "has not been initialized" in res_stage_uninit.json()["detail"]
+
+    # Checkpoint on uninitialized project returns 404 (not initialized)
+    res_cp_uninit = client.get(f"/api/pipeline/{uninit_proj.id}/checkpoints/story_approval")
+    assert res_cp_uninit.status_code == 404
+    assert "has not been initialized" in res_cp_uninit.json()["detail"]
+
+    # Audit queries return empty list
+    res_audit_uninit = client.get(f"/api/pipeline/{uninit_proj.id}/checkpoints/story_approval/audit")
+    assert res_audit_uninit.status_code == 200
+    assert res_audit_uninit.json()["total"] == 0
+
+    res_proj_audit_uninit = client.get(f"/api/pipeline/{uninit_proj.id}/audit")
+    assert res_proj_audit_uninit.status_code == 200
+    assert res_proj_audit_uninit.json()["total"] == 0
+
+    # Call GET endpoints on partial project
+    res_status_partial = client.get(f"/api/pipeline/{partial_proj.id}")
+    assert res_status_partial.status_code == 200
+    data_partial = res_status_partial.json()
+    assert data_partial["is_initialized"] is False
+    assert len(data_partial["stages"]) == 1
+    assert data_partial["stages"][0]["stage_name"] == "story_development"
+    assert data_partial["checkpoints"] == []
+
+    # Existing stage returns 200
+    res_stage_ok = client.get(f"/api/pipeline/{partial_proj.id}/stages/story_development")
+    assert res_stage_ok.status_code == 200
+    assert res_stage_ok.json()["stage_name"] == "story_development"
+
+    # Missing stage returns 404
+    res_stage_missing = client.get(f"/api/pipeline/{partial_proj.id}/stages/screenplay")
+    assert res_stage_missing.status_code == 404
+
+    # Missing checkpoint returns 404
+    res_cp_missing = client.get(f"/api/pipeline/{partial_proj.id}/checkpoints/story_approval")
+    assert res_cp_missing.status_code == 404
+
+    # Assert ZERO database mutations occurred across all calls
+    assert session.query(PipelineStageState).count() == stage_cnt_before
+    assert session.query(PipelineCheckpoint).count() == cp_cnt_before
+    assert session.query(PipelineCheckpointAudit).count() == audit_cnt_before
+
+    # Verify uninitialized project still has 0 stages in DB
+    assert session.query(PipelineStageState).filter(PipelineStageState.project_id == uninit_proj.id).count() == 0
+    # Verify partial project still has only 1 stage in DB
+    assert session.query(PipelineStageState).filter(PipelineStageState.project_id == partial_proj.id).count() == 1
+
+
+def test_safe_public_projection_redacts_sensitive_metadata_and_errors(test_db_session):
+    """
+    Verifies Requirement 2: Safe Public Projections.
+    - Sanitizes stage_metadata: strips worker_id, fencing_token, internal payloads, file paths.
+    - Sanitizes error_message: redacts file paths, API keys, bearer tokens, DB credentials.
+    - Preserves safe frontend fields (e.g. model, resolution, retry_count, content hashes).
+    """
+    session, engine = test_db_session
+
+    create_res = client.post("/api/projects", json={"name": "Sanitization Test Film"})
+    project_id = create_res.json()["id"]
+
+    # Inject sensitive data into a stage
+    stage = session.query(PipelineStageState).filter(
+        PipelineStageState.project_id == project_id,
+        PipelineStageState.stage_name == "screenplay"
+    ).first()
+
+    sensitive_metadata = {
+        "worker_id": "gpu-worker-us-central-99",
+        "fencing_token": 999123,
+        "payload": {"prompt": "cinematic prompt", "internal_secret": "sk-proj-supersecretkey123456789"},
+        "disk_path": "/var/data/models/weights.bin",
+        "model": "screenplay-gpt-v4",
+        "resolution": "4K",
+        "safe_summary": "Script draft generated at /home/leevawn/output.fdr"
+    }
+    sensitive_error = (
+        'Traceback (most recent call last):\n'
+        '  File "/home/leevawn/Phim/backend/worker.py", line 123, in execute\n'
+        '    raise ConnectionError("DB postgresql://admin:topsecretpass@db.internal:5432/film failed with sk-ant-api03-12345678901234567890")'
+    )
+
+    stage.stage_metadata = json.dumps(sensitive_metadata)
+    stage.error_message = sensitive_error
+    session.commit()
+
+    # Query complete pipeline state
+    pipe_res = client.get(f"/api/pipeline/{project_id}")
+    assert pipe_res.status_code == 200
+    pipe_data = pipe_res.json()
+    sc_stage = next(s for s in pipe_data["stages"] if s["stage_name"] == "screenplay")
+
+    meta = sc_stage["stage_metadata"]
+    assert "worker_id" not in meta
+    assert "fencing_token" not in meta
+    assert "payload" not in meta
+    assert "disk_path" not in meta
+    assert meta["model"] == "screenplay-gpt-v4"
+    assert meta["resolution"] == "4K"
+    assert "[REDACTED_PATH]" in meta["safe_summary"]
+    assert "/home/leevawn" not in meta["safe_summary"]
+
+    err = sc_stage["error_message"]
+    assert "topsecretpass" not in err
+    assert "[REDACTED_PASS]" in err
+    assert "[REDACTED_API_KEY]" in err
+    assert "sk-ant-api03" not in err
+    assert "/home/leevawn" not in err
+
+    # Query individual stage detail
+    detail_res = client.get(f"/api/pipeline/{project_id}/stages/screenplay")
+    assert detail_res.status_code == 200
+    detail_data = detail_res.json()
+    assert "worker_id" not in detail_data["stage_metadata"]
+    assert "topsecretpass" not in detail_data["error_message"]
+
+
+def test_cross_project_job_isolation(test_db_session):
+    """
+    Verifies Requirement 2:
+    - active StudioJob lookup strictly validates StudioJob.project_id == project_id.
+    - Stage referencing a job belonging to another project never exposes that job.
+    """
+    session, engine = test_db_session
+
+    res_a = client.post("/api/projects", json={"name": "Project A"})
+    id_a = res_a.json()["id"]
+
+    res_b = client.post("/api/projects", json={"name": "Project B"})
+    id_b = res_b.json()["id"]
+
+    # Create StudioJob belonging to Project B
+    job_b = StudioJob(
+        id=str(uuid.uuid4()),
+        project_id=id_b,
+        job_type="cinematic_prompt_agent",
+        idempotency_key=f"idemp-{uuid.uuid4().hex[:8]}",
+        status="RUNNING",
+        worker_id="worker_b",
+        fencing_token=1,
+        created_at=utc_now(),
+        updated_at=utc_now()
+    )
+    session.add(job_b)
+    session.flush()
+
+    # Corrupt or mismatched association: Project A stage points to Job B
+    stage_a = session.query(PipelineStageState).filter(
+        PipelineStageState.project_id == id_a,
+        PipelineStageState.stage_name == "cinematic_prompts"
+    ).first()
+    stage_a.active_job_id = job_b.id
+    session.commit()
+
+    # Read Project A stage detail: active_job must be None
+    res = client.get(f"/api/pipeline/{id_a}/stages/cinematic_prompts")
     assert res.status_code == 200
     data = res.json()
+    assert data["active_job_id"] == job_b.id
+    assert data["active_job"] is None  # Must NOT leak Project B's job!
 
-    assert data["project_id"] == legacy_proj.id
-    assert len(data["stages"]) == 11
-    assert len(data["checkpoints"]) == 4
 
-    # Verify database now contains the 11 stages and 4 checkpoints
-    stage_cnt_after = session.query(PipelineStageState).filter(PipelineStageState.project_id == legacy_proj.id).count()
-    assert stage_cnt_after == 11
-    cp_cnt_after = session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == legacy_proj.id).count()
-    assert cp_cnt_after == 4
+def test_hash_freshness_semantics_four_cases(test_db_session):
+    """
+    Verifies Requirement 3: Correct 3-state hash freshness semantics.
+    - True: Screenplay with matching hash.
+    - False: Screenplay with drifted hash or missing scenes after approval.
+    - None: Unsupported artifact hashing (e.g. visual_approval / visual_bible) even when APPROVED.
+    - None: Unapproved checkpoint without baseline artifact hash.
+    """
+    session, engine = test_db_session
+
+    create_res = client.post("/api/projects", json={"name": "Freshness Semantics Film"})
+    project_id = create_res.json()["id"]
+
+    # Case 4: Unapproved checkpoint without hash -> is_hash_fresh is None
+    res_unapproved = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval")
+    assert res_unapproved.status_code == 200
+    assert res_unapproved.json()["is_hash_fresh"] is None
+
+    # Add scene and approve screenplay
+    scene = Scene(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        scene_number=1,
+        slugline="INT. ROOM - DAY",
+        script_content="INT. ROOM - DAY\nA quiet morning.",
+        order_index=1
+    )
+    session.add(scene)
+    session.commit()
+
+    approved_cp = pipeline_orchestrator.record_checkpoint_decision(
+        db=session,
+        project_id=project_id,
+        checkpoint_type="story_approval",
+        decision="APPROVED",
+        reviewer_name="Director"
+    )
+
+    # Case 1: Matching screenplay hash -> is_hash_fresh is True
+    res_fresh = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval")
+    assert res_fresh.status_code == 200
+    assert res_fresh.json()["is_hash_fresh"] is True
+
+    # Modify scene content without invalidating checkpoint -> drifted content
+    scene.script_content = "INT. ROOM - DAY\nAn explosion occurs!"
+    session.commit()
+
+    # Case 2A: Drifted screenplay hash -> is_hash_fresh is False
+    res_drifted = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval")
+    assert res_drifted.status_code == 200
+    assert res_drifted.json()["is_hash_fresh"] is False
+
+    # Delete all scenes -> current hash is None -> is_hash_fresh is False
+    session.delete(scene)
+    session.commit()
+
+    # Case 2B: Missing artifact content after approval -> is_hash_fresh is False
+    res_missing = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval")
+    assert res_missing.status_code == 200
+    assert res_missing.json()["current_artifact_hash"] is None
+    assert res_missing.json()["is_hash_fresh"] is False
+
+    # Case 3: APPROVED checkpoint on unsupported artifact type (visual_approval / visual_bible)
+    # Manually set visual_approval to APPROVED with an arbitrary artifact_content_hash
+    vis_cp = session.query(PipelineCheckpoint).filter(
+        PipelineCheckpoint.project_id == project_id,
+        PipelineCheckpoint.checkpoint_type == "visual_approval"
+    ).first()
+    vis_cp.status = "APPROVED"
+    vis_cp.artifact_content_hash = "manual_vis_hash_123"
+    session.commit()
+
+    res_vis = client.get(f"/api/pipeline/{project_id}/checkpoints/visual_approval")
+    assert res_vis.status_code == 200
+    vis_data = res_vis.json()
+    assert vis_data["status"] == "APPROVED"
+    assert vis_data["artifact_content_hash"] == "manual_vis_hash_123"
+    assert vis_data["current_artifact_hash"] is None
+    # Crucial assertion: Must be None, NOT False! (Unsupported hashing must never be falsely marked stale)
+    assert vis_data["is_hash_fresh"] is None
+
+
+def test_audit_history_pagination_tie_breaker(test_db_session):
+    """
+    Verifies Requirement 5: Stable pagination tie-breaker.
+    When multiple audit records have the exact same created_at timestamp,
+    ordering by (created_at DESC, id DESC) provides deterministic pagination.
+    """
+    session, engine = test_db_session
+
+    create_res = client.post("/api/projects", json={"name": "Tie Breaker Film"})
+    project_id = create_res.json()["id"]
+
+    same_time = utc_now()
+    records = []
+    for i in range(5):
+        records.append(PipelineCheckpointAudit(
+            id=f"audit-tie-{i:03d}",
+            project_id=project_id,
+            project_name_snapshot="Tie Breaker Film",
+            checkpoint_id="cp-tie",
+            checkpoint_type="story_approval",
+            decision="APPROVED",
+            artifact_content_hash="hash123",
+            artifact_version=1,
+            reviewer_name="Auditor",
+            feedback_notes=f"Note {i}",
+            created_at=same_time
+        ))
+    session.add_all(records)
+    session.commit()
+
+    # Page 1: limit 2, offset 0
+    res_p1 = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/audit?limit=2&offset=0")
+    assert res_p1.status_code == 200
+    p1_items = res_p1.json()["items"]
+    assert len(p1_items) == 2
+    assert p1_items[0]["id"] == "audit-tie-004"
+    assert p1_items[1]["id"] == "audit-tie-003"
+
+    # Page 2: limit 2, offset 2
+    res_p2 = client.get(f"/api/pipeline/{project_id}/checkpoints/story_approval/audit?limit=2&offset=2")
+    assert res_p2.status_code == 200
+    p2_items = res_p2.json()["items"]
+    assert len(p2_items) == 2
+    assert p2_items[0]["id"] == "audit-tie-002"
+    assert p2_items[1]["id"] == "audit-tie-001"
 
 
 def test_read_only_contract_does_not_mutate_data(test_db_session):
@@ -636,23 +946,36 @@ def test_read_only_contract_does_not_mutate_data(test_db_session):
 def test_postgresql_read_api_compatibility():
     """
     Verifies dual-engine PostgreSQL compatibility for the Pipeline Read API.
-    Skips cleanly if PostgreSQL test instance is unavailable.
+    Self-contained: ensures PostgreSQL schema is migrated to head before running.
+    Skips cleanly if PostgreSQL test instance is unavailable locally; fails in CI.
     """
+    is_ci = os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
     pg_engine = get_postgres_engine()
     if pg_engine is None:
-        pytest.skip("PostgreSQL test instance not reachable; skipping PG Pipeline Read API test.")
+        if is_ci:
+            pytest.fail("PostgreSQL test instance is required in CI but is not reachable.")
+        else:
+            pytest.skip("PostgreSQL test instance not reachable; skipping PG Pipeline Read API test.")
 
-    TestingSessionLocal = sessionmaker(bind=pg_engine)
-
-    def override_get_db():
-        db = TestingSessionLocal()
-        try:
-            yield db
-        finally:
-            db.close()
-
-    app.dependency_overrides[get_db] = override_get_db
     try:
+        # 1. Ensure PostgreSQL schema is upgraded to migration head independently
+        alembic_cfg = Config(str(settings.root_dir / "alembic.ini"))
+        alembic_cfg.set_main_option("script_location", str(settings.root_dir / "backend" / "alembic"))
+        alembic_cfg.set_main_option("sqlalchemy.url", pg_engine.url.render_as_string(hide_password=False))
+        alembic_cfg.attributes["configure_logger"] = False
+        command.upgrade(alembic_cfg, "head")
+
+        TestingSessionLocal = sessionmaker(bind=pg_engine)
+
+        def override_get_db():
+            db = TestingSessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+
         # Create project via client on PostgreSQL
         create_res = client.post("/api/projects", json={
             "name": "PG Pipeline Read Film",
@@ -666,6 +989,7 @@ def test_postgresql_read_api_compatibility():
         pipe_res = client.get(f"/api/pipeline/{project_id}")
         assert pipe_res.status_code == 200
         data = pipe_res.json()
+        assert data["is_initialized"] is True
         assert len(data["stages"]) == 11
         assert len(data["checkpoints"]) == 4
 
