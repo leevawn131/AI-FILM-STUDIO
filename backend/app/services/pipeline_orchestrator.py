@@ -56,13 +56,13 @@ PIPELINE_CHECKPOINTS = [
 def is_pipeline_complete(db: Session, project_id: str) -> bool:
     """
     Checks if all 11 discrete stages and all 4 checkpoints exist for the project.
-    Verifies exact stage names and checkpoint types, not just row count.
+    Verifies exact equality of stage names and checkpoint types (rejects unexpected or missing records).
     """
     stage_names = {
         name for (name,) in db.query(PipelineStageState.stage_name)
         .filter(PipelineStageState.project_id == project_id).all()
     }
-    if not set(PIPELINE_STAGES).issubset(stage_names):
+    if stage_names != set(PIPELINE_STAGES):
         return False
 
     cp_types = {
@@ -70,7 +70,7 @@ def is_pipeline_complete(db: Session, project_id: str) -> bool:
         .filter(PipelineCheckpoint.project_id == project_id).all()
     }
     expected_cps = {cp[0] for cp in PIPELINE_CHECKPOINTS}
-    if not expected_cps.issubset(cp_types):
+    if cp_types != expected_cps:
         return False
 
     return True

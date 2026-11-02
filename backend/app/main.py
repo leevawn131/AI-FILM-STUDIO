@@ -6,6 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.app.config import settings
 from backend.app.database import init_db, SessionLocal
 from backend.app.models.entities import Project, Character, Location, Scene, Shot
+from backend.app.services.pipeline_orchestrator import initialize_project_pipeline
 from backend.app.routers import projects, dashboard, cost, screenplay, storyboard, characters, locations, flow_handoff, media, editor, audio, export, system, jobs
 
 def seed_initial_demo_if_empty(force: bool = False):
@@ -55,8 +56,7 @@ def seed_initial_demo_if_empty(force: bool = False):
                 visual_prompt_tags="Submerged underwater server room, cyan neon glow, water ripple caustic reflections on brushed metal walls"
             )
             db.add(loc)
-            db.commit()
-            db.refresh(loc)
+            db.flush()
 
             # Seed scene
             scene = Scene(
@@ -91,8 +91,7 @@ FADE TO BLACK.
                 order_index=1
             )
             db.add(scene)
-            db.commit()
-            db.refresh(scene)
+            db.flush()
 
             # Seed shot 1 & 2
             sh1 = Shot(
@@ -131,7 +130,6 @@ FADE TO BLACK.
             db.flush()
 
             # Atomically initialize pipeline stages and checkpoints within the same transaction
-            from backend.app.services.pipeline_orchestrator import initialize_project_pipeline
             initialize_project_pipeline(demo.id, db, auto_commit=False)
             db.commit()
             db.refresh(demo)

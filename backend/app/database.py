@@ -4,7 +4,8 @@ import datetime
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Set, Tuple
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from alembic.config import Config
 from alembic import command
@@ -12,6 +13,17 @@ from alembic import command
 from backend.app.config import settings
 
 logger = logging.getLogger("database")
+
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    """
+    Enforces SQLite foreign-key constraints on every SQLite connection in production and tests.
+    Avoids applying SQLite-specific PRAGMA to other database engines like PostgreSQL.
+    """
+    if type(dbapi_connection).__module__ == "sqlite3":
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 class MigrationError(Exception):
     """Base exception for database migration errors."""

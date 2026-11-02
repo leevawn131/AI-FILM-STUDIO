@@ -44,17 +44,35 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
+    from sqlalchemy import event
+
     # Check if a connection was provided programmatically
     provided_connection = config.attributes.get("connection", None)
     if provided_connection is not None:
+        raw_conn = None
+        if provided_connection.dialect.name == "sqlite":
+            raw_conn = getattr(provided_connection.connection, "dbapi_connection", None)
+            if raw_conn is None:
+                raw_conn = getattr(provided_connection.connection, "connection", None)
+            if raw_conn is not None:
+                cursor = raw_conn.cursor()
+                cursor.execute("PRAGMA foreign_keys=OFF")
+                cursor.close()
+
         context.configure(
             connection=provided_connection,
             target_metadata=target_metadata,
             render_as_batch=True,
             version_num_length=128,
         )
-        with context.begin_transaction():
-            context.run_migrations()
+        try:
+            with context.begin_transaction():
+                context.run_migrations()
+        finally:
+            if raw_conn is not None:
+                cursor = raw_conn.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.close()
         return
 
     configuration = config.get_section(config.config_ini_section, {})
@@ -65,6 +83,13 @@ def run_migrations_online() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+
+    if connectable.dialect.name == "sqlite":
+        @event.listens_for(connectable, "connect")
+        def disable_fk_for_migrations(dbapi_conn, record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=OFF")
+            cursor.close()
 
     with connectable.connect() as connection:
         context.configure(

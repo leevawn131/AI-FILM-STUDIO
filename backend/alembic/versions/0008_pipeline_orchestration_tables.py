@@ -37,12 +37,12 @@ def upgrade() -> None:
         if 'pipeline_overall_status' not in proj_cols:
             batch_op.add_column(sa.Column('pipeline_overall_status', sa.String(32), nullable=False, server_default='in_progress'))
 
-    # 2. Create pipeline_stage_states table
+    # 2. Create pipeline_stage_states table (published schema with CASCADE; converted to RESTRICT in 0009)
     if 'pipeline_stage_states' not in tables:
         op.create_table(
             'pipeline_stage_states',
             sa.Column('id', sa.String(36), primary_key=True),
-            sa.Column('project_id', sa.String(36), sa.ForeignKey('projects.id', ondelete='RESTRICT'), nullable=False),
+            sa.Column('project_id', sa.String(36), sa.ForeignKey('projects.id', ondelete='CASCADE'), nullable=False),
             sa.Column('stage_name', sa.String(64), nullable=False),
             sa.Column('status', sa.String(32), nullable=False, server_default='NOT_STARTED'),
             sa.Column('active_job_id', sa.String(36), sa.ForeignKey('studio_jobs.id', ondelete='SET NULL'), nullable=True),
@@ -61,12 +61,12 @@ def upgrade() -> None:
         op.create_index('ix_pipeline_stage_states_stage_name', 'pipeline_stage_states', ['stage_name'])
         op.create_index('ix_pipeline_stage_states_status', 'pipeline_stage_states', ['status'])
 
-    # 3. Create pipeline_checkpoints table
+    # 3. Create pipeline_checkpoints table (published schema with CASCADE; converted to RESTRICT in 0009)
     if 'pipeline_checkpoints' not in tables:
         op.create_table(
             'pipeline_checkpoints',
             sa.Column('id', sa.String(36), primary_key=True),
-            sa.Column('project_id', sa.String(36), sa.ForeignKey('projects.id', ondelete='RESTRICT'), nullable=False),
+            sa.Column('project_id', sa.String(36), sa.ForeignKey('projects.id', ondelete='CASCADE'), nullable=False),
             sa.Column('checkpoint_type', sa.String(64), nullable=False),
             sa.Column('status', sa.String(32), nullable=False, server_default='LOCKED'),
             sa.Column('artifact_type', sa.String(64), nullable=False),
@@ -179,6 +179,22 @@ def downgrade() -> None:
                 raise RuntimeError(
                     f"Audit archive verification failed: expected {count} records in '{archive_path}', found {len(archived_data)}."
                 )
+
+            # Deep record-level verification: ensure EVERY source audit record is preserved exactly
+            archived_by_id = {rec.get("id"): rec for rec in archived_data if isinstance(rec, dict)}
+            for src_row in serializable_rows:
+                src_id = src_row.get("id")
+                if src_id not in archived_by_id:
+                    raise RuntimeError(
+                        f"Audit archive verification failed: source audit record id '{src_id}' missing from archive."
+                    )
+                archived_rec = archived_by_id[src_id]
+                for key in ["project_id", "checkpoint_type", "decision", "artifact_content_hash", "artifact_version"]:
+                    if str(archived_rec.get(key)) != str(src_row.get(key)):
+                        raise RuntimeError(
+                            f"Audit archive verification failed for record '{src_id}': field '{key}' mismatch "
+                            f"(source: {src_row.get(key)}, archive: {archived_rec.get(key)})."
+                        )
 
     dialect_name = bind.dialect.name
     if dialect_name == 'sqlite':

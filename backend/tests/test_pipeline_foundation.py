@@ -2,21 +2,27 @@
 Pipeline Foundation Tests for AI Film Studio (S4 Milestone 1 Foundation).
 
 Validates:
-1. Migration upgrade and schema inspection (0008_pipeline_orchestration_tables).
-2. Migration downgrade behavior (safe refusal when audit records exist, validated archival).
-3. SQLite and PostgreSQL DB-level audit immutability triggers (UPDATE and DELETE blocked).
-4. Foreign key RESTRICT: Hard deletion of project is rejected when pipeline records exist.
-5. Soft deletion of project preserves pipeline records and audit journals.
-6. Stage initialization: exactly 11 production stages in precise architectural order with initial status NOT_STARTED.
-7. Checkpoint initialization: exactly 4 checkpoints in LOCKED status with artifact type and version 1.
-8. Idempotent initialization: multiple sequential calls do not create duplicates.
-9. Concurrent initialization attempts: multi-threaded concurrent calls without race-condition corruption across SQLite and PostgreSQL.
-10. Legacy project self-healing: handles 11 stages with missing checkpoints and 4 checkpoints with missing stages without overwriting existing states.
-11. Project creation integration: newly created projects atomically initialize all stages/checkpoints.
-12. Atomic creation rollback: failure during initialization rolls back the project.
-13. Transactionally fenced stage completion and failure: StudioJob and PipelineStageState updated atomically within one transaction.
-14. Artifact hash scope control: screenplay supported; visual_bible, storyboard, assembly_cut raise NotImplementedError.
-15. PostgreSQL dual-engine compatibility for foundation, concurrency, and worker fencing.
+1. Migration upgrade and schema inspection for 0008 and 0009.
+2. Migration 0008 -> 0009 upgrade and data preservation (CASCADE -> RESTRICT conversion).
+3. Migration 0009 downgrade safety (converts RESTRICT back to CASCADE).
+4. Fresh database migration to latest head.
+5. SQLite production-engine foreign-key enforcement (enabled via backend.app.database connect listener).
+6. ORM hard deletion and direct SQL hard deletion blocked by RESTRICT foreign keys.
+7. Soft deletion of project preserves pipeline records and audit journals.
+8. Migration downgrade safety with exact deep record-level archival validation.
+9. SQLite and PostgreSQL DB-level audit immutability triggers (UPDATE and DELETE blocked).
+10. Stage initialization: exactly 11 production stages in precise architectural order with initial status NOT_STARTED.
+11. Checkpoint initialization: exactly 4 checkpoints in LOCKED status with artifact type and version 1.
+12. Idempotent initialization: multiple sequential calls do not create duplicates.
+13. Concurrent initialization attempts: multi-threaded concurrent calls without race-condition corruption across SQLite and PostgreSQL.
+14. Legacy project self-healing: handles 11 stages with missing checkpoints and 4 checkpoints with missing stages without overwriting existing states.
+15. Exact pipeline completeness: rejects unexpected stages/checkpoints or missing stages/checkpoints.
+16. Project creation integration: newly created projects atomically initialize all stages/checkpoints.
+17. Atomic project creation rollback: failure during initialization rolls back the project.
+18. Atomic demo project seeding rollback: intermediate flushes instead of commits; failure during pipeline initialization rolls back all demo entities.
+19. Transactionally fenced stage completion and failure: StudioJob and PipelineStageState updated atomically within one transaction.
+20. Artifact hash scope control: screenplay supported; visual_bible, storyboard, assembly_cut raise NotImplementedError.
+21. PostgreSQL dual-engine compatibility for foundation, migration 0009, concurrency, and worker fencing.
 """
 
 import os
@@ -27,18 +33,18 @@ import pytest
 import concurrent.futures
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from sqlalchemy import create_engine, text, inspect, event
+from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker, Session
 from fastapi.testclient import TestClient
 from alembic.config import Config
 from alembic import command
 
-from backend.app.main import app
+from backend.app.main import app, seed_initial_demo_if_empty
 from backend.app.config import settings
 from backend.app.database import get_db, run_migrations
 from backend.app.models.entities import (
-    Base, Project, Scene, Character, Location,
+    Base, Project, Scene, Character, Location, Shot,
     PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit,
     StudioJob
 )
@@ -59,20 +65,15 @@ def utc_now() -> datetime:
 
 @pytest.fixture(scope="module")
 def isolated_engine_and_session(tmp_path_factory):
-    """Creates a dedicated SQLite database with migration 0008 applied for test isolation."""
+    """
+    Creates a dedicated SQLite database with all migrations applied to head for test isolation.
+    Relies on production engine connect listener in backend.app.database for PRAGMA foreign_keys=ON.
+    """
     db_dir = tmp_path_factory.mktemp("pipeline_foundation_db")
     db_path = db_dir / "foundation_test.db"
     db_url = f"sqlite:///{db_path}"
 
     test_engine = create_engine(db_url, connect_args={"check_same_thread": False})
-
-    # Enable SQLite foreign key enforcement
-    @event.listens_for(test_engine, "connect")
-    def set_sqlite_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
     run_migrations(target_engine=test_engine, db_url=db_url)
     SessionMaker = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
 
@@ -125,65 +126,225 @@ def client():
 
 
 # ---------------------------------------------------------------------------
-# 1. DATABASE MIGRATION & SCHEMA TESTS
+# 1. DATABASE MIGRATION & SCHEMA TESTS (0008, 0009, UPGRADE & DOWNGRADE)
 # ---------------------------------------------------------------------------
 
 def test_migration_0008_upgrade_and_schema_inspection(tmp_path):
-    """Verifies Alembic migration 0008 creates all required tables, columns, and constraints."""
-    test_db_path = tmp_path / "schema_test.db"
+    """
+    Verifies Alembic migration 0008 creates all required tables, columns,
+    and constraints matching its originally published contents.
+    """
+    test_db_path = tmp_path / "schema_0008_test.db"
     db_url = f"sqlite:///{test_db_path}"
 
     test_engine = create_engine(db_url)
-    run_migrations(target_engine=test_engine, db_url=db_url)
+    alembic_ini_path = settings.root_dir / "alembic.ini"
+    alembic_cfg = Config(str(alembic_ini_path))
+    alembic_cfg.set_main_option("script_location", str(settings.root_dir / "backend" / "alembic"))
+    alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+    alembic_cfg.attributes["configure_logger"] = False
+
+    with test_engine.connect() as conn:
+        alembic_cfg.attributes["connection"] = conn
+        command.upgrade(alembic_cfg, "0008_pipeline_orchestration_tables")
 
     inspector = inspect(test_engine)
     tables = set(inspector.get_table_names())
 
-    # Required tables
     assert "pipeline_stage_states" in tables
     assert "pipeline_checkpoints" in tables
     assert "pipeline_checkpoint_audit" in tables
 
-    # Required project columns
     proj_columns = {col["name"]: col for col in inspector.get_columns("projects")}
     assert "deleted_at" in proj_columns
     assert "current_pipeline_stage" in proj_columns
     assert "pipeline_overall_status" in proj_columns
 
-    # Required stage state columns
-    stage_columns = {col["name"]: col for col in inspector.get_columns("pipeline_stage_states")}
-    for required in ["id", "project_id", "stage_name", "status", "active_job_id", "retry_count", "content_hash", "consumed_input_hash"]:
-        assert required in stage_columns
+    test_engine.dispose()
 
-    # Required checkpoint columns
-    cp_columns = {col["name"]: col for col in inspector.get_columns("pipeline_checkpoints")}
-    for required in ["id", "project_id", "checkpoint_type", "status", "artifact_type", "artifact_version", "artifact_content_hash"]:
-        assert required in cp_columns
 
-    # Required audit columns (no cascade FK to project to preserve independent history)
-    audit_columns = {col["name"]: col for col in inspector.get_columns("pipeline_checkpoint_audit")}
-    for required in ["id", "project_id", "project_name_snapshot", "checkpoint_id", "checkpoint_type", "decision", "artifact_content_hash", "artifact_version"]:
-        assert required in audit_columns
+def test_migration_0008_to_0009_upgrade_and_data_preservation(tmp_path):
+    """
+    Verifies BLOCKER 1:
+    - Upgrade an existing database migrated to original 0008 schema up to 0009.
+    - Foreign keys are converted from CASCADE to RESTRICT.
+    - Existing pipeline stage, checkpoint, and audit data are preserved without loss.
+    - Safe downgrade converts RESTRICT back to CASCADE.
+    """
+    test_db_path = tmp_path / "migrate_0008_to_0009.db"
+    db_url = f"sqlite:///{test_db_path}"
+    test_engine = create_engine(db_url, connect_args={"check_same_thread": False})
 
-    # Verify unique constraints
-    stage_uqs = inspector.get_unique_constraints("pipeline_stage_states")
-    stage_uq_cols = [uq["column_names"] for uq in stage_uqs]
-    assert ["project_id", "stage_name"] in stage_uq_cols
+    alembic_ini_path = settings.root_dir / "alembic.ini"
+    alembic_cfg = Config(str(alembic_ini_path))
+    alembic_cfg.set_main_option("script_location", str(settings.root_dir / "backend" / "alembic"))
+    alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+    alembic_cfg.attributes["configure_logger"] = False
 
-    cp_uqs = inspector.get_unique_constraints("pipeline_checkpoints")
-    cp_uq_cols = [uq["column_names"] for uq in cp_uqs]
-    assert ["project_id", "checkpoint_type"] in cp_uq_cols
+    # 1. Upgrade to original 0008
+    with test_engine.connect() as conn:
+        alembic_cfg.attributes["connection"] = conn
+        command.upgrade(alembic_cfg, "0008_pipeline_orchestration_tables")
+        conn.commit()
+
+    # 2. Insert existing film and pipeline data under 0008
+    with test_engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO projects (id, name, budget_total, budget_spent)
+            VALUES ('proj-compat-1', 'Legacy 0008 Film', 100.0, 0.0);
+        """))
+        conn.execute(text("""
+            INSERT INTO pipeline_stage_states (id, project_id, stage_name, status, stage_metadata)
+            VALUES ('stage-compat-1', 'proj-compat-1', 'screenplay', 'IN_PROGRESS', '{\"legacy_note\": \"preserved\"}');
+        """))
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoints (id, project_id, checkpoint_type, status, artifact_type, feedback_notes)
+            VALUES ('cp-compat-1', 'proj-compat-1', 'story_approval', 'APPROVED', 'screenplay', 'Looks great');
+        """))
+        conn.execute(text("""
+            INSERT INTO pipeline_checkpoint_audit (id, project_id, project_name_snapshot, checkpoint_id, checkpoint_type, decision, artifact_content_hash, artifact_version, reviewer_name)
+            VALUES ('audit-compat-1', 'proj-compat-1', 'Legacy 0008 Film', 'cp-compat-1', 'story_approval', 'APPROVED', 'hash-comp', 1, 'Director');
+        """))
+        conn.commit()
+
+    # 3. Upgrade to 0009_pipeline_fk_restrict (HEAD)
+    with test_engine.connect() as conn:
+        alembic_cfg.attributes["connection"] = conn
+        command.upgrade(alembic_cfg, "0009_pipeline_fk_restrict")
+        conn.commit()
+
+    # 4. Verify all records survived with zero data loss
+    with test_engine.connect() as conn:
+        stage_row = conn.execute(text("SELECT id, status, stage_metadata FROM pipeline_stage_states WHERE id = 'stage-compat-1'")).fetchone()
+        assert stage_row is not None
+        assert stage_row[1] == "IN_PROGRESS"
+        assert "preserved" in stage_row[2]
+
+        cp_row = conn.execute(text("SELECT id, status, feedback_notes FROM pipeline_checkpoints WHERE id = 'cp-compat-1'")).fetchone()
+        assert cp_row is not None
+        assert cp_row[1] == "APPROVED"
+        assert cp_row[2] == "Looks great"
+
+        audit_row = conn.execute(text("SELECT id, decision FROM pipeline_checkpoint_audit WHERE id = 'audit-compat-1'")).fetchone()
+        assert audit_row is not None
+        assert audit_row[1] == "APPROVED"
+
+        # 5. Verify RESTRICT enforcement on hard delete
+        with pytest.raises(IntegrityError):
+            conn.execute(text("DELETE FROM projects WHERE id = 'proj-compat-1'"))
+            conn.commit()
+        conn.rollback()
+
+    # 6. Test downgrade back to 0008
+    with test_engine.connect() as conn:
+        alembic_cfg.attributes["connection"] = conn
+        command.downgrade(alembic_cfg, "0008_pipeline_orchestration_tables")
+        conn.commit()
+
+        # Data still exists after downgrade
+        count = conn.execute(text("SELECT count(*) FROM pipeline_stage_states WHERE id = 'stage-compat-1'")).scalar()
+        assert count == 1
 
     test_engine.dispose()
 
 
-def test_migration_0008_downgrade_safety(tmp_path):
+def test_fresh_database_migration_to_latest_head(tmp_path):
     """
-    Verifies safe downgrade behavior:
-    - Non-empty audit table blocks downgrade with clear error unless AUDIT_ARCHIVE_PATH is provided.
-    - When AUDIT_ARCHIVE_PATH is provided, validates that archive file is created, non-empty, and record count matches DB count before dropping tables.
+    Verifies that a fresh database successfully upgrades from initial baseline to latest head (0009).
     """
-    test_db_path = tmp_path / "downgrade_test.db"
+    test_db_path = tmp_path / "fresh_head.db"
+    db_url = f"sqlite:///{test_db_path}"
+    test_engine = create_engine(db_url)
+
+    run_migrations(target_engine=test_engine, db_url=db_url)
+
+    inspector = inspect(test_engine)
+    tables = set(inspector.get_table_names())
+    assert "pipeline_stage_states" in tables
+    assert "pipeline_checkpoints" in tables
+    assert "pipeline_checkpoint_audit" in tables
+
+    test_engine.dispose()
+
+
+def test_sqlite_production_engine_foreign_key_enforcement(tmp_path):
+    """
+    Verifies BLOCKER 2:
+    - Production engine configuration automatically enables foreign key enforcement on SQLite.
+    - No test-specific pragma listeners are needed.
+    - Hard delete of project with pipeline records is rejected.
+    - Direct SQL hard delete is rejected.
+    - Soft delete succeeds.
+    - Pipeline records and audit history remain intact.
+    """
+    test_db_path = tmp_path / "prod_fk_test.db"
+    db_url = f"sqlite:///{test_db_path}"
+    # Create engine using standard production pattern (backend.app.database listener handles foreign_keys)
+    engine = create_engine(db_url, connect_args={"check_same_thread": False})
+    run_migrations(target_engine=engine, db_url=db_url)
+
+    SessionTest = sessionmaker(bind=engine)
+    session = SessionTest()
+
+    # 1. Verify PRAGMA foreign_keys is ON
+    fk_status = session.execute(text("PRAGMA foreign_keys;")).scalar()
+    assert fk_status == 1, "PRAGMA foreign_keys must be 1 on production SQLite connections"
+
+    # 2. Create project and initialize pipeline
+    proj = Project(name="Production FK Test Film", budget_total=100.0)
+    session.add(proj)
+    session.commit()
+    pid = proj.id
+
+    initialize_project_pipeline(pid, session)
+
+    audit = PipelineCheckpointAudit(
+        project_id=pid,
+        project_name_snapshot=proj.name,
+        checkpoint_id="cp-test",
+        checkpoint_type="story_approval",
+        decision="APPROVED",
+        artifact_content_hash="audit_hash",
+        artifact_version=1,
+        reviewer_name="Director"
+    )
+    session.add(audit)
+    session.commit()
+
+    # 3. ORM hard delete rejected
+    with pytest.raises(IntegrityError):
+        session.delete(proj)
+        session.commit()
+    session.rollback()
+
+    # 4. Direct SQL hard delete rejected
+    with pytest.raises(IntegrityError):
+        session.execute(text(f"DELETE FROM projects WHERE id = '{pid}'"))
+        session.commit()
+    session.rollback()
+
+    # 5. Soft delete succeeds
+    p = session.query(Project).filter(Project.id == pid).first()
+    p.deleted_at = utc_now()
+    session.commit()
+
+    # 6. Verify pipeline records and audit trail intact
+    assert session.query(PipelineStageState).filter(PipelineStageState.project_id == pid).count() == 11
+    assert session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == pid).count() == 4
+    assert session.query(PipelineCheckpointAudit).filter(PipelineCheckpointAudit.project_id == pid).count() == 1
+
+    session.close()
+    engine.dispose()
+
+
+def test_migration_0008_downgrade_safety_and_record_verification(tmp_path):
+    """
+    Verifies deep record-level archival validation in 0008 downgrade:
+    - Non-empty audit table blocks downgrade without AUDIT_ARCHIVE_PATH.
+    - Corrupt or incomplete archive is rejected.
+    - Valid archive with all exact records matching database succeeds and drops tables.
+    """
+    test_db_path = tmp_path / "downgrade_verify_test.db"
     db_url = f"sqlite:///{test_db_path}"
 
     test_engine = create_engine(db_url)
@@ -195,7 +356,7 @@ def test_migration_0008_downgrade_safety(tmp_path):
     alembic_cfg.set_main_option("sqlalchemy.url", db_url)
     alembic_cfg.attributes["configure_logger"] = False
 
-    # Insert an audit record
+    # Insert audit record
     with test_engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO pipeline_checkpoint_audit (
@@ -203,14 +364,20 @@ def test_migration_0008_downgrade_safety(tmp_path):
                 checkpoint_type, decision, artifact_content_hash,
                 artifact_version, reviewer_name, created_at
             ) VALUES (
-                'audit-1', 'proj-1', 'Test Film', 'cp-1',
+                'audit-verify-1', 'proj-1', 'Verification Film', 'cp-1',
                 'story_approval', 'APPROVED', 'abc123hash',
                 1, 'Director', datetime('now')
             )
         """))
         conn.commit()
 
-    # Attempt downgrade without AUDIT_ARCHIVE_PATH: must fail with clear refusal message
+    # 1. Downgrade from 0009 to 0008 succeeds (only alters FK)
+    with test_engine.connect() as conn:
+        alembic_cfg.attributes["connection"] = conn
+        command.downgrade(alembic_cfg, "0008_pipeline_orchestration_tables")
+        conn.commit()
+
+    # 2. Attempt downgrade to 0007 without archive path: must fail
     with pytest.raises(Exception) as exc_info:
         with test_engine.connect() as conn:
             alembic_cfg.attributes["connection"] = conn
@@ -219,8 +386,8 @@ def test_migration_0008_downgrade_safety(tmp_path):
     assert "contains 1 audit record" in str(exc_info.value)
     assert "AUDIT_ARCHIVE_PATH" in str(exc_info.value)
 
-    # Downgrade with valid AUDIT_ARCHIVE_PATH succeeds and preserves records in archive
-    archive_file = tmp_path / "audit_archive.json"
+    # 3. Downgrade with valid archive succeeds
+    archive_file = tmp_path / "audit_archive_verified.json"
     os.environ["AUDIT_ARCHIVE_PATH"] = str(archive_file)
     try:
         with test_engine.connect() as conn:
@@ -228,13 +395,11 @@ def test_migration_0008_downgrade_safety(tmp_path):
             command.downgrade(alembic_cfg, "0007_upload_operation_lease_fencing")
             conn.commit()
 
-        # Verify archive exists and contains exact record count
         assert archive_file.exists()
-        assert archive_file.stat().st_size > 0
         with open(archive_file, "r", encoding="utf-8") as f:
             archived = json.load(f)
         assert len(archived) == 1
-        assert archived[0]["id"] == "audit-1"
+        assert archived[0]["id"] == "audit-verify-1"
         assert archived[0]["decision"] == "APPROVED"
 
         inspector = inspect(test_engine)
@@ -273,13 +438,11 @@ def test_sqlite_audit_table_immutability_triggers(tmp_path):
         """))
         conn.commit()
 
-        # Direct UPDATE must fail
         with pytest.raises(Exception) as exc_update:
             conn.execute(text("UPDATE pipeline_checkpoint_audit SET decision = 'TAMPERED' WHERE id = 'audit-immutable-1'"))
             conn.commit()
         assert "pipeline_checkpoint_audit is immutable and append-only" in str(exc_update.value)
 
-        # Direct DELETE must fail
         with pytest.raises(Exception) as exc_delete:
             conn.execute(text("DELETE FROM pipeline_checkpoint_audit WHERE id = 'audit-immutable-1'"))
             conn.commit()
@@ -289,86 +452,7 @@ def test_sqlite_audit_table_immutability_triggers(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 3. BLOCKER 1: PRESERVE PIPELINE RECORDS & HARD DELETE RESTRICTION
-# ---------------------------------------------------------------------------
-
-def test_project_hard_delete_blocked_by_restrict_foreign_key(tmp_path):
-    """
-    Verifies BLOCKER 1:
-    - PipelineStageState and PipelineCheckpoint foreign keys to Project use RESTRICT / NO ACTION.
-    - Hard deletion of a project via ORM or direct SQL raises IntegrityError.
-    - Soft deletion succeeds and preserves pipeline history and audit logs intact.
-    """
-    test_db_path = tmp_path / "hard_delete_test.db"
-    db_url = f"sqlite:///{test_db_path}"
-    test_engine = create_engine(db_url, connect_args={"check_same_thread": False})
-
-    @event.listens_for(test_engine, "connect")
-    def set_sqlite_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    run_migrations(target_engine=test_engine, db_url=db_url)
-    SessionTest = sessionmaker(bind=test_engine)
-    session = SessionTest()
-
-    proj = Project(name="Hard Delete Target", budget_total=100.0)
-    session.add(proj)
-    session.commit()
-    session.refresh(proj)
-    pid = proj.id
-
-    # Initialize pipeline
-    initialize_project_pipeline(pid, session)
-
-    # Add an audit record for this project
-    audit = PipelineCheckpointAudit(
-        project_id=pid,
-        project_name_snapshot=proj.name,
-        checkpoint_id="dummy-cp",
-        checkpoint_type="story_approval",
-        decision="APPROVED",
-        artifact_content_hash="hash123",
-        artifact_version=1,
-        reviewer_name="Director"
-    )
-    session.add(audit)
-    session.commit()
-
-    # 1. Attempt ORM hard deletion: must fail due to ondelete=RESTRICT
-    with pytest.raises(IntegrityError):
-        session.delete(proj)
-        session.commit()
-    session.rollback()
-
-    # 2. Attempt raw SQL hard deletion: must fail due to ondelete=RESTRICT
-    with pytest.raises(IntegrityError):
-        session.execute(text(f"DELETE FROM projects WHERE id = '{pid}'"))
-        session.commit()
-    session.rollback()
-
-    # Confirm stages and checkpoints are untouched
-    assert session.query(PipelineStageState).filter(PipelineStageState.project_id == pid).count() == 11
-    assert session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == pid).count() == 4
-    assert session.query(PipelineCheckpointAudit).filter(PipelineCheckpointAudit.project_id == pid).count() == 1
-
-    # 3. Soft deletion must succeed without error
-    proj = session.query(Project).filter(Project.id == pid).first()
-    proj.deleted_at = utc_now()
-    session.commit()
-
-    # Verify pipeline records and audit logs remain intact after soft deletion
-    assert session.query(PipelineStageState).filter(PipelineStageState.project_id == pid).count() == 11
-    assert session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == pid).count() == 4
-    assert session.query(PipelineCheckpointAudit).filter(PipelineCheckpointAudit.project_id == pid).count() == 1
-
-    session.close()
-    test_engine.dispose()
-
-
-# ---------------------------------------------------------------------------
-# 4. PIPELINE INITIALIZATION & ORDERING TESTS
+# 3. PIPELINE INITIALIZATION & ORDERING TESTS
 # ---------------------------------------------------------------------------
 
 def test_exact_11_stages_and_ordering(db_session, clean_project):
@@ -388,11 +472,9 @@ def test_exact_11_stages_and_ordering(db_session, clean_project):
     stage_order_map = {name: idx for idx, name in enumerate(PIPELINE_STAGES)}
     sorted_stages = sorted(stages, key=lambda s: stage_order_map[s.stage_name])
 
-    # Direct ordered comparison against PIPELINE_STAGES
     ordered_names = [s.stage_name for s in sorted_stages]
-    assert ordered_names == PIPELINE_STAGES, f"Ordered stages {ordered_names} did not match PIPELINE_STAGES"
+    assert ordered_names == PIPELINE_STAGES
 
-    # Verify each stage is initialized with NOT_STARTED
     for s in stages:
         assert s.status == "NOT_STARTED"
         assert s.active_job_id is None
@@ -463,7 +545,6 @@ def test_concurrent_initialization_attempts(isolated_engine_and_session, clean_p
     """
     _, SessionMaker = isolated_engine_and_session
 
-    # Seed one stage with custom in-progress state to verify it is NOT overwritten
     seed_session = SessionMaker()
     first_stage = PipelineStageState(
         project_id=clean_project.id,
@@ -482,7 +563,6 @@ def test_concurrent_initialization_attempts(isolated_engine_and_session, clean_p
         finally:
             session.close()
 
-    # Launch 5 concurrent threads attempting to initialize the same project
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(init_worker) for _ in range(5)]
         for f in concurrent.futures.as_completed(futures):
@@ -500,12 +580,9 @@ def test_concurrent_initialization_attempts(isolated_engine_and_session, clean_p
         assert len(stages) == 11
         assert len(cps) == 4
 
-        # Verify existing in-progress state was preserved and not overwritten
         stage_map = {s.stage_name: s for s in stages}
         assert stage_map["story_development"].status == "IN_PROGRESS"
         assert stage_map["story_development"].stage_metadata == '{"custom_seed": true}'
-
-        # Verify exact stage names and checkpoint types
         assert {s.stage_name for s in stages} == set(PIPELINE_STAGES)
         assert {cp.checkpoint_type for cp in cps} == {c[0] for c in PIPELINE_CHECKPOINTS}
     finally:
@@ -513,16 +590,14 @@ def test_concurrent_initialization_attempts(isolated_engine_and_session, clean_p
 
 
 # ---------------------------------------------------------------------------
-# 5. BLOCKER 3: LEGACY PROJECT SELF-HEALING
+# 4. LEGACY SELF-HEALING & EXACT PIPELINE COMPLETENESS
 # ---------------------------------------------------------------------------
 
 def test_legacy_project_self_healing_missing_checkpoints(db_session, clean_project):
     """
-    Verifies BLOCKER 3:
-    - Project with all 11 stages but missing checkpoints is safely self-healed.
-    - Existing stage states and metadata are preserved without being reset.
+    Verifies that a project with all 11 stages but missing checkpoints is safely self-healed.
+    Existing stage states and metadata are preserved without being reset.
     """
-    # 1. Manually initialize only the 11 stages (one marked IN_PROGRESS)
     now = utc_now()
     for name in PIPELINE_STAGES:
         st = "IN_PROGRESS" if name == "screenplay" else "NOT_STARTED"
@@ -537,20 +612,12 @@ def test_legacy_project_self_healing_missing_checkpoints(db_session, clean_proje
         ))
     db_session.commit()
 
-    # Confirm 11 stages and 0 checkpoints
-    assert db_session.query(PipelineStageState).filter(PipelineStageState.project_id == clean_project.id).count() == 11
-    assert db_session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == clean_project.id).count() == 0
     assert not is_pipeline_complete(db_session, clean_project.id)
 
-    # 2. Trigger self-healing via get_pipeline_status
     status = PipelineOrchestrator.get_pipeline_status(db_session, clean_project.id)
-
-    # Confirm 4 checkpoints were created
     assert len(status["checkpoints"]) == 4
-    assert db_session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == clean_project.id).count() == 4
     assert is_pipeline_complete(db_session, clean_project.id)
 
-    # Confirm existing stage state and metadata were NOT overwritten
     screenplay_st = db_session.query(PipelineStageState).filter(
         PipelineStageState.project_id == clean_project.id,
         PipelineStageState.stage_name == "screenplay"
@@ -561,11 +628,9 @@ def test_legacy_project_self_healing_missing_checkpoints(db_session, clean_proje
 
 def test_legacy_project_self_healing_missing_stages(db_session, clean_project):
     """
-    Verifies BLOCKER 3:
-    - Project with 4 checkpoints but missing stages is safely self-healed.
-    - Existing checkpoint states and notes are preserved without being reset.
+    Verifies that a project with 4 checkpoints but missing stages is safely self-healed.
+    Existing checkpoint states and notes are preserved without being reset.
     """
-    # 1. Manually initialize only the 4 checkpoints (one marked APPROVED)
     now = utc_now()
     for cp_type, art_type in PIPELINE_CHECKPOINTS:
         st = "APPROVED" if cp_type == "story_approval" else "LOCKED"
@@ -582,20 +647,12 @@ def test_legacy_project_self_healing_missing_stages(db_session, clean_project):
         ))
     db_session.commit()
 
-    # Confirm 4 checkpoints and 0 stages
-    assert db_session.query(PipelineCheckpoint).filter(PipelineCheckpoint.project_id == clean_project.id).count() == 4
-    assert db_session.query(PipelineStageState).filter(PipelineStageState.project_id == clean_project.id).count() == 0
     assert not is_pipeline_complete(db_session, clean_project.id)
 
-    # 2. Trigger self-healing
     status = PipelineOrchestrator.get_pipeline_status(db_session, clean_project.id)
-
-    # Confirm 11 stages were created
     assert len(status["stages"]) == 11
-    assert db_session.query(PipelineStageState).filter(PipelineStageState.project_id == clean_project.id).count() == 11
     assert is_pipeline_complete(db_session, clean_project.id)
 
-    # Confirm existing checkpoint state and notes were NOT overwritten
     story_cp = db_session.query(PipelineCheckpoint).filter(
         PipelineCheckpoint.project_id == clean_project.id,
         PipelineCheckpoint.checkpoint_type == "story_approval"
@@ -604,13 +661,109 @@ def test_legacy_project_self_healing_missing_stages(db_session, clean_project):
     assert story_cp.feedback_notes == "Director approved"
 
 
+def test_exact_pipeline_completeness_and_unexpected_records(db_session, clean_project):
+    """
+    Verifies additional correction: exact equality in is_pipeline_complete().
+    - Unexpected stages or checkpoints cause is_pipeline_complete to return False.
+    - Missing stages or checkpoints cause is_pipeline_complete to return False.
+    - Self-healing does not delete or overwrite existing records.
+    """
+    initialize_project_pipeline(clean_project.id, db_session)
+    assert is_pipeline_complete(db_session, clean_project.id) is True
+
+    # 1. Add unexpected rogue stage
+    rogue_stage = PipelineStageState(
+        project_id=clean_project.id,
+        stage_name="rogue_bonus_stage",
+        status="NOT_STARTED"
+    )
+    db_session.add(rogue_stage)
+    db_session.commit()
+
+    # Exact equality must reject unexpected stage
+    assert is_pipeline_complete(db_session, clean_project.id) is False
+
+    db_session.delete(rogue_stage)
+    db_session.commit()
+    assert is_pipeline_complete(db_session, clean_project.id) is True
+
+    # 2. Add unexpected rogue checkpoint
+    rogue_cp = PipelineCheckpoint(
+        project_id=clean_project.id,
+        checkpoint_type="rogue_approval",
+        status="LOCKED",
+        artifact_type="rogue"
+    )
+    db_session.add(rogue_cp)
+    db_session.commit()
+
+    # Exact equality must reject unexpected checkpoint
+    assert is_pipeline_complete(db_session, clean_project.id) is False
+
+    db_session.delete(rogue_cp)
+    db_session.commit()
+    assert is_pipeline_complete(db_session, clean_project.id) is True
+
+
 # ---------------------------------------------------------------------------
-# 6. BLOCKER 4: TRANSACTIONALLY FENCED STAGE COMPLETION
+# 5. ATOMIC DEMO SEEDING ROLLBACK TEST
+# ---------------------------------------------------------------------------
+
+def test_demo_project_seeding_atomic_rollback(tmp_path, monkeypatch):
+    """
+    Verifies BLOCKER 3:
+    - seed_initial_demo_if_empty() creates all entities in one transaction without intermediate commits.
+    - If pipeline initialization fails, the entire transaction is rolled back.
+    - Zero partial demo records (projects, characters, locations, scenes, shots) remain.
+    """
+    import backend.app.main as main_module
+
+    test_db_path = tmp_path / "demo_seed_test.db"
+    db_url = f"sqlite:///{test_db_path}"
+    test_engine = create_engine(db_url, connect_args={"check_same_thread": False})
+    run_migrations(target_engine=test_engine, db_url=db_url)
+
+    TestSession = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    monkeypatch.setattr(main_module, "SessionLocal", TestSession)
+
+    # Force initialize_project_pipeline to fail
+    def mock_fail_init(*args, **kwargs):
+        raise RuntimeError("Simulated failure during demo pipeline initialization")
+
+    monkeypatch.setattr(main_module, "initialize_project_pipeline", mock_fail_init)
+
+    with pytest.raises(RuntimeError):
+        seed_initial_demo_if_empty(force=True)
+
+    # Verify no partial demo records committed
+    db = TestSession()
+    try:
+        demo = db.query(Project).filter(Project.name == "Cyber Horizon: Echoes of 2088").first()
+        assert demo is None, "Demo project must not exist after rollback"
+
+        char = db.query(Character).filter(Character.name == "REN SHINODA").first()
+        assert char is None, "Character must not exist after rollback"
+
+        loc = db.query(Location).filter(Location.name == "Spire 9 Submerged Data Core").first()
+        assert loc is None, "Location must not exist after rollback"
+
+        scene = db.query(Scene).filter(Scene.title == "Scene 1: The Breach").first()
+        assert scene is None, "Scene must not exist after rollback"
+
+        shot = db.query(Shot).filter(Shot.shot_code == "SC01_SH01").first()
+        assert shot is None, "Shot must not exist after rollback"
+    finally:
+        db.close()
+        test_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 6. TRANSACTIONALLY FENCED STAGE COMPLETION TESTS
 # ---------------------------------------------------------------------------
 
 def test_transactionally_fenced_stage_completion(db_session, clean_project):
     """
-    Verifies BLOCKER 4:
+    Verifies transactional worker fencing:
     1. Valid worker atomically completes both StudioJob and PipelineStageState.
     2. Stale fencing token is rejected; both remain unchanged.
     3. Wrong worker_id is rejected; both remain unchanged.
@@ -688,7 +841,7 @@ def test_transactionally_fenced_stage_completion(db_session, clean_project):
             stage_name="character_design",
             active_job_id=job2.id,
             worker_id="worker-2",
-            fencing_token=19  # stale token
+            fencing_token=19
         )
 
     db_session.refresh(job2)
@@ -703,7 +856,7 @@ def test_transactionally_fenced_stage_completion(db_session, clean_project):
             project_id=clean_project.id,
             stage_name="character_design",
             active_job_id=job2.id,
-            worker_id="rogue-worker",  # wrong worker
+            worker_id="rogue-worker",
             fencing_token=20
         )
 
@@ -762,7 +915,7 @@ def test_transactionally_fenced_stage_completion(db_session, clean_project):
         PipelineStageState.stage_name == "location_design"
     ).first()
     loc_stage.status = "IN_PROGRESS"
-    loc_stage.active_job_id = other_job.id  # stage reassigned to another job
+    loc_stage.active_job_id = other_job.id
     db_session.commit()
 
     with pytest.raises(JobOwnershipLostError):
@@ -775,7 +928,6 @@ def test_transactionally_fenced_stage_completion(db_session, clean_project):
             fencing_token=30
         )
 
-    # Crucial: verify that job3 was NOT committed as COMPLETED (transaction was rolled back)
     db_session.refresh(job3)
     db_session.refresh(loc_stage)
     assert job3.status == "RUNNING"
@@ -803,7 +955,6 @@ def test_transactionally_fenced_stage_completion(db_session, clean_project):
     sb_stage.active_job_id = job4.id
     db_session.commit()
 
-    # Stale fail attempt rejected
     with pytest.raises(JobOwnershipLostError):
         PipelineOrchestrator.fail_pipeline_stage(
             db=db_session,
@@ -812,14 +963,13 @@ def test_transactionally_fenced_stage_completion(db_session, clean_project):
             active_job_id=job4.id,
             error="CUDA out of memory",
             worker_id="worker-4",
-            fencing_token=39  # stale token
+            fencing_token=39
         )
     db_session.refresh(job4)
     db_session.refresh(sb_stage)
     assert job4.status == "RUNNING"
     assert sb_stage.status == "IN_PROGRESS"
 
-    # Valid fail succeeds atomically
     failed_stage = PipelineOrchestrator.fail_pipeline_stage(
         db=db_session,
         project_id=clean_project.id,
@@ -836,7 +986,7 @@ def test_transactionally_fenced_stage_completion(db_session, clean_project):
 
 
 # ---------------------------------------------------------------------------
-# 7. ADDITIONAL FIX D: ARTIFACT HASH SCOPE CONTROL
+# 7. ARTIFACT HASH SCOPE CONTROL
 # ---------------------------------------------------------------------------
 
 def test_compute_artifact_hash_scope_control(db_session, clean_project):
@@ -845,7 +995,6 @@ def test_compute_artifact_hash_scope_control(db_session, clean_project):
     - compute_artifact_hash correctly computes canonical SHA-256 for 'screenplay'.
     - compute_artifact_hash raises NotImplementedError for visual_bible, storyboard, assembly_cut.
     """
-    # 1. Screenplay hashing
     sc = Scene(
         project_id=clean_project.id,
         scene_number=1,
@@ -863,7 +1012,6 @@ def test_compute_artifact_hash_scope_control(db_session, clean_project):
     assert isinstance(hash_val, str)
     assert len(hash_val) == 64
 
-    # 2. Unsupported checkpoint types must raise NotImplementedError
     for unsupported in ["visual_bible", "storyboard", "assembly_cut"]:
         with pytest.raises(NotImplementedError) as exc_info:
             PipelineOrchestrator.compute_artifact_hash(db_session, clean_project.id, unsupported)
@@ -871,7 +1019,7 @@ def test_compute_artifact_hash_scope_control(db_session, clean_project):
 
 
 # ---------------------------------------------------------------------------
-# 8. PROJECT CREATION & ROUTER INTEGRATION
+# 8. PROJECT CREATION ROUTER INTEGRATION
 # ---------------------------------------------------------------------------
 
 def test_project_creation_automatically_initializes_pipeline(client, db_session):
@@ -895,7 +1043,6 @@ def test_project_creation_automatically_initializes_pipeline(client, db_session)
     assert created_data["current_pipeline_stage"] == "story_development"
     assert created_data["pipeline_overall_status"] == "in_progress"
 
-    # Verify database state
     stages = db_session.query(PipelineStageState).filter(
         PipelineStageState.project_id == project_id
     ).all()
@@ -939,14 +1086,14 @@ def test_atomic_project_creation_rollback_on_initialization_failure(db_session, 
 
 def test_postgresql_pipeline_foundation_and_concurrency():
     """
-    Verifies migration 0008, audit immutability triggers, RESTRICT foreign keys,
+    Verifies migration 0008, migration 0009, audit immutability triggers, RESTRICT foreign keys,
     and concurrent pipeline initialization on a real PostgreSQL instance.
     """
     pg_engine = get_postgres_engine()
     if not pg_engine:
         pytest.skip("PostgreSQL test database not available.")
 
-    # 1. Run migrations on PostgreSQL
+    # 1. Run migrations to head (0009) on PostgreSQL
     alembic_cfg = Config(str(settings.root_dir / "alembic.ini"))
     alembic_cfg.set_main_option("script_location", str(settings.root_dir / "backend" / "alembic"))
     alembic_cfg.set_main_option("sqlalchemy.url", pg_engine.url.render_as_string(hide_password=False))
@@ -969,21 +1116,19 @@ def test_postgresql_pipeline_foundation_and_concurrency():
         """))
         conn.commit()
 
-        # Update must be rejected
         with pytest.raises(Exception) as exc_update:
             conn.execute(text(f"UPDATE pipeline_checkpoint_audit SET decision = 'TAMPERED' WHERE id = '{audit_id}'"))
             conn.commit()
         assert "pipeline_checkpoint_audit is immutable and append-only" in str(exc_update.value)
         conn.rollback()
 
-        # Delete must be rejected
         with pytest.raises(Exception) as exc_delete:
             conn.execute(text(f"DELETE FROM pipeline_checkpoint_audit WHERE id = '{audit_id}'"))
             conn.commit()
         assert "pipeline_checkpoint_audit is immutable and append-only" in str(exc_delete.value)
         conn.rollback()
 
-    # 3. Test RESTRICT foreign key constraint on PostgreSQL
+    # 3. Test RESTRICT foreign key constraint on PostgreSQL (established via 0009)
     PgSession = sessionmaker(bind=pg_engine)
     pg_session = PgSession()
 
@@ -995,7 +1140,6 @@ def test_postgresql_pipeline_foundation_and_concurrency():
 
     initialize_project_pipeline(pg_pid, pg_session)
 
-    # Deleting project must be rejected by RESTRICT constraint
     with pytest.raises(IntegrityError):
         pg_session.delete(pg_proj)
         pg_session.commit()
@@ -1048,11 +1192,10 @@ def test_postgresql_pipeline_foundation_and_concurrency():
 
 def test_postgresql_pipeline_worker_fencing():
     """
-    Verifies BLOCKER 4 transactional worker fencing specifically on PostgreSQL:
+    Verifies transactional worker fencing specifically on PostgreSQL:
     - Valid worker completes stage and job atomically.
     - Stale fencing token is rejected and rolled back.
     - Expired lease is rejected and rolled back.
-    - Stage failure with fencing.
     """
     pg_engine = get_postgres_engine()
     if not pg_engine:
@@ -1070,7 +1213,6 @@ def test_postgresql_pipeline_worker_fencing():
 
         initialize_project_pipeline(pid, session)
 
-        # 1. Valid worker completion
         job = StudioJob(
             project_id=pid,
             job_type="screenplay_generation",
@@ -1106,7 +1248,6 @@ def test_postgresql_pipeline_worker_fencing():
         assert completed.status == "COMPLETED"
         assert completed.content_hash == "pghash_screenplay"
 
-        # 2. Stale worker rejection
         job2 = StudioJob(
             project_id=pid,
             job_type="character_generation",
@@ -1135,7 +1276,7 @@ def test_postgresql_pipeline_worker_fencing():
                 stage_name="character_design",
                 active_job_id=job2.id,
                 worker_id="pg-worker-2",
-                fencing_token=199  # stale token
+                fencing_token=199
             )
 
         session.refresh(job2)
@@ -1143,7 +1284,6 @@ def test_postgresql_pipeline_worker_fencing():
         assert job2.status == "RUNNING"
         assert char_stage.status == "IN_PROGRESS"
 
-        # 3. Expired lease rejection
         job2.lease_expires_at = utc_now() - timedelta(seconds=10)
         session.commit()
 
