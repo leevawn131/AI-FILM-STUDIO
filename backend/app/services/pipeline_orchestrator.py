@@ -121,46 +121,64 @@ def validate_stage_transition(current_status: str, target_status: str) -> bool:
 def _clear_project_locks(session, transaction):
     if transaction.nested:
         return
+    session.info.pop("_active_sqlite_write_lock_tx", None)
     session.info.pop("_locked_projects", None)
+    session.info.pop("_pg_locked_projects", None)
 
 
 def acquire_project_write_lock(db: Session, project_id: str) -> Optional[Project]:
     """
     Acquires an exclusive write lock for the project across SQLite and PostgreSQL.
     - PostgreSQL: Executes SELECT ... FOR UPDATE on the Project row to serialize writers.
+      Natively reentrant within the same transaction.
     - SQLite: Starts a BEGIN IMMEDIATE transaction before reading snapshots,
-      ensuring that transactions are serialized. Reentrant if already held.
-      If connection is already in an un-locked transaction or lock cannot be acquired,
-      rolls back and raises an explicit error.
+      ensuring that transactions are serialized across concurrent processes.
+      Reentrant within the same active SessionTransaction.
+      If a caller-owned transaction is already in progress without write lock serialization,
+      raises HTTP 409 WITHOUT rolling back caller's uncommitted work.
     """
-    locked_projects = db.info.get("_locked_projects", set())
     bind = db.get_bind()
     dialect = bind.dialect.name if bind else "sqlite"
 
     if dialect == "postgresql":
         project = db.query(Project).filter(Project.id == project_id).with_for_update().first()
         if project:
+            db.info.setdefault("_pg_locked_projects", set()).add(project_id)
             db.info.setdefault("_locked_projects", set()).add(project_id)
         return project
     else:
-        if project_id in locked_projects:
-            return db.query(Project).filter(Project.id == project_id).first()
-
+        current_tx = db.get_transaction()
         conn = db.connection()
         raw_conn = getattr(conn.connection, "dbapi_connection", None)
         if raw_conn is None:
             raw_conn = getattr(conn.connection, "connection", None)
+        in_dbapi_tx = getattr(raw_conn, "in_transaction", False)
 
-        if raw_conn is not None and getattr(raw_conn, "in_transaction", False):
-            db.rollback()
+        # 1. Reentrant lock check for active SQLite write transaction
+        tx_write_locked = (
+            current_tx is not None
+            and current_tx.is_active
+            and in_dbapi_tx
+            and db.info.get("_active_sqlite_write_lock_tx") is current_tx
+        )
+        if tx_write_locked:
+            db.info.setdefault("_locked_projects", set()).add(project_id)
+            return db.query(Project).filter(Project.id == project_id).first()
+
+        # 2. Check if caller already has an active transaction or pending writes
+        has_caller_pending_writes = bool(db.new or db.dirty or db.deleted)
+        if in_dbapi_tx or has_caller_pending_writes:
+            # Caller owns this active transaction; do NOT roll it back!
             raise HTTPException(
                 status_code=409,
-                detail="Cannot safely acquire SQLite write lock: an active transaction is already in progress on this connection."
+                detail="Cannot safely acquire SQLite write lock: caller transaction is already in progress without write lock serialization."
             )
 
+        # 3. Fresh transaction: helper attempts BEGIN IMMEDIATE
         try:
             conn.exec_driver_sql("BEGIN IMMEDIATE")
         except Exception as lock_err:
+            # Helper initiated this transaction attempt, so helper safely rolls back
             db.rollback()
             err_msg = str(lock_err).lower()
             if "locked" in err_msg or "busy" in err_msg:
@@ -173,9 +191,10 @@ def acquire_project_write_lock(db: Session, project_id: str) -> Optional[Project
                 detail=f"Failed to acquire SQLite write lock: {lock_err}"
             ) from lock_err
 
+        # Write lock acquired: record transaction identity
+        db.info["_active_sqlite_write_lock_tx"] = db.get_transaction()
+        db.info.setdefault("_locked_projects", set()).add(project_id)
         project = db.query(Project).filter(Project.id == project_id).first()
-        if project:
-            db.info.setdefault("_locked_projects", set()).add(project_id)
         return project
 
 
@@ -1412,18 +1431,22 @@ class PipelineOrchestrator:
 
         # Worker input snapshot freshness check
         if stage_name in ("character_design", "location_design", "storyboard"):
+            if not consumed_input_hash:
+                raise JobOwnershipLostError(
+                    f"consumed_input_hash is mandatory for stage '{stage_name}' (fail-closed)."
+                )
             current_screenplay_hash = PipelineOrchestrator.compute_artifact_hash(db, project_id, "screenplay")
             if not current_screenplay_hash:
                 raise JobOwnershipLostError(
                     f"Cannot complete stage '{stage_name}': upstream screenplay artifact has no content hash (fail-closed)."
                 )
-            if consumed_input_hash and consumed_input_hash != current_screenplay_hash:
+            if consumed_input_hash != current_screenplay_hash:
                 raise JobOwnershipLostError(
                     f"Worker consumed an obsolete input snapshot (input hash '{consumed_input_hash}' != current '{current_screenplay_hash}'). Execution rejected."
                 )
-            if stage.consumed_input_hash and stage.consumed_input_hash != current_screenplay_hash:
+            if stage.consumed_input_hash and stage.consumed_input_hash != consumed_input_hash:
                 raise JobOwnershipLostError(
-                    f"Stage input snapshot drifted (stage hash '{stage.consumed_input_hash}' != current '{current_screenplay_hash}'). Execution rejected."
+                    f"Stage input snapshot drifted (stage hash '{stage.consumed_input_hash}' != current '{consumed_input_hash}'). Execution rejected."
                 )
 
         # Do not allow late completion to move a STALE stage back to COMPLETED

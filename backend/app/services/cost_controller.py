@@ -17,7 +17,7 @@ import json
 import hashlib
 import threading
 from typing import Optional, Any, Dict, Tuple
-from sqlalchemy import update, or_
+from sqlalchemy import update, or_, case
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException
@@ -292,6 +292,54 @@ class CostController:
                 if existing:
                     return existing
             raise
+
+    @staticmethod
+    def record_compensation(
+        db: Session,
+        project_id: str,
+        original_record: CostRecord,
+        reason: str = "generation_finalization_failed"
+    ) -> Optional[CostRecord]:
+        """
+        Creates an immutable compensation/refund ledger entry and restores Project.budget_spent.
+        Preserves original CostRecord in audit history (never deleted).
+        """
+        if not original_record or not original_record.cost_usd or original_record.cost_usd <= 0:
+            return None
+
+        refund_amount = original_record.cost_usd
+        stmt = (
+            update(Project)
+            .where(Project.id == project_id)
+            .values(
+                budget_spent=case(
+                    (Project.budget_spent - refund_amount < 0.0, 0.0),
+                    else_=Project.budget_spent - refund_amount
+                )
+            )
+        )
+        db.execute(stmt)
+
+        refund_record = CostRecord(
+            project_id=project_id,
+            scene_id=original_record.scene_id,
+            shot_id=original_record.shot_id,
+            provider=original_record.provider,
+            model=original_record.model,
+            operation="compensation_refund",
+            action_type="refund",
+            cost_usd=-refund_amount,
+            estimated_cost=-refund_amount,
+            actual_cost=-refund_amount if original_record.actual_cost_known else None,
+            actual_cost_known=original_record.actual_cost_known,
+            currency=original_record.currency or "USD",
+            operation_identity=f"refund_{original_record.id}",
+            details=f"Compensation refund for cost record {original_record.id}: {reason}"
+        )
+        db.add(refund_record)
+        db.commit()
+        db.refresh(refund_record)
+        return refund_record
 
     @staticmethod
     def record_flow_credit_usage(

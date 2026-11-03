@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
@@ -8,8 +9,10 @@ from backend.app.models.entities import Project, Scene, Character, Location, Sho
 from backend.app.schemas.entities import SceneCreate, SceneUpdate, SceneResponse
 from backend.app.agents.screenwriter_agent import screenwriter_agent
 from backend.app.services.cost_controller import cost_controller
-from backend.app.services.job_manager import job_manager, sanitize_error_message
+from backend.app.services.job_manager import job_manager, sanitize_error_message, JobOwnershipLostError
 from backend.app.services.pipeline_orchestrator import PipelineOrchestrator, acquire_project_write_lock
+
+logger = logging.getLogger(__name__)
 
 CANONICAL_SCREENPLAY_FIELDS = {
     "slugline", "title", "summary", "script_content",
@@ -128,16 +131,42 @@ def create_scene(data: SceneCreate, db: Session = Depends(get_db)):
 
 @router.post("/generate", response_model=SceneResponse)
 def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db)):
-    project = acquire_project_write_lock(db, data.project_id)
+    # -------------------------------------------------------------
+    # PHASE A: PREPARE (No project write lock held during execution)
+    # -------------------------------------------------------------
+    project = db.query(Project).filter(Project.id == data.project_id).first()
     if not project or project.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Read input snapshot: canonical screenplay hash, character details, location details
+    input_screenplay_hash = PipelineOrchestrator.compute_artifact_hash(db, data.project_id, "screenplay")
+    last_scene = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
+    next_num = (last_scene.scene_number + 1) if last_scene else 1
+
+    characters_data = []
+    if data.character_ids:
+        chars = db.query(Character).filter(Character.id.in_(data.character_ids)).all()
+        for c in chars:
+            characters_data.append({"name": c.name, "role": c.role, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics})
+    else:
+        chars = db.query(Character).filter(Character.project_id == data.project_id).limit(2).all()
+        for c in chars:
+            characters_data.append({"name": c.name, "role": c.role, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics})
+
+    loc_data = None
+    if data.location_id:
+        loc = db.query(Location).filter(Location.id == data.location_id).first()
+        if loc:
+            loc_data = {"name": loc.name, "time_of_day": loc.time_of_day, "lighting_setup": loc.lighting_setup}
 
     job_payload = {
         "project_id": data.project_id,
         "prompt": data.prompt,
         "character_ids": data.character_ids,
-        "location_id": data.location_id
+        "location_id": data.location_id,
+        "input_screenplay_hash": input_screenplay_hash
     }
+
     job, action = job_manager.prepare_or_claim_job(
         db=db,
         project_id=data.project_id,
@@ -160,30 +189,10 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
             detail=f"Screenplay generation job is already in progress (job_id: {job.id}). Please wait for completion."
         )
 
-    committed = False
+    # -------------------------------------------------------------
+    # PHASE B: AI EXECUTION (No lock held, no DB transaction open)
+    # -------------------------------------------------------------
     try:
-        last_scene = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
-        next_num = (last_scene.scene_number + 1) if last_scene else 1
-        next_order = (last_scene.order_index + 1) if last_scene else 1
-
-        # Gather character details
-        characters_data = []
-        if data.character_ids:
-            chars = db.query(Character).filter(Character.id.in_(data.character_ids)).all()
-            for c in chars:
-                characters_data.append({"name": c.name, "role": c.role, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics})
-        else:
-            chars = db.query(Character).filter(Character.project_id == data.project_id).limit(2).all()
-            for c in chars:
-                characters_data.append({"name": c.name, "role": c.role, "clothing": c.clothing, "facial_characteristics": c.facial_characteristics})
-
-        # Location details
-        loc_data = None
-        if data.location_id:
-            loc = db.query(Location).filter(Location.id == data.location_id).first()
-            if loc:
-                loc_data = {"name": loc.name, "time_of_day": loc.time_of_day, "lighting_setup": loc.lighting_setup}
-
         generated = screenwriter_agent.write_scene(
             project_title=project.name,
             genre=project.genre,
@@ -192,17 +201,29 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
             characters=characters_data,
             location=loc_data
         )
+    except Exception as ai_err:
+        try:
+            job_manager.fail_job(
+                db=db, job_id=job.id, error=ai_err,
+                worker_id=job.worker_id, fencing_token=job.fencing_token, commit=True
+            )
+        except Exception as fail_e:
+            logger.error(f"Failed to record job failure: {fail_e}")
+        if isinstance(ai_err, HTTPException):
+            raise ai_err
+        raise HTTPException(status_code=500, detail=f"AI generation failed: {sanitize_error_message(ai_err)}") from ai_err
 
-        # Extract genuine usage metadata (Gemini token counts or offline engine attribution)
-        gen_meta = (generated.get("_generation_metadata") if isinstance(generated, dict) else None) or {}
-        provider = gen_meta.get("provider", "offline_engine")
-        model = gen_meta.get("model", "offline-heuristic-v1")
-        input_tokens = gen_meta.get("input_tokens", 0)
-        output_tokens = gen_meta.get("output_tokens", 0)
-        engine_label = "Google Gemini" if provider == "gemini" else "Offline Studio Engine"
-        cost_details = f"{engine_label} Screenwriter: {data.prompt[:50] if data.prompt else 'Dramatic sequence'}"
+    # Extract usage metadata
+    gen_meta = (generated.get("_generation_metadata") if isinstance(generated, dict) else None) or {}
+    provider = gen_meta.get("provider", "offline_engine")
+    model = gen_meta.get("model", "offline-heuristic-v1")
+    input_tokens = gen_meta.get("input_tokens", 0)
+    output_tokens = gen_meta.get("output_tokens", 0)
+    engine_label = "Google Gemini" if provider == "gemini" else "Offline Studio Engine"
+    cost_details = f"{engine_label} Screenwriter: {data.prompt[:50] if data.prompt else 'Dramatic sequence'}"
 
-        # Authorize & charge with duplicate detection and accurate provider/model attribution
+    # Record charge idempotently in cost ledger (separately committed)
+    try:
         cost_controller.authorize_and_charge(
             db=db,
             project_id=data.project_id,
@@ -214,21 +235,75 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
             payload=job_payload,
             details=cost_details
         )
+    except HTTPException as budget_err:
+        try:
+            job_manager.fail_job(
+                db=db, job_id=job.id, error=budget_err,
+                worker_id=job.worker_id, fencing_token=job.fencing_token, commit=True
+            )
+        except Exception as fail_e:
+            logger.error(f"Failed to record job failure: {fail_e}")
+        raise budget_err
+    except Exception as charge_err:
+        try:
+            job_manager.fail_job(
+                db=db, job_id=job.id, error=charge_err,
+                worker_id=job.worker_id, fencing_token=job.fencing_token, commit=True
+            )
+        except Exception as fail_e:
+            logger.error(f"Failed to record job failure: {fail_e}")
+        raise HTTPException(status_code=500, detail=f"Cost authorization failed: {sanitize_error_message(charge_err)}") from charge_err
+
+    # -------------------------------------------------------------
+    # PHASE C: FINALIZE (Acquire project write lock, verify, commit)
+    # -------------------------------------------------------------
+    project = acquire_project_write_lock(db, data.project_id)
+    if not project or project.deleted_at is not None:
+        db.rollback()
+        try:
+            job_manager.fail_job(
+                db=db, job_id=job.id, error="Project was deleted during scene generation",
+                worker_id=job.worker_id, fencing_token=job.fencing_token, commit=True
+            )
+        except Exception as fail_e:
+            logger.error(f"Failed to record job failure: {fail_e}")
+        raise HTTPException(status_code=404, detail="Project not found or deleted")
+
+    # Verify input snapshot has not drifted
+    current_screenplay_hash = PipelineOrchestrator.compute_artifact_hash(db, data.project_id, "screenplay")
+    if current_screenplay_hash != input_screenplay_hash:
+        db.rollback()
+        try:
+            job_manager.fail_job(
+                db=db, job_id=job.id, error="Screenplay snapshot drifted during AI generation",
+                worker_id=job.worker_id, fencing_token=job.fencing_token, commit=True
+            )
+        except Exception as fail_e:
+            logger.error(f"Failed to record job failure: {fail_e}")
+        raise HTTPException(
+            status_code=409,
+            detail="Screenplay was modified while scene was being generated. Generation discarded."
+        )
+
+    committed = False
+    try:
+        last_scene_locked = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
+        final_num = (last_scene_locked.scene_number + 1) if last_scene_locked else 1
+        final_order = (last_scene_locked.order_index + 1) if last_scene_locked else 1
 
         scene = Scene(
             project_id=data.project_id,
-            scene_number=next_num,
+            scene_number=final_num,
             slugline=generated.get("slugline", "INT. UNKNOWN SET - NIGHT"),
-            title=generated.get("title", f"Scene {next_num}"),
+            title=generated.get("title", f"Scene {final_num}"),
             summary=generated.get("summary", ""),
             script_content=generated.get("script_content", ""),
             location_id=data.location_id,
             estimated_duration=generated.get("estimated_duration", 20),
             budget_limit=25.0,
-            order_index=next_order
+            order_index=final_order
         )
         db.add(scene)
-        # Invalidate downstream approvals/stages atomically in the same transaction
         PipelineOrchestrator.invalidate_downstream_stages(
             db=db, project_id=data.project_id, changed_stage="screenplay", commit=False
         )
@@ -240,16 +315,20 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
         committed = True
         db.refresh(scene)
         return scene
-    except Exception as e:
+    except Exception as fin_err:
         if not committed:
             db.rollback()
-            try:
-                job_manager.fail_job(db, job.id, e, worker_id=job.worker_id, fencing_token=job.fencing_token, commit=True)
-            except Exception as fail_err:
-                logger.error(f"Failed to record job failure for job {job.id}: {fail_err}")
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
+            if not isinstance(fin_err, JobOwnershipLostError):
+                try:
+                    job_manager.fail_job(
+                        db, job.id, fin_err,
+                        worker_id=job.worker_id, fencing_token=job.fencing_token, commit=True
+                    )
+                except Exception as fail_e:
+                    logger.error(f"Failed to record job failure for job {job.id}: {fail_e}")
+        if isinstance(fin_err, HTTPException):
+            raise fin_err
+        raise HTTPException(status_code=500, detail=sanitize_error_message(fin_err)) from fin_err
 
 @router.patch("/{scene_id}", response_model=SceneResponse)
 def update_scene(scene_id: str, data: SceneUpdate, db: Session = Depends(get_db)):

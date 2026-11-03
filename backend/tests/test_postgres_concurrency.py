@@ -728,24 +728,28 @@ def test_pg_concurrent_story_approval_with_barrier(pg_session_factory):
         assert audits[1].decision == winner_decision
 
 
-def test_pg_screenplay_mutation_vs_worker_completion_with_barrier(pg_session_factory):
+def test_pg_concurrency_case_a_worker_wins(pg_session_factory):
     """
-    Requirement 6B: PostgreSQL screenplay mutation vs worker completion.
-    - Worker begins executing on screenplay H1.
-    - Another transaction modifies screenplay to H2 and invalidates downstream stages.
-    - Controlled via barrier to verify worker H1 is strictly rejected from completing.
-    - Both StudioJob and PipelineStageState preserve valid uncorrupted states.
+    Requirement 5: Case A — Worker wins lock:
+    - Worker acquires project lock first.
+    - Mutation starts and must wait on project row lock.
+    - Worker completes stage on H1 successfully and commits.
+    - Mutation unblocks, mutates screenplay to H2, and invalidates stage.
+    - Final state: stage is STALE.
+    - Worker job maintains COMPLETED status of valid completed worker.
+    - Audit and hashes remain consistent.
     """
     import threading
-    from backend.app.models.entities import PipelineStageState, PipelineCheckpoint
-    from backend.app.services.pipeline_orchestrator import PipelineOrchestrator
-    from backend.app.services.job_manager import JobManager, JobOwnershipLostError
+    import time
+    from backend.app.models.entities import PipelineStageState
+    from backend.app.services.pipeline_orchestrator import PipelineOrchestrator, acquire_project_write_lock
+    from backend.app.services.job_manager import JobManager
     from backend.app.schemas.pipeline import CheckpointDecisionRequest
 
-    project_id = f"pg-mut-work-{uuid.uuid4().hex[:8]}"
+    project_id = f"pg-case-a-{uuid.uuid4().hex[:8]}"
 
     with pg_session_factory() as session:
-        proj = Project(id=project_id, name="PG Mutation vs Worker")
+        proj = Project(id=project_id, name="PG Case A Worker Wins")
         session.add(proj)
         session.commit()
         PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
@@ -754,7 +758,7 @@ def test_pg_screenplay_mutation_vs_worker_completion_with_barrier(pg_session_fac
             id=str(uuid.uuid4()),
             project_id=project_id,
             scene_number=1,
-            slugline="INT. BUNKER - DAY",
+            slugline="INT. LAB - DAY",
             script_content="H1 initial screenplay content.",
             order_index=1
         )
@@ -775,9 +779,8 @@ def test_pg_screenplay_mutation_vs_worker_completion_with_barrier(pg_session_fac
             )
         )
 
-        # Setup in-progress character_design stage with leased job
-        jm = JobManager()
-        worker_id = "pg-char-worker-01"
+        worker_id = "pg-worker-case-a"
+        jm = JobManager(worker_id=worker_id)
         job, action = jm.prepare_or_claim_job(
             db=session,
             project_id=project_id,
@@ -796,57 +799,212 @@ def test_pg_screenplay_mutation_vs_worker_completion_with_barrier(pg_session_fac
         session.commit()
         job_id = job.id
 
-    # Coordination: Mutation transaction finishes and commits first
-    mutation_done = threading.Event()
+    worker_locked = threading.Event()
+    mutation_attempting_lock = threading.Event()
+    worker_committed = threading.Event()
     worker_result = {}
+    mutation_result = {}
 
-    def mutation_worker():
-        with pg_session_factory() as sess:
-            # Acquire lock and mutate screenplay to H2
-            sc_to_edit = sess.query(Scene).filter(Scene.project_id == project_id).first()
-            sc_to_edit.script_content = "H2 radically modified content."
+    def worker_thread():
+        with pg_session_factory() as sess_w:
+            # 1. Acquire project write lock first (SELECT ... FOR UPDATE)
+            acquire_project_write_lock(sess_w, project_id)
+            worker_locked.set()
+
+            # Wait until mutation thread begins attempting to acquire the same lock
+            assert mutation_attempting_lock.wait(timeout=5.0)
+            time.sleep(0.2)  # Ensure mutation thread is blocked waiting for DB lock
+
+            # Complete stage on H1
+            PipelineOrchestrator.complete_pipeline_stage(
+                db=sess_w,
+                project_id=project_id,
+                stage_name="character_design",
+                active_job_id=job_id,
+                worker_id=worker_id,
+                fencing_token=fencing_token,
+                result_hash="res-char-case-a",
+                consumed_input_hash=h1
+            )
+            worker_committed.set()
+            worker_result["success"] = True
+
+    def mutation_thread():
+        assert worker_locked.wait(timeout=5.0)
+        with pg_session_factory() as sess_m:
+            mutation_attempting_lock.set()
+            # 2. This will BLOCK until worker_thread commits sess_w!
+            acquire_project_write_lock(sess_m, project_id)
+            assert worker_committed.wait(timeout=2.0), "Mutation unblocked before worker committed!"
+
+            # Mutate screenplay to H2 and invalidate downstream
+            sc_to_edit = sess_m.query(Scene).filter(Scene.project_id == project_id).first()
+            sc_to_edit.script_content = "H2 mutated screenplay content."
             PipelineOrchestrator.invalidate_downstream_stages(
-                db=sess,
+                db=sess_m,
                 project_id=project_id,
                 changed_stage="screenplay",
                 commit=False
             )
-            sess.commit()
-            mutation_done.set()
+            sess_m.commit()
+            mutation_result["success"] = True
 
-    def stage_completion_worker():
-        # Wait until mutation transaction has committed
-        mutation_done.wait(timeout=5.0)
-        with pg_session_factory() as sess:
+    t_w = threading.Thread(target=worker_thread)
+    t_m = threading.Thread(target=mutation_thread)
+    t_w.start()
+    t_m.start()
+    t_w.join(timeout=10.0)
+    t_m.join(timeout=10.0)
+
+    assert worker_result.get("success") is True
+    assert mutation_result.get("success") is True
+
+    with pg_session_factory() as session:
+        st = session.query(PipelineStageState).filter(
+            PipelineStageState.project_id == project_id,
+            PipelineStageState.stage_name == "character_design"
+        ).first()
+        # Stage is STALE because mutation invalidated it
+        assert st.status == "STALE"
+        assert st.active_job_id is None
+
+        # StudioJob preserves COMPLETED status from the valid worker
+        jb = session.query(StudioJob).filter(StudioJob.id == job_id).first()
+        assert jb.status == "COMPLETED"
+
+
+def test_pg_concurrency_case_b_mutation_wins(pg_session_factory):
+    """
+    Requirement 5: Case B — Mutation wins lock:
+    - Mutation acquires project lock first.
+    - Worker starts and must wait on project row lock.
+    - Mutation commits H2 and invalidates stage.
+    - Worker unblocks, attempts to complete on obsolete H1, and is rejected.
+    - Final state: stage is STALE.
+    - Old job is NOT COMPLETED.
+    """
+    import threading
+    import time
+    from backend.app.models.entities import PipelineStageState
+    from backend.app.services.pipeline_orchestrator import PipelineOrchestrator, acquire_project_write_lock
+    from backend.app.services.job_manager import JobManager, JobOwnershipLostError
+    from backend.app.schemas.pipeline import CheckpointDecisionRequest
+
+    project_id = f"pg-case-b-{uuid.uuid4().hex[:8]}"
+
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG Case B Mutation Wins")
+        session.add(proj)
+        session.commit()
+        PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+        sc = Scene(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            scene_number=1,
+            slugline="INT. BUNKER - NIGHT",
+            script_content="H1 initial screenplay content.",
+            order_index=1
+        )
+        session.add(sc)
+        session.commit()
+
+        sub = PipelineOrchestrator.submit_story_for_review(session, project_id)
+        h1 = sub["artifact_content_hash"]
+        v1 = sub["artifact_version"]
+
+        PipelineOrchestrator.record_story_decision(
+            session, project_id,
+            CheckpointDecisionRequest(
+                decision="APPROVED",
+                expected_artifact_version=v1,
+                expected_artifact_hash=h1,
+                reviewer_name="Director"
+            )
+        )
+
+        worker_id = "pg-worker-case-b"
+        jm = JobManager(worker_id=worker_id)
+        job, action = jm.prepare_or_claim_job(
+            db=session,
+            project_id=project_id,
+            job_type="character_generation",
+            payload={"screenplay_hash": h1}
+        )
+        fencing_token = job.fencing_token
+
+        stage = session.query(PipelineStageState).filter(
+            PipelineStageState.project_id == project_id,
+            PipelineStageState.stage_name == "character_design"
+        ).first()
+        stage.status = "IN_PROGRESS"
+        stage.active_job_id = job.id
+        stage.consumed_input_hash = h1
+        session.commit()
+        job_id = job.id
+
+    mutation_locked = threading.Event()
+    worker_attempting_lock = threading.Event()
+    mutation_committed = threading.Event()
+    worker_result = {}
+    mutation_result = {}
+
+    def mutation_thread():
+        with pg_session_factory() as sess_m:
+            # 1. Acquire project write lock first (SELECT ... FOR UPDATE)
+            acquire_project_write_lock(sess_m, project_id)
+            mutation_locked.set()
+
+            # Wait until worker begins attempting to complete stage
+            assert worker_attempting_lock.wait(timeout=5.0)
+            time.sleep(0.2)  # Ensure worker is blocked in complete_pipeline_stage waiting for lock
+
+            # Mutate screenplay to H2 and invalidate downstream stages
+            sc_to_edit = sess_m.query(Scene).filter(Scene.project_id == project_id).first()
+            sc_to_edit.script_content = "H2 radically modified screenplay."
+            PipelineOrchestrator.invalidate_downstream_stages(
+                db=sess_m,
+                project_id=project_id,
+                changed_stage="screenplay",
+                commit=False
+            )
+            sess_m.commit()
+            mutation_committed.set()
+            mutation_result["success"] = True
+
+    def worker_thread():
+        assert mutation_locked.wait(timeout=5.0)
+        with pg_session_factory() as sess_w:
+            worker_attempting_lock.set()
             try:
+                # 2. This will BLOCK until mutation_thread commits sess_m!
                 PipelineOrchestrator.complete_pipeline_stage(
-                    db=sess,
+                    db=sess_w,
                     project_id=project_id,
                     stage_name="character_design",
                     active_job_id=job_id,
                     worker_id=worker_id,
                     fencing_token=fencing_token,
-                    result_hash="res-char-h1",
+                    result_hash="res-char-case-b",
                     consumed_input_hash=h1
                 )
                 worker_result["completed"] = True
             except JobOwnershipLostError as e:
                 worker_result["completed"] = False
                 worker_result["error"] = str(e.detail)
+            assert mutation_committed.is_set(), "Worker unblocked before mutation committed!"
 
-    t_mut = threading.Thread(target=mutation_worker)
-    t_work = threading.Thread(target=stage_completion_worker)
+    t_m = threading.Thread(target=mutation_thread)
+    t_w = threading.Thread(target=worker_thread)
+    t_m.start()
+    t_w.start()
+    t_m.join(timeout=10.0)
+    t_w.join(timeout=10.0)
 
-    t_mut.start()
-    t_work.start()
-    t_mut.join(timeout=10.0)
-    t_work.join(timeout=10.0)
-
-    # Worker must be rejected because stage became STALE and input H1 != current H2
+    assert mutation_result.get("success") is True
     assert worker_result.get("completed") is False
     assert "stale" in worker_result.get("error", "").lower() or "obsolete" in worker_result.get("error", "").lower()
 
-    # Verify stage remains STALE and StudioJob was NOT completed
     with pg_session_factory() as session:
         st = session.query(PipelineStageState).filter(
             PipelineStageState.project_id == project_id,
@@ -855,6 +1013,7 @@ def test_pg_screenplay_mutation_vs_worker_completion_with_barrier(pg_session_fac
         assert st.status == "STALE"
         assert st.active_job_id is None
 
+        # StudioJob was NOT completed
         jb = session.query(StudioJob).filter(StudioJob.id == job_id).first()
         assert jb.status != "COMPLETED"
 

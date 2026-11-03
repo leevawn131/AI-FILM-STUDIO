@@ -9,6 +9,7 @@ Comprehensive Test Suite for S4 M2.2–M2.4:
 
 import os
 import uuid
+from datetime import datetime, timezone, timedelta
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -23,6 +24,8 @@ from backend.app.models.entities import (
 )
 from backend.app.services.pipeline_orchestrator import pipeline_orchestrator, PipelineOrchestrator
 from backend.app.services.gatekeeper import gatekeeper
+from backend.app.services.job_manager import JobManager, JobOwnershipLostError
+from backend.app.agents.screenwriter_agent import screenwriter_agent
 from backend.tests.test_postgres_concurrency import get_postgres_engine
 
 client = TestClient(app)
@@ -984,15 +987,20 @@ def test_sqlite_lock_acquisition_and_serialization(tmp_path):
 
         # 5. Calling acquire_project_write_lock when connection is already in an active un-locked transaction
         s3 = SessionFactory()
-        # Perform an INSERT to trigger active DBAPI transaction without write lock
-        s3.add(Project(id=str(uuid.uuid4()), name="Pre-existing Transaction"))
+        pre_id = str(uuid.uuid4())
+        s3.add(Project(id=pre_id, name="Pre-existing Transaction"))
         s3.flush()
         with pytest.raises(HTTPException) as exc_unlocked:
             acquire_project_write_lock(s3, proj_id)
         assert exc_unlocked.value.status_code == 409
-        assert "active transaction is already in progress" in str(exc_unlocked.value.detail).lower()
-        s3.rollback()
+        assert "caller transaction is already in progress" in str(exc_unlocked.value.detail).lower()
+        # Caller pending write was NOT lost -> caller can commit it successfully
+        s3.commit()
         s3.close()
+        with SessionFactory() as verify_s:
+            saved_p = verify_s.query(Project).filter(Project.id == pre_id).first()
+            assert saved_p is not None
+            assert saved_p.name == "Pre-existing Transaction"
     finally:
         s1.close()
         s2.close()
@@ -1099,8 +1107,8 @@ def test_final_commit_fault_injection_in_generate_ai_scene(test_db_session, monk
     def mock_commit(self):
         nonlocal commit_count
         commit_count += 1
-        # Commit 1 is prepare_or_claim_job. Commit 2 is final commit in generate_ai_scene.
-        if commit_count == 2:
+        # Commit 1 is prepare_or_claim_job. Commit 2 is authorize_and_charge. Commit 3 is final commit in generate_ai_scene.
+        if commit_count == 3:
             from sqlalchemy.exc import OperationalError
             raise OperationalError("Simulated disk I/O failure during final commit", {}, Exception())
         return orig_commit(self)
@@ -1121,4 +1129,374 @@ def test_final_commit_fault_injection_in_generate_ai_scene(test_db_session, monk
     ).first()
     assert failed_job is not None
     assert failed_job.status == "FAILED"
+
+
+def test_sqlite_lock_caller_pending_write_preserved_on_rejection(tmp_path):
+    """
+    Requirement 1 Test 1: Caller with pending write calls acquire_project_write_lock.
+    - Helper rejects with 409 because transaction is already active without write lock.
+    - Helper does NOT call db.rollback().
+    - Caller's pending write is preserved and can be committed.
+    """
+    from sqlalchemy.orm import sessionmaker
+    from backend.app.services.pipeline_orchestrator import acquire_project_write_lock
+
+    db_file = tmp_path / "sqlite_lock_pending_write.db"
+    db_url = f"sqlite:///{db_file}"
+    engine = create_engine(db_url)
+    run_migrations(target_engine=engine, db_url=db_url)
+    SessionFactory = sessionmaker(bind=engine)
+
+    proj_id = str(uuid.uuid4())
+    with SessionFactory() as s:
+        p = Project(id=proj_id, name="Main Project")
+        s.add(p)
+        s.commit()
+
+    caller_session = SessionFactory()
+    pending_proj_id = str(uuid.uuid4())
+    caller_session.add(Project(id=pending_proj_id, name="Pending Work"))
+    caller_session.flush()  # DBAPI transaction is now active
+
+    # Helper must reject WITHOUT rolling back caller_session
+    with pytest.raises(HTTPException) as exc:
+        acquire_project_write_lock(caller_session, proj_id)
+    assert exc.value.status_code == 409
+    assert "caller transaction is already in progress" in str(exc.value.detail).lower()
+
+    # Caller commits its own transaction
+    caller_session.commit()
+    caller_session.close()
+
+    # Verify pending work was committed and NOT lost
+    with SessionFactory() as verify_s:
+        saved = verify_s.query(Project).filter(Project.id == pending_proj_id).first()
+        assert saved is not None
+        assert saved.name == "Pending Work"
+
+    engine.dispose()
+
+
+def test_sqlite_lock_reentrancy_and_metadata_cleanup(tmp_path):
+    """
+    Requirement 1 Tests 3 & 5: Lock reentrancy and metadata cleanup.
+    - Demonstrates reentrant locking within the same active transaction.
+    - Demonstrates that lock metadata is cleared upon commit and rollback.
+    """
+    from sqlalchemy.orm import sessionmaker
+    from backend.app.services.pipeline_orchestrator import acquire_project_write_lock
+
+    db_file = tmp_path / "sqlite_lock_reentrancy.db"
+    db_url = f"sqlite:///{db_file}"
+    engine = create_engine(db_url)
+    run_migrations(target_engine=engine, db_url=db_url)
+    SessionFactory = sessionmaker(bind=engine)
+
+    p1_id = str(uuid.uuid4())
+    p2_id = str(uuid.uuid4())
+    with SessionFactory() as s:
+        s.add(Project(id=p1_id, name="Project 1"))
+        s.add(Project(id=p2_id, name="Project 2"))
+        s.commit()
+
+    s = SessionFactory()
+
+    # Tx 1: Acquire lock for Project 1
+    p1 = acquire_project_write_lock(s, p1_id)
+    assert p1 is not None
+    assert s.info.get("_active_sqlite_write_lock_tx") is not None
+    assert p1_id in s.info.get("_locked_projects", set())
+
+    # Reentrant call for Project 1 within same transaction succeeds
+    p1_again = acquire_project_write_lock(s, p1_id)
+    assert p1_again.id == p1_id
+
+    # Reentrant call for Project 2 within same transaction succeeds (DB is write-locked)
+    p2 = acquire_project_write_lock(s, p2_id)
+    assert p2.id == p2_id
+    assert p2_id in s.info.get("_locked_projects", set())
+
+    # Commit Tx 1 -> metadata must be cleared
+    s.commit()
+    assert s.info.get("_active_sqlite_write_lock_tx") is None
+    assert not s.info.get("_locked_projects")
+
+    # Tx 2: Acquire fresh lock in new transaction
+    p1_fresh = acquire_project_write_lock(s, p1_id)
+    assert p1_fresh is not None
+    assert s.info.get("_active_sqlite_write_lock_tx") is not None
+
+    # Rollback Tx 2 -> metadata must be cleared
+    s.rollback()
+    assert s.info.get("_active_sqlite_write_lock_tx") is None
+    assert not s.info.get("_locked_projects")
+
+    s.close()
+    engine.dispose()
+
+
+def test_ai_scene_generation_cost_idempotency_and_retry_after_final_failure(test_db_session, monkeypatch):
+    """
+    Requirement 3: AI succeeds, final commit fails -> retry with same identity does not double-charge.
+    - Phase A claims job.
+    - Phase B executes AI and records cost in ledger (committed independently).
+    - Phase C final commit is aborted by fault injection.
+    - Job is marked FAILED, but CostRecord remains intact (audit preserved).
+    - Client retries with exact same payload:
+      - Job retry is claimed (RUNNING).
+      - CostController detects operation_identity, returns existing record without double-charging!
+      - Final commit succeeds: scene created, job COMPLETED.
+      - Exactly 1 charge exists in cost ledger!
+    """
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Cost Idempotency Film", "budget_total": 100.0})
+    project_id = create_res.json()["id"]
+
+    orig_commit = Session.commit
+    commit_count = 0
+
+    def mock_commit(self):
+        nonlocal commit_count
+        commit_count += 1
+        # Commit 1: prepare_or_claim_job
+        # Commit 2: cost_controller.authorize_and_charge
+        # Commit 3: generate_ai_scene final commit -> FAIL
+        if commit_count == 3:
+            from sqlalchemy.exc import OperationalError
+            raise OperationalError("Simulated disk failure during final scene commit", {}, Exception())
+        return orig_commit(self)
+
+    monkeypatch.setattr(Session, "commit", mock_commit)
+
+    # Attempt 1: Fails at final commit
+    res1 = client.post("/api/scenes/generate", json={"project_id": project_id, "prompt": "Unique Scene Alpha"})
+    assert res1.status_code == 500
+
+    # Verify no scene was committed
+    scenes = client.get(f"/api/scenes/{project_id}").json()
+    assert len(scenes) == 0
+
+    # Verify job is FAILED
+    job = session.query(StudioJob).filter(StudioJob.project_id == project_id).first()
+    assert job is not None
+    assert job.status == "FAILED"
+
+    # Verify CostRecord exists (audit history preserved)
+    cost_records = session.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+    assert len(cost_records) == 1
+    first_record_id = cost_records[0].id
+
+    # Remove fault injection for Attempt 2 (Retry)
+    monkeypatch.setattr(Session, "commit", orig_commit)
+
+    # Attempt 2: Retry with exact same request
+    res2 = client.post("/api/scenes/generate", json={"project_id": project_id, "prompt": "Unique Scene Alpha"})
+    assert res2.status_code == 200
+
+    # Verify scene was committed
+    scenes_after = client.get(f"/api/scenes/{project_id}").json()
+    assert len(scenes_after) == 1
+    assert scenes_after[0]["id"] == res2.json()["id"]
+
+    # Verify job is now COMPLETED
+    session.expire_all()
+    job_after = session.query(StudioJob).filter(StudioJob.id == job.id).first()
+    assert job_after.status == "COMPLETED"
+
+    # Verify cost ledger has NO DUPLICATE CHARGE (still exactly 1 record!)
+    cost_records_after = session.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+    assert len(cost_records_after) == 1
+    assert cost_records_after[0].id == first_record_id
+
+
+def test_ai_scene_generation_snapshot_drift_rejected(test_db_session, monkeypatch):
+    """
+    Requirement 2: Snapshot drift defense in generate_ai_scene.
+    - AI generation begins based on input screenplay snapshot H1.
+    - Before finalization, screenplay is mutated to H2.
+    - Finalize phase detects snapshot drift and rejects stale generation with HTTP 409.
+    - Stale scene is not saved, job is marked FAILED.
+    """
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Drift Defense Film"})
+    project_id = create_res.json()["id"]
+
+    # Create Scene 1 (Screenplay hash H1)
+    s1 = Scene(
+        project_id=project_id,
+        scene_number=1,
+        slugline="INT. BASE - DAY",
+        script_content="H1 initial screenplay content.",
+        order_index=1
+    )
+    session.add(s1)
+    session.commit()
+
+    # Hook write_scene to simulate concurrent mutation during AI execution
+    orig_write_scene = screenwriter_agent.write_scene
+    def mutating_write_scene(*args, **kwargs):
+        # Concurrently edit Scene 1 to mutate screenplay to H2 while AI is thinking
+        with sessionmaker(bind=engine)() as s_mut:
+            sc = s_mut.query(Scene).filter(Scene.project_id == project_id).first()
+            sc.script_content = "H2 concurrently edited content."
+            s_mut.commit()
+        return orig_write_scene(*args, **kwargs)
+
+    monkeypatch.setattr(screenwriter_agent, "write_scene", mutating_write_scene)
+
+    gen_res = client.post("/api/scenes/generate", json={"project_id": project_id, "prompt": "Scene 2 attempted"})
+    assert gen_res.status_code == 409
+    assert "screenplay was modified" in gen_res.json()["detail"].lower()
+
+    # Verify only Scene 1 exists (stale generated scene was discarded)
+    scenes = client.get(f"/api/scenes/{project_id}").json()
+    assert len(scenes) == 1
+    assert scenes[0]["scene_number"] == 1
+
+
+def test_complete_pipeline_stage_mandatory_consumed_input_hash(test_db_session):
+    """
+    Requirement 4: Mandatory consumed_input_hash for stages dependent on screenplay.
+    - character_design, location_design, storyboard fail closed if consumed_input_hash is None.
+    - Fail closed if consumed_input_hash != current_screenplay_hash.
+    - Fail closed if stage.consumed_input_hash != consumed_input_hash.
+    - Succeeds when consumed_input_hash matches.
+    """
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Input Hash Validation Film"})
+    project_id = create_res.json()["id"]
+
+    # Add scene so screenplay has a canonical hash
+    sc = Scene(
+        project_id=project_id,
+        scene_number=1,
+        slugline="INT. LAB - DAY",
+        script_content="Canonical screenplay content.",
+        order_index=1
+    )
+    session.add(sc)
+    session.commit()
+
+    current_hash = PipelineOrchestrator.compute_artifact_hash(session, project_id, "screenplay")
+    assert current_hash is not None
+
+    for stage_name in ("character_design", "location_design", "storyboard"):
+        # Setup job and stage
+        jm = JobManager(worker_id=f"worker-{stage_name}")
+        job, action = jm.prepare_or_claim_job(
+            db=session, project_id=project_id, job_type=f"{stage_name}_gen", payload={"h": current_hash}
+        )
+
+        stage = session.query(PipelineStageState).filter(
+            PipelineStageState.project_id == project_id,
+            PipelineStageState.stage_name == stage_name
+        ).first()
+        stage.status = "IN_PROGRESS"
+        stage.active_job_id = job.id
+        stage.consumed_input_hash = current_hash
+        session.commit()
+
+        # 1. consumed_input_hash is None -> FAIL CLOSED
+        with pytest.raises(JobOwnershipLostError) as exc_none:
+            PipelineOrchestrator.complete_pipeline_stage(
+                db=session,
+                project_id=project_id,
+                stage_name=stage_name,
+                active_job_id=job.id,
+                worker_id=f"worker-{stage_name}",
+                fencing_token=job.fencing_token,
+                consumed_input_hash=None
+            )
+        assert "mandatory" in str(exc_none.value.detail).lower()
+
+        # 2. consumed_input_hash is obsolete/mismatched -> FAIL CLOSED
+        with pytest.raises(JobOwnershipLostError) as exc_mismatch:
+            PipelineOrchestrator.complete_pipeline_stage(
+                db=session,
+                project_id=project_id,
+                stage_name=stage_name,
+                active_job_id=job.id,
+                worker_id=f"worker-{stage_name}",
+                fencing_token=job.fencing_token,
+                consumed_input_hash="deadbeef" * 8
+            )
+        assert "obsolete" in str(exc_mismatch.value.detail).lower()
+
+        # 3. Matching consumed_input_hash -> SUCCEEDS
+        completed = PipelineOrchestrator.complete_pipeline_stage(
+            db=session,
+            project_id=project_id,
+            stage_name=stage_name,
+            active_job_id=job.id,
+            worker_id=f"worker-{stage_name}",
+            fencing_token=job.fencing_token,
+            result_hash=f"res-{stage_name}",
+            consumed_input_hash=current_hash
+        )
+        assert completed.status == "COMPLETED"
+
+
+def test_job_manager_worker_fencing_prevents_stale_worker_mutations(test_db_session):
+    """
+    Requirement 6: JobManager worker fencing test.
+    - Worker 1 claims job (fencing_token=1).
+    - Worker 1 lease expires.
+    - Worker 2 reclaims job (fencing_token=2).
+    - Worker 1 attempts complete_job with token 1 -> rejected with JobOwnershipLostError.
+    - Worker 1 attempts fail_job with token 1 -> rejected with JobOwnershipLostError.
+    - Worker 2 completes job with token 2 -> succeeds!
+    """
+    session, engine = test_db_session
+    create_res = client.post("/api/projects", json={"name": "Fencing Defense Film"})
+    project_id = create_res.json()["id"]
+
+    jm1 = JobManager(worker_id="worker-01")
+    job1, action1 = jm1.prepare_or_claim_job(
+        db=session, project_id=project_id, job_type="fenced_task", payload={"task": "process"}
+    )
+    assert job1.worker_id == "worker-01"
+    assert job1.fencing_token == 1
+
+    # Simulate Worker 1 lease expiry
+    job1.lease_expires_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=10)
+    session.commit()
+
+    # Worker 2 reclaims job
+    jm2 = JobManager(worker_id="worker-02")
+    job2, action2 = jm2.prepare_or_claim_job(
+        db=session, project_id=project_id, job_type="fenced_task", payload={"task": "process"}
+    )
+    assert action2 == "EXECUTE"
+    assert job2.worker_id == "worker-02"
+    assert job2.fencing_token == 2
+
+    # Stale Worker 1 attempts complete_job with token 1 -> REJECTED
+    with pytest.raises(JobOwnershipLostError):
+        jm1.complete_job(
+            db=session,
+            job_id=job1.id,
+            result={"output": "stale-worker-1"},
+            worker_id="worker-01",
+            fencing_token=1
+        )
+
+    # Stale Worker 1 attempts fail_job with token 1 -> REJECTED
+    with pytest.raises(JobOwnershipLostError):
+        jm1.fail_job(
+            db=session,
+            job_id=job1.id,
+            error=RuntimeError("Worker 1 crashed"),
+            worker_id="worker-01",
+            fencing_token=1
+        )
+
+    # Valid Worker 2 completes job with token 2 -> SUCCEEDS
+    completed_job = jm2.complete_job(
+        db=session,
+        job_id=job2.id,
+        result={"output": "valid-worker-2"},
+        worker_id="worker-02",
+        fencing_token=2
+    )
+    assert completed_job.status == "COMPLETED"
 
