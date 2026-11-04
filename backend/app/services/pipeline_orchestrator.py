@@ -194,7 +194,11 @@ def acquire_project_write_lock(db: Session, project_id: str) -> Optional[Project
         # Write lock acquired: record transaction identity
         db.info["_active_sqlite_write_lock_tx"] = db.get_transaction()
         db.info.setdefault("_locked_projects", set()).add(project_id)
-        project = db.query(Project).filter(Project.id == project_id).first()
+        try:
+            project = db.query(Project).filter(Project.id == project_id).first()
+        except Exception:
+            db.rollback()
+            raise
         return project
 
 

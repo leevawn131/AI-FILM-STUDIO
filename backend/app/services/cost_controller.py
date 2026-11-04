@@ -37,6 +37,14 @@ ACCOUNTING_OPERATIONS = {
         "default_flow_credits": 0.0,
         "default_estimated_cost": 0.0
     },
+    "script_generation": {
+        "provider": "gemini",
+        "default_model": settings.gemini_model,
+        "description": "Interactive screenplay drafting and dialogue generation",
+        "consumes_flow_credits": False,
+        "default_flow_credits": 0.0,
+        "default_estimated_cost": 0.0
+    },
     "storyboard_generation": {
         "provider": "gemini",
         "default_model": settings.gemini_model,
@@ -177,7 +185,9 @@ class CostController:
         resolved_provider = provider or op_meta.get("provider", "offline_engine")
         resolved_model = model or op_meta.get("default_model")
 
-        # 2. Composite deduplication check (Database-enforced Idempotency)
+        # 2. Composite deduplication check (Database-enforced Idempotency under Policy B)
+        # Policy B: Charges are incurred only for successful finalization.
+        # If a previous generation was refunded, a retry re-charges with a sequenced attempt identity.
         p_hash = CostController.compute_hash(payload) if payload else ""
         if payload and not allow_duplicate:
             op_id = CostController.compute_operation_identity(
@@ -192,7 +202,31 @@ class CostController:
                 CostRecord.operation_identity == op_id
             ).first()
             if existing:
-                return existing
+                # Check if this charge was compensated/refunded due to past finalization failure
+                refund = db.query(CostRecord).filter(
+                    CostRecord.operation_identity == f"refund_{existing.id}"
+                ).first()
+                if not refund:
+                    # Original charge is active and unrefunded -> idempotent return
+                    return existing
+
+                # The previous charge was refunded; this is a retry attempt that must be charged.
+                # Compute unique retry operation identity:
+                retry_count = db.query(CostRecord).filter(
+                    CostRecord.operation_identity.like(f"{op_id}:retry:%")
+                ).count()
+                op_id = f"{op_id}:retry:{retry_count + 1}"
+
+                # Check if this specific retry attempt was already recorded and unrefunded
+                retry_existing = db.query(CostRecord).filter(
+                    CostRecord.operation_identity == op_id
+                ).first()
+                if retry_existing:
+                    retry_refund = db.query(CostRecord).filter(
+                        CostRecord.operation_identity == f"refund_{retry_existing.id}"
+                    ).first()
+                    if not retry_refund:
+                        return retry_existing
         else:
             op_id = None
 
@@ -301,24 +335,38 @@ class CostController:
         reason: str = "generation_finalization_failed"
     ) -> Optional[CostRecord]:
         """
+        Policy B: Scene finalization failure compensation.
         Creates an immutable compensation/refund ledger entry and restores Project.budget_spent.
-        Preserves original CostRecord in audit history (never deleted).
+        - Idempotent: checks for existing refund by original_record.id.
+        - Concurrency safe: UniqueConstraint on operation_identity catches races and returns committed winner.
+        - Refund cannot exceed original charged amount.
+        - Preserves original CostRecord in audit history (never deleted).
         """
-        if not original_record or not original_record.cost_usd or original_record.cost_usd <= 0:
+        if not original_record:
             return None
 
-        refund_amount = original_record.cost_usd
-        stmt = (
-            update(Project)
-            .where(Project.id == project_id)
-            .values(
-                budget_spent=case(
-                    (Project.budget_spent - refund_amount < 0.0, 0.0),
-                    else_=Project.budget_spent - refund_amount
+        refund_op_id = f"refund_{original_record.id}"
+
+        # 1. Fast-path idempotency check: already refunded?
+        existing_refund = db.query(CostRecord).filter(
+            CostRecord.operation_identity == refund_op_id
+        ).first()
+        if existing_refund:
+            return existing_refund
+
+        refund_amount = max(0.0, float(original_record.cost_usd or 0.0))
+        if refund_amount > 0.0:
+            stmt = (
+                update(Project)
+                .where(Project.id == project_id)
+                .values(
+                    budget_spent=case(
+                        (Project.budget_spent - refund_amount < 0.0, 0.0),
+                        else_=Project.budget_spent - refund_amount
+                    )
                 )
             )
-        )
-        db.execute(stmt)
+            db.execute(stmt)
 
         refund_record = CostRecord(
             project_id=project_id,
@@ -333,13 +381,23 @@ class CostController:
             actual_cost=-refund_amount if original_record.actual_cost_known else None,
             actual_cost_known=original_record.actual_cost_known,
             currency=original_record.currency or "USD",
-            operation_identity=f"refund_{original_record.id}",
+            operation_identity=refund_op_id,
             details=f"Compensation refund for cost record {original_record.id}: {reason}"
         )
         db.add(refund_record)
-        db.commit()
-        db.refresh(refund_record)
-        return refund_record
+        try:
+            db.commit()
+            db.refresh(refund_record)
+            return refund_record
+        except IntegrityError:
+            db.rollback()
+            # Concurrent race condition: another thread committed the refund
+            existing = db.query(CostRecord).filter(
+                CostRecord.operation_identity == refund_op_id
+            ).first()
+            if existing:
+                return existing
+            raise
 
     @staticmethod
     def record_flow_credit_usage(

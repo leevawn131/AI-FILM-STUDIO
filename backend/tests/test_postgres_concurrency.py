@@ -728,7 +728,26 @@ def test_pg_concurrent_story_approval_with_barrier(pg_session_factory):
         assert audits[1].decision == winner_decision
 
 
-def test_pg_concurrency_case_a_worker_wins(pg_session_factory):
+def wait_for_row_lock_waiter(engine, waiter_pid: int, timeout: float = 5.0) -> bool:
+    """
+    Deterministically verifies that the PostgreSQL backend session (waiter_pid)
+    is genuinely blocked waiting for a lock (granted = false in pg_locks).
+    Eliminates race conditions and avoids arbitrary sleep-based waits.
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        with engine.connect() as conn:
+            blocked = conn.execute(
+                text("SELECT 1 FROM pg_locks WHERE pid = :pid AND granted = false"),
+                {"pid": waiter_pid}
+            ).scalar()
+            if blocked:
+                return True
+        time.sleep(0.01)
+    raise TimeoutError(f"PID {waiter_pid} was not observed waiting for row lock within {timeout}s")
+
+
+def test_pg_concurrency_case_a_worker_wins(pg_engine, pg_session_factory):
     """
     Requirement 5: Case A — Worker wins lock:
     - Worker acquires project lock first.
@@ -740,8 +759,7 @@ def test_pg_concurrency_case_a_worker_wins(pg_session_factory):
     - Audit and hashes remain consistent.
     """
     import threading
-    import time
-    from backend.app.models.entities import PipelineStageState
+    from backend.app.models.entities import PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit
     from backend.app.services.pipeline_orchestrator import PipelineOrchestrator, acquire_project_write_lock
     from backend.app.services.job_manager import JobManager
     from backend.app.schemas.pipeline import CheckpointDecisionRequest
@@ -802,52 +820,65 @@ def test_pg_concurrency_case_a_worker_wins(pg_session_factory):
     worker_locked = threading.Event()
     mutation_attempting_lock = threading.Event()
     worker_committed = threading.Event()
+    mutation_pid_holder = {}
+    thread_exceptions = []
     worker_result = {}
     mutation_result = {}
 
     def worker_thread():
-        with pg_session_factory() as sess_w:
-            # 1. Acquire project write lock first (SELECT ... FOR UPDATE)
-            acquire_project_write_lock(sess_w, project_id)
-            worker_locked.set()
+        try:
+            with pg_session_factory() as sess_w:
+                # 1. Acquire project write lock first (SELECT ... FOR UPDATE)
+                acquire_project_write_lock(sess_w, project_id)
+                worker_locked.set()
 
-            # Wait until mutation thread begins attempting to acquire the same lock
-            assert mutation_attempting_lock.wait(timeout=5.0)
-            time.sleep(0.2)  # Ensure mutation thread is blocked waiting for DB lock
+                # Wait until mutation thread obtains PID and attempts to acquire the same lock
+                assert mutation_attempting_lock.wait(timeout=5.0)
+                mutation_pid = mutation_pid_holder["pid"]
+                wait_for_row_lock_waiter(pg_engine, mutation_pid)
 
-            # Complete stage on H1
-            PipelineOrchestrator.complete_pipeline_stage(
-                db=sess_w,
-                project_id=project_id,
-                stage_name="character_design",
-                active_job_id=job_id,
-                worker_id=worker_id,
-                fencing_token=fencing_token,
-                result_hash="res-char-case-a",
-                consumed_input_hash=h1
-            )
-            worker_committed.set()
-            worker_result["success"] = True
+                # Complete stage on H1
+                PipelineOrchestrator.complete_pipeline_stage(
+                    db=sess_w,
+                    project_id=project_id,
+                    stage_name="character_design",
+                    active_job_id=job_id,
+                    worker_id=worker_id,
+                    fencing_token=fencing_token,
+                    result_hash="res-char-case-a",
+                    consumed_input_hash=h1
+                )
+                worker_committed.set()
+                worker_result["success"] = True
+        except Exception as exc:
+            thread_exceptions.append(exc)
+            raise
 
     def mutation_thread():
-        assert worker_locked.wait(timeout=5.0)
-        with pg_session_factory() as sess_m:
-            mutation_attempting_lock.set()
-            # 2. This will BLOCK until worker_thread commits sess_w!
-            acquire_project_write_lock(sess_m, project_id)
-            assert worker_committed.wait(timeout=2.0), "Mutation unblocked before worker committed!"
+        try:
+            assert worker_locked.wait(timeout=5.0)
+            with pg_session_factory() as sess_m:
+                pid = sess_m.execute(text("SELECT pg_backend_pid()")).scalar()
+                mutation_pid_holder["pid"] = pid
+                mutation_attempting_lock.set()
+                # 2. This will BLOCK until worker_thread commits sess_w!
+                acquire_project_write_lock(sess_m, project_id)
+                assert worker_committed.wait(timeout=2.0), "Mutation unblocked before worker committed!"
 
-            # Mutate screenplay to H2 and invalidate downstream
-            sc_to_edit = sess_m.query(Scene).filter(Scene.project_id == project_id).first()
-            sc_to_edit.script_content = "H2 mutated screenplay content."
-            PipelineOrchestrator.invalidate_downstream_stages(
-                db=sess_m,
-                project_id=project_id,
-                changed_stage="screenplay",
-                commit=False
-            )
-            sess_m.commit()
-            mutation_result["success"] = True
+                # Mutate screenplay to H2 and invalidate downstream
+                sc_to_edit = sess_m.query(Scene).filter(Scene.project_id == project_id).first()
+                sc_to_edit.script_content = "H2 mutated screenplay content."
+                PipelineOrchestrator.invalidate_downstream_stages(
+                    db=sess_m,
+                    project_id=project_id,
+                    changed_stage="screenplay",
+                    commit=False
+                )
+                sess_m.commit()
+                mutation_result["success"] = True
+        except Exception as exc:
+            thread_exceptions.append(exc)
+            raise
 
     t_w = threading.Thread(target=worker_thread)
     t_m = threading.Thread(target=mutation_thread)
@@ -855,6 +886,9 @@ def test_pg_concurrency_case_a_worker_wins(pg_session_factory):
     t_m.start()
     t_w.join(timeout=10.0)
     t_m.join(timeout=10.0)
+
+    if thread_exceptions:
+        raise thread_exceptions[0]
 
     assert worker_result.get("success") is True
     assert mutation_result.get("success") is True
@@ -872,8 +906,24 @@ def test_pg_concurrency_case_a_worker_wins(pg_session_factory):
         jb = session.query(StudioJob).filter(StudioJob.id == job_id).first()
         assert jb.status == "COMPLETED"
 
+        # Checkpoint is STALE
+        cp = session.query(PipelineCheckpoint).filter(
+            PipelineCheckpoint.project_id == project_id,
+            PipelineCheckpoint.checkpoint_type == "story_approval"
+        ).first()
+        assert cp.status == "STALE"
 
-def test_pg_concurrency_case_b_mutation_wins(pg_session_factory):
+        # Invalidation audit recorded with H1 and V1
+        inv_audit = session.query(PipelineCheckpointAudit).filter(
+            PipelineCheckpointAudit.project_id == project_id,
+            PipelineCheckpointAudit.decision == "INVALIDATED"
+        ).first()
+        assert inv_audit is not None
+        assert inv_audit.artifact_content_hash == h1
+        assert inv_audit.artifact_version == v1
+
+
+def test_pg_concurrency_case_b_mutation_wins(pg_engine, pg_session_factory):
     """
     Requirement 5: Case B — Mutation wins lock:
     - Mutation acquires project lock first.
@@ -884,8 +934,7 @@ def test_pg_concurrency_case_b_mutation_wins(pg_session_factory):
     - Old job is NOT COMPLETED.
     """
     import threading
-    import time
-    from backend.app.models.entities import PipelineStageState
+    from backend.app.models.entities import PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit
     from backend.app.services.pipeline_orchestrator import PipelineOrchestrator, acquire_project_write_lock
     from backend.app.services.job_manager import JobManager, JobOwnershipLostError
     from backend.app.schemas.pipeline import CheckpointDecisionRequest
@@ -946,53 +995,66 @@ def test_pg_concurrency_case_b_mutation_wins(pg_session_factory):
     mutation_locked = threading.Event()
     worker_attempting_lock = threading.Event()
     mutation_committed = threading.Event()
+    worker_pid_holder = {}
+    thread_exceptions = []
     worker_result = {}
     mutation_result = {}
 
     def mutation_thread():
-        with pg_session_factory() as sess_m:
-            # 1. Acquire project write lock first (SELECT ... FOR UPDATE)
-            acquire_project_write_lock(sess_m, project_id)
-            mutation_locked.set()
+        try:
+            with pg_session_factory() as sess_m:
+                # 1. Acquire project write lock first (SELECT ... FOR UPDATE)
+                acquire_project_write_lock(sess_m, project_id)
+                mutation_locked.set()
 
-            # Wait until worker begins attempting to complete stage
-            assert worker_attempting_lock.wait(timeout=5.0)
-            time.sleep(0.2)  # Ensure worker is blocked in complete_pipeline_stage waiting for lock
+                # Wait until worker begins attempting to complete stage
+                assert worker_attempting_lock.wait(timeout=5.0)
+                worker_pid = worker_pid_holder["pid"]
+                wait_for_row_lock_waiter(pg_engine, worker_pid)
 
-            # Mutate screenplay to H2 and invalidate downstream stages
-            sc_to_edit = sess_m.query(Scene).filter(Scene.project_id == project_id).first()
-            sc_to_edit.script_content = "H2 radically modified screenplay."
-            PipelineOrchestrator.invalidate_downstream_stages(
-                db=sess_m,
-                project_id=project_id,
-                changed_stage="screenplay",
-                commit=False
-            )
-            sess_m.commit()
-            mutation_committed.set()
-            mutation_result["success"] = True
+                # Mutate screenplay to H2 and invalidate downstream stages
+                sc_to_edit = sess_m.query(Scene).filter(Scene.project_id == project_id).first()
+                sc_to_edit.script_content = "H2 radically modified screenplay."
+                PipelineOrchestrator.invalidate_downstream_stages(
+                    db=sess_m,
+                    project_id=project_id,
+                    changed_stage="screenplay",
+                    commit=False
+                )
+                sess_m.commit()
+                mutation_committed.set()
+                mutation_result["success"] = True
+        except Exception as exc:
+            thread_exceptions.append(exc)
+            raise
 
     def worker_thread():
-        assert mutation_locked.wait(timeout=5.0)
-        with pg_session_factory() as sess_w:
-            worker_attempting_lock.set()
-            try:
-                # 2. This will BLOCK until mutation_thread commits sess_m!
-                PipelineOrchestrator.complete_pipeline_stage(
-                    db=sess_w,
-                    project_id=project_id,
-                    stage_name="character_design",
-                    active_job_id=job_id,
-                    worker_id=worker_id,
-                    fencing_token=fencing_token,
-                    result_hash="res-char-case-b",
-                    consumed_input_hash=h1
-                )
-                worker_result["completed"] = True
-            except JobOwnershipLostError as e:
-                worker_result["completed"] = False
-                worker_result["error"] = str(e.detail)
-            assert mutation_committed.is_set(), "Worker unblocked before mutation committed!"
+        try:
+            assert mutation_locked.wait(timeout=5.0)
+            with pg_session_factory() as sess_w:
+                pid = sess_w.execute(text("SELECT pg_backend_pid()")).scalar()
+                worker_pid_holder["pid"] = pid
+                worker_attempting_lock.set()
+                try:
+                    # 2. This will BLOCK until mutation_thread commits sess_m!
+                    PipelineOrchestrator.complete_pipeline_stage(
+                        db=sess_w,
+                        project_id=project_id,
+                        stage_name="character_design",
+                        active_job_id=job_id,
+                        worker_id=worker_id,
+                        fencing_token=fencing_token,
+                        result_hash="res-char-case-b",
+                        consumed_input_hash=h1
+                    )
+                    worker_result["completed"] = True
+                except JobOwnershipLostError as e:
+                    worker_result["completed"] = False
+                    worker_result["error"] = str(e.detail)
+                assert mutation_committed.is_set(), "Worker unblocked before mutation committed!"
+        except Exception as exc:
+            thread_exceptions.append(exc)
+            raise
 
     t_m = threading.Thread(target=mutation_thread)
     t_w = threading.Thread(target=worker_thread)
@@ -1000,6 +1062,9 @@ def test_pg_concurrency_case_b_mutation_wins(pg_session_factory):
     t_w.start()
     t_m.join(timeout=10.0)
     t_w.join(timeout=10.0)
+
+    if thread_exceptions:
+        raise thread_exceptions[0]
 
     assert mutation_result.get("success") is True
     assert worker_result.get("completed") is False
@@ -1016,6 +1081,22 @@ def test_pg_concurrency_case_b_mutation_wins(pg_session_factory):
         # StudioJob was NOT completed
         jb = session.query(StudioJob).filter(StudioJob.id == job_id).first()
         assert jb.status != "COMPLETED"
+
+        # Checkpoint is STALE
+        cp = session.query(PipelineCheckpoint).filter(
+            PipelineCheckpoint.project_id == project_id,
+            PipelineCheckpoint.checkpoint_type == "story_approval"
+        ).first()
+        assert cp.status == "STALE"
+
+        # Invalidation audit recorded with H1 and V1
+        inv_audit = session.query(PipelineCheckpointAudit).filter(
+            PipelineCheckpointAudit.project_id == project_id,
+            PipelineCheckpointAudit.decision == "INVALIDATED"
+        ).first()
+        assert inv_audit is not None
+        assert inv_audit.artifact_content_hash == h1
+        assert inv_audit.artifact_version == v1
 
 
 

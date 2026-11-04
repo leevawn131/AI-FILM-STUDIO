@@ -282,6 +282,11 @@ class JobManager:
         if not job:
             raise JobOwnershipLostError(f"Job '{job_id}' no longer exists.")
 
+        try:
+            db.refresh(job)
+        except Exception:
+            pass
+
         if job.status not in ("RUNNING", "PENDING"):
             raise JobOwnershipLostError(
                 f"Job '{job_id}' is no longer active (status: {job.status}). Worker '{target_worker}' must abort."
