@@ -25,6 +25,9 @@ def list_project_media(project_id: str, db: Session = Depends(get_db)):
         res.append({
             "id": a.id,
             "project_id": a.project_id,
+            "shot_id": a.shot_id,
+            "version": a.version or 1,
+            "status": a.status or "ready",
             "filename": a.filename,
             "file_path": a.file_path,
             "media_type": a.media_type,
@@ -93,6 +96,9 @@ async def upload_media_file(project_id: str, file: UploadFile = File(...), db: S
     return {
         "id": asset.id,
         "project_id": asset.project_id,
+        "shot_id": asset.shot_id,
+        "version": asset.version or 1,
+        "status": asset.status or "ready",
         "filename": asset.filename,
         "file_path": asset.file_path,
         "media_type": asset.media_type,
@@ -144,6 +150,7 @@ def link_asset_to_shot(asset_id: str, req: LinkShotRequest, db: Session = Depend
         raise HTTPException(status_code=404, detail="Shot not found")
 
     asset.auto_matched_shot_id = shot.id
+    asset.shot_id = shot.id
     shot.video_asset_id = asset.id
     shot.generation_status = "imported"
     shot.thumbnail_path = asset.thumbnail_path

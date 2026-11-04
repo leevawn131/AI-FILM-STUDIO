@@ -22,6 +22,7 @@ from backend.app.services.job_manager import (
     DEFAULT_LEASE_SECONDS
 )
 from backend.app.services.pipeline_orchestrator import PipelineOrchestrator, acquire_project_write_lock
+from backend.app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -382,8 +383,16 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
     }
     idempotency_key = compute_idempotency_key(data.project_id, "screenplay_generate", request_identity_payload)
 
-    target_provider = "gemini" if gemini_service.has_gemini else "offline_engine"
-    target_model = gemini_service.model if gemini_service.has_gemini else "offline-studio-engine"
+    if gemini_service.has_gemini:
+        target_provider = "gemini"
+        target_model = gemini_service.model
+    elif settings.ai_provider == "ollama":
+        target_provider = "ollama"
+        target_model = settings.ollama_model
+    else:
+        target_provider = "offline_engine"
+        target_model = "offline-studio-engine"
+
     generation_config = {
         "agent": "screenwriter_agent",
         "provider": target_provider,
@@ -409,7 +418,7 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
                 try:
                     cached_res = json.loads(existing_job.result) if isinstance(existing_job.result, str) else existing_job.result
                     cached_provider = cached_res.get("effective_provider")
-                    if cached_provider and cached_provider != target_provider:
+                    if cached_provider and cached_provider != target_provider and target_provider == "gemini":
                         logger.info(
                             f"Existing completed job {existing_job.id} used provider {cached_provider}, "
                             f"but current runtime provider is {target_provider}. Re-executing generation."
@@ -656,7 +665,8 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
             db=db,
             project_id=data.project_id,
             action_type="script_generation",
-            provider=effective_provider,
+            provider=target_provider,
+            effective_provider=effective_provider,
             model=effective_model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,

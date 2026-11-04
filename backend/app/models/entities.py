@@ -138,6 +138,7 @@ class Shot(Base):
     project = relationship("Project", back_populates="shots")
     scene = relationship("Scene", back_populates="shots")
     video_asset = relationship("MediaAsset", foreign_keys=[video_asset_id])
+    media_versions = relationship("MediaAsset", foreign_keys="[MediaAsset.shot_id]", back_populates="shot")
 
 
 class MediaAsset(Base):
@@ -145,6 +146,9 @@ class MediaAsset(Base):
 
     id = Column(String(36), primary_key=True, default=gen_uuid)
     project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    shot_id = Column(String(36), ForeignKey("shots.id", ondelete="SET NULL"), nullable=True)
+    version = Column(Integer, default=1)
+    status = Column(String(32), default="ready") # imported, processing, ready, failed, missing_file
     filename = Column(String(256), nullable=False)
     file_path = Column(String(512), nullable=False)
     media_type = Column(String(32), default="video") # video, image, audio
@@ -162,6 +166,7 @@ class MediaAsset(Base):
     created_at = Column(DateTime, default=utc_now)
 
     project = relationship("Project", back_populates="media_assets")
+    shot = relationship("Shot", foreign_keys=[shot_id], back_populates="media_versions")
 
 
 class AudioTrack(Base):
@@ -174,6 +179,8 @@ class AudioTrack(Base):
     file_path = Column(String(512), nullable=False)
     duration_seconds = Column(Float, default=0.0)
     start_time_seconds = Column(Float, default=0.0)
+    fade_in_seconds = Column(Float, default=0.0)
+    fade_out_seconds = Column(Float, default=0.0)
     volume_level = Column(Float, default=1.0) # 0.0 to 2.0
     ducking_enabled = Column(Boolean, default=False)
     ducking_level = Column(Float, default=0.25)
@@ -228,11 +235,13 @@ class ExportJob(Base):
     id = Column(String(36), primary_key=True, default=gen_uuid)
     project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     preset_name = Column(String(64), default="1080p_cinematic")
+    render_mode = Column(String(32), default="final") # preview, final
+    allow_placeholders = Column(Boolean, default=False)
     resolution = Column(String(32), default="1920x1080")
     aspect_ratio = Column(String(16), default="16:9")
     fps = Column(Integer, default=24)
     include_subtitles = Column(Boolean, default=False)
-    status = Column(String(32), default="queued") # queued, rendering, completed, failed
+    status = Column(String(32), default="queued") # queued, rendering, completed, failed, cancelled
     progress_pct = Column(Integer, default=0)
     output_path = Column(String(512), default="")
     file_size_bytes = Column(Integer, default=0)

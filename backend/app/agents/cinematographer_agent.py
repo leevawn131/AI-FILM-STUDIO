@@ -1,10 +1,15 @@
 """
 Cinematographer Agent.
-Specializes in optical camera specs, anamorphic lenses, lighting schemes,
-color grading anchors, and Google Flow video prompt formulation.
+Specializes in optical camera specifications, anamorphic lenses, lighting schemes,
+framing, composition, color grading anchors, and Google Flow video prompt formulation.
 """
 
+import logging
 from typing import Dict, Any, Optional
+from backend.app.services.ai_provider import get_ai_provider
+from backend.app.services.structured_output import CinematographyOutput
+
+logger = logging.getLogger("cinematographer_agent")
 
 LENS_PROFILES = {
     "Wide Establishing Shot": "24mm wide angle cinema lens, deep depth of field, sharp architectural geometry",
@@ -14,6 +19,7 @@ LENS_PROFILES = {
     "Low Angle Heroic Dutch Tilt": "28mm wide anamorphic lens, dynamic vertical perspective, dramatic lens flare"
 }
 
+
 class CinematographerAgent:
     def optimize_flow_prompt(
         self,
@@ -22,30 +28,65 @@ class CinematographerAgent:
         visual_description: str,
         lighting: str,
         visual_style: Optional[str] = None,
-        character_anchors: Optional[str] = None
-    ) -> Dict[str, str]:
-        """Crafts a cinematic prompt optimized specifically for Google Flow."""
-        lens = LENS_PROFILES.get(camera_angle, "35mm anamorphic lens, cinema prime")
+        character_anchors: Optional[str] = None,
+        provider_preference: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Crafts a professional cinematography prompt optimized specifically for Google Flow
+        using the active AI provider or deterministic optical lens formulas.
+        """
+        provider = get_ai_provider(provider_preference)
         style = visual_style or "35mm film grain, 8k cinematic masterpiece, photorealistic, natural lighting, high dynamic range"
-
         chars_str = f" Subjects: {character_anchors}." if character_anchors else ""
 
-        flow_prompt = (
-            f"{camera_angle}, {camera_movement}. "
-            f"{visual_description}.{chars_str} "
-            f"Lens: {lens}. "
-            f"Lighting: {lighting}. "
-            f"Style: {style}. Film still, masterpiece quality, color graded."
+        user_prompt = (
+            f"Camera Angle: {camera_angle}\n"
+            f"Camera Movement: {camera_movement}\n"
+            f"Action/Description: {visual_description}\n"
+            f"Lighting: {lighting}\n"
+            f"Visual Style: {style}\n"
+            f"{chars_str}\n"
+            "Formulate the ultimate cinematic Google Flow video prompt including camera body, lens, framing, lighting, and negative prompt."
         )
 
-        negative_prompt = (
-            "blurry, cartoon, 3d render, low resolution, oversaturated, deformed face, "
-            "extra limbs, watermark, text overlay, floating artifacts, jerky movement"
-        )
+        try:
+            profile, meta = provider.generate_structured(
+                prompt=user_prompt,
+                schema=CinematographyOutput,
+                system_prompt="You are a master Hollywood Director of Photography (DP). Formulate precise optical camera specs and prompts."
+            )
+            return {
+                "video_prompt": profile.video_prompt,
+                "negative_prompt": profile.negative_prompt,
+                "camera": profile.camera,
+                "lens": profile.lens,
+                "lighting": profile.lighting,
+                "composition": profile.composition,
+                "color_palette": profile.color_palette,
+                "_generation_metadata": meta
+            }
+        except Exception as e:
+            logger.debug(f"AI cinematography optimization fallback: {e}")
+            lens = LENS_PROFILES.get(camera_angle, "35mm anamorphic cinema prime lens")
+            flow_prompt = (
+                f"{camera_angle}, {camera_movement}. "
+                f"{visual_description}.{chars_str} "
+                f"Lens: {lens}. "
+                f"Lighting: {lighting}. "
+                f"Style: {style}. Film still, masterpiece quality, color graded."
+            )
+            negative_prompt = (
+                "blurry, cartoon, 3d render, low resolution, oversaturated, deformed face, "
+                "extra limbs, watermark, text overlay, floating artifacts, jerky movement"
+            )
+            from backend.app.services.ai_provider import OfflineTemplateProvider
+            offline_meta = OfflineTemplateProvider()._meta()
+            return {
+                "video_prompt": flow_prompt,
+                "negative_prompt": negative_prompt,
+                "lens": lens,
+                "_generation_metadata": offline_meta
+            }
 
-        return {
-            "video_prompt": flow_prompt,
-            "negative_prompt": negative_prompt
-        }
 
 cinematographer_agent = CinematographerAgent()

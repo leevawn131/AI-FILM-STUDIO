@@ -30,15 +30,28 @@ export const App: React.FC = () => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [loading, setLoading] = useState(true);
 
+  const handleSelectProject = (project: Project | null) => {
+    setActiveProject(project);
+    if (project) {
+      localStorage.setItem('ai_film_studio_active_project_id', project.id);
+    } else {
+      localStorage.removeItem('ai_film_studio_active_project_id');
+    }
+  };
+
   const loadProjects = async () => {
     try {
       const list = await fetchProjects();
       setProjects(list);
       if (list.length > 0) {
-        // preserve existing active project if possible
         setActiveProject((prev) => {
           if (prev) {
             const found = list.find((p) => p.id === prev.id);
+            if (found) return found;
+          }
+          const savedId = localStorage.getItem('ai_film_studio_active_project_id');
+          if (savedId) {
+            const found = list.find((p) => p.id === savedId);
             if (found) return found;
           }
           return list[0];
@@ -82,7 +95,7 @@ export const App: React.FC = () => {
         onSelectView={setCurrentView}
         projects={projects}
         activeProject={activeProject}
-        onSelectProject={setActiveProject}
+        onSelectProject={handleSelectProject}
         onOpenNewProjectModal={() => setIsModalOpen(true)}
       />
 
@@ -108,7 +121,7 @@ export const App: React.FC = () => {
                   projects={projects}
                   stats={stats}
                   onSelectView={setCurrentView}
-                  onSelectProject={setActiveProject}
+                  onSelectProject={handleSelectProject}
                   onOpenNewProjectModal={() => setIsModalOpen(true)}
                 />
               )}
@@ -117,7 +130,7 @@ export const App: React.FC = () => {
                 <ProjectsView
                   projects={projects}
                   activeProject={activeProject}
-                  onSelectProject={setActiveProject}
+                  onSelectProject={handleSelectProject}
                   onRefresh={loadProjects}
                   onOpenNewProjectModal={() => setIsModalOpen(true)}
                 />

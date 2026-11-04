@@ -1,7 +1,10 @@
 """
-Gemini Service with seamless local Offline Studio Engine fallback.
-Provides access to Google Gemini when configured, and falls back to
-local offline creative filmmaking generation when offline or no API key is set.
+AI Generation Service with Ollama local engine, Google Gemini, and Offline Studio Engine.
+Enforces:
+- Local Ollama execution by default (zero external cost, offline private processing)
+- Google Gemini when configured with GEMINI_API_KEY
+- Seamless fallback to Offline Studio Engine with explicit metadata
+- Accurate attribution of provider, model, tokens, and fallback status
 """
 
 import logging
@@ -10,8 +13,13 @@ import os
 from typing import List, Dict, Any, Optional
 from backend.app.config import settings
 from backend.app.services.offline_ai_engine import offline_ai
+from backend.app.services.structured_output import (
+    ScreenplaySceneOutput,
+    SceneBreakdownOutput
+)
 
 logger = logging.getLogger("gemini_service")
+
 
 def extract_gemini_usage(response: Any, model_name: str) -> Dict[str, Any]:
     """
@@ -43,6 +51,7 @@ def extract_gemini_usage(response: Any, model_name: str) -> Dict[str, Any]:
         "engine_label": "Google Gemini"
     }
 
+
 def get_offline_usage() -> Dict[str, Any]:
     """Returns explicit metadata for local offline heuristics."""
     return {
@@ -55,6 +64,7 @@ def get_offline_usage() -> Dict[str, Any]:
         "is_fallback": True,
         "engine_label": "Offline Studio Engine"
     }
+
 
 class GeminiService:
     def __init__(self):
@@ -69,7 +79,7 @@ class GeminiService:
                 self._client = genai.Client(api_key=self.api_key)
                 logger.info(f"Gemini client initialized with model {self.model}")
             except Exception as e:
-                logger.warning(f"Could not initialize google-genai client: {e}. Falling back to Offline Studio Engine.")
+                logger.warning(f"Could not initialize google-genai client: {e}. Local providers will be used.")
 
     @property
     def has_gemini(self) -> bool:
@@ -82,9 +92,18 @@ class GeminiService:
         scene_number: int,
         prompt: Optional[str] = None,
         characters: Optional[List[Dict[str, str]]] = None,
-        location: Optional[Dict[str, str]] = None
+        location: Optional[Dict[str, str]] = None,
+        provider_preference: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Generates a screenplay scene using Gemini if available, or Offline Studio Engine."""
+        """
+        Generates a screenplay scene using the configured provider:
+        1. Gemini (if preferred or configured)
+        2. Ollama (if configured or local default)
+        3. Offline Studio Engine (safe template fallback)
+        """
+        chosen_provider = provider_preference or settings.ai_provider
+
+        # 1. Try Gemini if configured with valid API key
         if self.has_gemini:
             try:
                 char_summary = ", ".join([f"{c.get('name')} ({c.get('role', '')})" for c in (characters or [])])
@@ -96,7 +115,7 @@ class GeminiService:
                 )
                 user_msg = (
                     f"Project: {project_title}\nGenre: {genre}\nScene #{scene_number}\n"
-                    f"Characters: {char_summary}\nLocation: {loc_summary}\nPrompt: {prompt or 'An intense turning point'}"
+                    f"Characters: {char_summary}\nLocation: {loc_summary}\nPrompt: {prompt or 'An intense dramatic sequence'}"
                 )
                 
                 response = self._client.models.generate_content(
@@ -110,9 +129,32 @@ class GeminiService:
                 data["_generation_metadata"] = meta
                 return data
             except Exception as e:
-                logger.warning(f"Gemini API call failed ({e}). Using Offline Studio Engine.")
+                logger.warning(f"Gemini screenplay call failed ({e}). Attempting local engine.")
 
-        # Fallback to local offline engine
+        # 2. Try Local Ollama if active
+        if chosen_provider in ("ollama", "local", None) and not self.has_gemini:
+            try:
+                from backend.app.services.ai_provider import OllamaProvider
+                ollama = OllamaProvider()
+                char_summary = ", ".join([f"{c.get('name')} ({c.get('role', '')})" for c in (characters or [])])
+                loc_summary = location.get("name", "Unknown Set") if location else "Interior Studio"
+                user_msg = (
+                    f"Project: {project_title}\nGenre: {genre}\nScene #{scene_number}\n"
+                    f"Characters: {char_summary}\nLocation: {loc_summary}\nPrompt: {prompt or 'An intense dramatic sequence'}"
+                )
+                structured_res, meta = ollama.generate_structured(
+                    prompt=user_msg,
+                    schema=ScreenplaySceneOutput,
+                    system_prompt="You are a master Hollywood Screenwriter. Write a formatted screenplay scene in Fountain format."
+                )
+                data = structured_res.model_dump()
+                self.last_metadata = meta
+                data["_generation_metadata"] = meta
+                return data
+            except Exception as e:
+                logger.warning(f"Ollama generation unavailable ({e}). Using Offline Studio Engine.")
+
+        # 3. Fallback to local offline engine
         fallback_meta = get_offline_usage()
         self.last_metadata = fallback_meta
         data = offline_ai.generate_screenplay_scene(
@@ -133,10 +175,14 @@ class GeminiService:
         genre: str,
         characters: Optional[List[Dict[str, str]]] = None,
         visual_style: Optional[str] = None,
-        count: int = 4
+        count: int = 4,
+        provider_preference: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Generates storyboard shots and Flow video prompts."""
-        if self.has_gemini:
+        chosen_provider = provider_preference or settings.ai_provider
+
+        # 1. Try Gemini
+        if (chosen_provider == "gemini" or not chosen_provider) and self.has_gemini:
             try:
                 sys_prompt = (
                     "You are a master Cinematographer and Director Agent. Break this scene down into cinematic shots for Google Flow video generation. "
@@ -156,8 +202,35 @@ class GeminiService:
                         s["_generation_metadata"] = meta
                     return shots
             except Exception as e:
-                logger.warning(f"Gemini shot generation failed ({e}). Using Offline Studio Engine.")
+                logger.warning(f"Gemini shot generation failed ({e}). Attempting local engine.")
 
+        # 2. Try Local Ollama
+        if chosen_provider in ("ollama", "local", None) and not self.has_gemini:
+            try:
+                from backend.app.services.ai_provider import OllamaProvider
+                ollama = OllamaProvider()
+                char_str = ", ".join([c.get("name", "") for c in (characters or [])])
+                user_msg = (
+                    f"Scene: {scene_slugline}\nSummary: {scene_summary}\nGenre: {genre}\n"
+                    f"Visual Style: {visual_style}\nCharacters: {char_str}\nTarget shot count: {count}"
+                )
+                breakdown, meta = ollama.generate_structured(
+                    prompt=user_msg,
+                    schema=SceneBreakdownOutput,
+                    system_prompt="You are a master Film Director. Break this dramatic scene down into sequential camera shots."
+                )
+                shots = []
+                for s in breakdown.shots:
+                    s_dict = s.model_dump()
+                    s_dict["_generation_metadata"] = meta
+                    shots.append(s_dict)
+                if shots:
+                    self.last_metadata = meta
+                    return shots
+            except Exception as e:
+                logger.warning(f"Ollama shot breakdown unavailable ({e}). Using Offline Studio Engine.")
+
+        # 3. Fallback to Offline Studio Engine
         fallback_meta = get_offline_usage()
         self.last_metadata = fallback_meta
         shots = offline_ai.generate_storyboard_shots(
@@ -175,5 +248,6 @@ class GeminiService:
     def check_continuity(self, shots: List[Dict[str, Any]], characters: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Checks continuity across storyboard shots."""
         return offline_ai.analyze_continuity(shots=shots, characters=characters)
+
 
 gemini_service = GeminiService()

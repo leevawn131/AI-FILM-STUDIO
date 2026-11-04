@@ -84,11 +84,16 @@ export interface Shot {
   order_index: number;
   created_at: string;
   media_url?: string | null;
+  versions_count?: number;
+  selected_version?: number | null;
 }
 
 export interface MediaAsset {
   id: string;
   project_id: string;
+  shot_id?: string | null;
+  version?: number;
+  status?: string;
   filename: string;
   file_path: string;
   media_type: string;
@@ -184,7 +189,9 @@ export interface ExportJob {
   aspect_ratio: string;
   fps: number;
   include_subtitles: boolean;
-  status: 'queued' | 'rendering' | 'completed' | 'failed';
+  render_mode?: 'final' | 'preview' | string;
+  allow_placeholders?: boolean;
+  status: 'queued' | 'rendering' | 'completed' | 'failed' | 'cancelled' | 'processing';
   progress_pct: number;
   output_path: string;
   file_size_bytes: number;
@@ -768,9 +775,11 @@ export async function launchExportRender(
   presetName: string = '1080p_cinematic',
   resolution: string = '1920x1080',
   fps: number = 24,
-  includeSubtitles: boolean = true
+  includeSubtitles: boolean = true,
+  renderMode: 'preview' | 'final' = 'final',
+  allowPlaceholders: boolean = false
 ): Promise<ExportJob> {
-  const res = await fetch(`${API_BASE}/export/render/${projectId}`, {
+  const res = await fetch(`${API_BASE}/export/render/${projectId}?async=true`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -779,10 +788,11 @@ export async function launchExportRender(
       resolution,
       fps,
       include_subtitles: includeSubtitles,
+      render_mode: renderMode,
+      allow_placeholders: allowPlaceholders,
     }),
   });
-  if (!res.ok) throw new Error('Failed to launch export render');
-  return res.json();
+  return parseApiResponse<ExportJob>(res, 'Failed to launch export render');
 }
 
 // ---------------------------------------------------------------------------
@@ -891,4 +901,94 @@ export async function fetchCheckpointDetail(
   const res = await fetch(`${API_BASE}/pipeline/${projectId}/checkpoints/${checkpointType}`);
   return parseApiResponse<PipelineCheckpointDetail>(res, `Failed to fetch checkpoint ${checkpointType}`);
 }
+
+export interface AIStatusResponse {
+  active_provider: string;
+  ollama: {
+    provider: string;
+    status: string;
+    host?: string;
+    configured_model?: string;
+    model_available?: boolean;
+    available_models?: string[];
+    error?: string;
+  };
+  gemini: {
+    provider: string;
+    status: string;
+    configured_model?: string;
+    has_client?: boolean;
+    note?: string;
+  };
+  offline_template: {
+    provider: string;
+    status: string;
+    configured_model: string;
+  };
+}
+
+export async function fetchAIStatus(): Promise<AIStatusResponse> {
+  const res = await fetch(`${API_BASE}/system/ai-status`);
+  return parseApiResponse<AIStatusResponse>(res, 'Failed to fetch AI engine status');
+}
+
+export async function updateAIConfig(data: { provider?: string; ollama_host?: string; ollama_model?: string }): Promise<any> {
+  const res = await fetch(`${API_BASE}/system/ai-config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  return parseApiResponse<any>(res, 'Failed to update AI configuration');
+}
+
+export async function fetchShotVersions(shotId: string): Promise<MediaAsset[]> {
+  const res = await fetch(`${API_BASE}/storyboard/shot/${shotId}/versions`);
+  return parseApiResponse<MediaAsset[]>(res, 'Failed to fetch shot versions');
+}
+
+export async function selectShotVersion(shotId: string, mediaAssetId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/storyboard/shot/${shotId}/select-version/${mediaAssetId}`, {
+    method: 'POST',
+  });
+  return parseApiResponse<any>(res, 'Failed to select shot version');
+}
+
+export async function backupProject(projectId: string): Promise<{ status: string; backup_filename: string; download_url: string; size_bytes: number }> {
+  const res = await fetch(`${API_BASE}/system/projects/${projectId}/backup`, {
+    method: 'POST',
+  });
+  return parseApiResponse(res, 'Failed to create project backup');
+}
+
+export async function restoreProject(file: File, newName?: string, overwrite?: boolean): Promise<any> {
+  const form = new FormData();
+  form.append('file', file);
+  if (newName) form.append('new_project_name', newName);
+  if (overwrite !== undefined) form.append('overwrite', String(overwrite));
+  const res = await fetch(`${API_BASE}/system/projects/restore`, {
+    method: 'POST',
+    body: form,
+  });
+  return parseApiResponse(res, 'Failed to restore project package');
+}
+
+export async function fetchExportJob(jobId: string): Promise<ExportJob> {
+  const res = await fetch(`${API_BASE}/export/job/${jobId}`);
+  return parseApiResponse<ExportJob>(res, 'Failed to fetch export job status');
+}
+
+export async function cancelExportJob(jobId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/export/job/${jobId}/cancel`, {
+    method: 'POST',
+  });
+  return parseApiResponse(res, 'Failed to cancel export job');
+}
+
+export async function retryExportJob(jobId: string): Promise<ExportJob> {
+  const res = await fetch(`${API_BASE}/export/job/${jobId}/retry`, {
+    method: 'POST',
+  });
+  return parseApiResponse<ExportJob>(res, 'Failed to retry export job');
+}
+
 

@@ -11,6 +11,8 @@ from backend.app.models.entities import Project, Location
 from backend.app.schemas.entities import LocationCreate, LocationUpdate, LocationResponse
 from backend.app.services.security import save_upload_file_securely, finalize_staged_upload, generate_secure_filename, validate_safe_path, sanitize_filename
 from backend.app.services.upload_manager import upload_manager
+from backend.app.services.ai_provider import get_ai_provider
+from backend.app.services.structured_output import LocationOutput
 
 router = APIRouter(prefix="/api/locations", tags=["locations"])
 
@@ -83,24 +85,53 @@ def generate_ai_location(data: GenerateLocationRequest, db: Session = Depends(ge
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    tmpl = random.choice(LOCATION_PRESETS)
-    name = data.name_hint or tmpl["name"]
-    time_of_day = data.time_of_day or "Night"
-
-    desc = tmpl["description"]
-    if data.atmosphere_prompt:
-        desc += f" Context: {data.atmosphere_prompt}"
-
-    loc = Location(
-        project_id=data.project_id,
-        name=name,
-        description=desc,
-        time_of_day=time_of_day,
-        weather=tmpl["weather"],
-        lighting_setup=tmpl["lighting"],
-        visual_prompt_tags=f"{name}, {time_of_day}, {tmpl['tags']}",
-        reference_image_path=""
+    provider = get_ai_provider()
+    user_prompt = (
+        f"Project Title: {project.name}\n"
+        f"Genre: {project.genre}\n"
+        f"Visual Style: {project.visual_style}\n"
+        f"Location Name Hint: {data.name_hint or 'Atmospheric Cinematic Set'}\n"
+        f"Time of Day: {data.time_of_day or 'Night'}\n"
+        f"Atmospheric Direction: {data.atmosphere_prompt or 'Deep atmospheric visual depth and evocative lighting.'}\n"
+        "Design a cinematic film location profile with detailed description, weather, lighting setup, and visual prompt tags."
     )
+
+    try:
+        loc_data, meta = provider.generate_structured(
+            prompt=user_prompt,
+            schema=LocationOutput,
+            system_prompt="You are a master Hollywood Production Designer and Art Director. Create visually rich, atmospheric location concepts."
+        )
+        loc = Location(
+            project_id=data.project_id,
+            name=loc_data.name,
+            description=loc_data.description,
+            time_of_day=loc_data.time_of_day,
+            weather=loc_data.weather,
+            lighting_setup=loc_data.lighting_setup,
+            visual_prompt_tags=loc_data.visual_prompt_tags,
+            reference_image_path=""
+        )
+    except Exception:
+        # Graceful procedural fallback
+        tmpl = random.choice(LOCATION_PRESETS)
+        name = data.name_hint or tmpl["name"]
+        time_of_day = data.time_of_day or "Night"
+        desc = tmpl["description"]
+        if data.atmosphere_prompt:
+            desc += f" Context: {data.atmosphere_prompt}"
+
+        loc = Location(
+            project_id=data.project_id,
+            name=name,
+            description=desc,
+            time_of_day=time_of_day,
+            weather=tmpl["weather"],
+            lighting_setup=tmpl["lighting"],
+            visual_prompt_tags=f"{name}, {time_of_day}, {tmpl['tags']}",
+            reference_image_path=""
+        )
+
     db.add(loc)
     db.commit()
     db.refresh(loc)

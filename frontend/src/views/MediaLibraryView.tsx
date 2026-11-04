@@ -45,6 +45,16 @@ export const MediaLibraryView: React.FC<MediaLibraryViewProps> = ({
   // Video preview modal
   const [activeVideoUrl, setActiveVideoUrl] = useState<string | null>(null);
 
+  // Scan result summary
+  const [scanResult, setScanResult] = useState<{
+    status: string;
+    ingested_count: number;
+    duplicates_count: number;
+    skipped_in_flight_count: number;
+    errors_count: number;
+    files?: any[];
+  } | null>(null);
+
   const loadData = async () => {
     if (!activeProject) return;
     setLoading(true);
@@ -71,7 +81,7 @@ export const MediaLibraryView: React.FC<MediaLibraryViewProps> = ({
     setScanning(true);
     try {
       const res = await scanWatchedFolder(activeProject.id);
-      alert(`Watched folder scanned: ${res.ingested_count} files imported into project!`);
+      setScanResult(res);
       await loadData();
       onRefreshProject();
     } catch (err) {
@@ -196,6 +206,34 @@ export const MediaLibraryView: React.FC<MediaLibraryViewProps> = ({
         </button>
       </div>
 
+      {/* Watched Ingestion Scan Results Notification */}
+      {scanResult && (
+        <div className="p-4 rounded-xl bg-studio-900 border border-cinema-gold/40 shadow-lg space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <span className="font-bold text-xs text-white uppercase font-mono">Scan Results Summary</span>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-cinema-gold/20 text-cinema-gold font-bold">
+                {scanResult.ingested_count} Ingested
+              </span>
+            </div>
+            <button
+              onClick={() => setScanResult(null)}
+              className="text-slate-400 hover:text-white text-xs"
+            >
+              ✕ Dismiss
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-4 text-xs font-mono text-slate-300">
+            <span>✅ <strong className="text-emerald-400">{scanResult.ingested_count}</strong> new footage files imported</span>
+            <span>🔁 <strong className="text-amber-400">{scanResult.duplicates_count}</strong> duplicates archived</span>
+            <span>⏳ <strong className="text-blue-400">{scanResult.skipped_in_flight_count}</strong> in-flight downloads skipped</span>
+            {scanResult.errors_count > 0 && (
+              <span>❌ <strong className="text-rose-400">{scanResult.errors_count}</strong> errors encountered</span>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Video Preview Modal */}
       {activeVideoUrl && (
         <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4">
@@ -258,9 +296,16 @@ export const MediaLibraryView: React.FC<MediaLibraryViewProps> = ({
               <div className="p-4 space-y-3">
                 <div className="flex items-start justify-between">
                   <div>
-                    <h3 className="text-xs font-bold text-white font-mono truncate max-w-[200px]" title={asset.filename}>
-                      {asset.filename}
-                    </h3>
+                    <div className="flex items-center space-x-1.5">
+                      {asset.version && (
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/60 border border-cinema-gold/40 text-cinema-gold font-bold">
+                          v{asset.version}
+                        </span>
+                      )}
+                      <h3 className="text-xs font-bold text-white font-mono truncate max-w-[170px]" title={asset.filename}>
+                        {asset.filename}
+                      </h3>
+                    </div>
                     <div className="flex items-center space-x-1.5 text-[10px] text-slate-400 font-mono mt-0.5">
                       <span>{asset.width}x{asset.height}</span>
                       <span>•</span>

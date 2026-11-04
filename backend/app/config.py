@@ -42,7 +42,11 @@ class Settings(BaseSettings):
     allowed_image_extensions: list[str] = [".jpg", ".jpeg", ".png", ".webp"]
     allowed_audio_extensions: list[str] = [".mp3", ".wav", ".aac", ".m4a", ".ogg"]
     
-    # Gemini / AI Integration
+    # AI Engine & Provider Configuration
+    ai_provider: str = os.getenv("AI_PROVIDER", "ollama") # ollama, gemini, offline_template
+    ollama_host: str = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+    ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.2")
+    ollama_timeout_seconds: int = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90"))
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     

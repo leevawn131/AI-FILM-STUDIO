@@ -6,6 +6,10 @@ import {
   fetchExportPresets,
   fetchExportJobs,
   launchExportRender,
+  cancelExportJob,
+  retryExportJob,
+  backupProject,
+  restoreProject,
 } from '../api/client';
 import {
   Download,
@@ -18,7 +22,11 @@ import {
   FileCheck,
   Video,
   AlertCircle,
-  X
+  X,
+  RotateCcw,
+  Ban,
+  Archive,
+  Upload
 } from 'lucide-react';
 
 interface ExportCenterViewProps {
@@ -33,14 +41,17 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
   const [presets, setPresets] = useState<Record<string, PresetConfig>>({});
   const [jobs, setJobs] = useState<ExportJob[]>([]);
   const [selectedPreset, setSelectedPreset] = useState<string>('1080p_cinematic');
+  const [renderMode, setRenderMode] = useState<'final' | 'preview'>('final');
+  const [allowPlaceholders, setAllowPlaceholders] = useState<boolean>(false);
   const [subtitles, setSubtitles] = useState(true);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [backupLoading, setBackupLoading] = useState(false);
   const [activePreviewUrl, setActivePreviewUrl] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const loadData = async () => {
     if (!activeProject) return;
-    setLoading(true);
     try {
       const [presetsData, jobsData] = await Promise.all([
         fetchExportPresets(),
@@ -50,8 +61,6 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
       setJobs(jobsData);
     } catch (err) {
       console.error(err);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -59,9 +68,24 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
     loadData();
   }, [activeProject?.id]);
 
+  // Polling for active background render jobs
+  useEffect(() => {
+    const hasActiveJob = jobs.some(
+      (j) => j.status === 'rendering' || j.status === 'queued' || j.status === 'processing'
+    );
+    if (!hasActiveJob) return;
+
+    const timer = setInterval(() => {
+      loadData();
+    }, 2000);
+
+    return () => clearInterval(timer);
+  }, [jobs]);
+
   const handleLaunchExport = async () => {
     if (!activeProject) return;
     setExporting(true);
+    setErrorMessage(null);
     try {
       const cfg = presets[selectedPreset] || {
         resolution: '1920x1080',
@@ -72,14 +96,65 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
         selectedPreset,
         cfg.resolution,
         cfg.fps,
-        subtitles
+        subtitles,
+        renderMode,
+        allowPlaceholders
       );
       await loadData();
       onRefreshProject();
     } catch (err: any) {
-      alert('Export failed: ' + (err.message || err));
+      setErrorMessage(err.detail || err.message || 'Export render failed');
     } finally {
       setExporting(false);
+    }
+  };
+
+  const handleCancel = async (jobId: string) => {
+    try {
+      await cancelExportJob(jobId);
+      await loadData();
+    } catch (e: any) {
+      alert('Could not cancel job: ' + (e.detail || e.message));
+    }
+  };
+
+  const handleRetry = async (jobId: string) => {
+    try {
+      await retryExportJob(jobId);
+      await loadData();
+    } catch (e: any) {
+      alert('Could not retry job: ' + (e.detail || e.message));
+    }
+  };
+
+  const handleBackup = async () => {
+    if (!activeProject) return;
+    setBackupLoading(true);
+    try {
+      const res = await backupProject(activeProject.id);
+      window.open(res.download_url, '_blank');
+    } catch (e: any) {
+      alert('Backup failed: ' + (e.detail || e.message));
+    } finally {
+      setBackupLoading(false);
+    }
+  };
+
+  const handleRestoreFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const confirmRestore = window.confirm(
+      `Restore project archive '${file.name}'? Existing project data will be preserved and restored as a separate project or remapped.`
+    );
+    if (!confirmRestore) return;
+
+    try {
+      await restoreProject(file, undefined, false);
+      alert('Project successfully restored from archive!');
+      onRefreshProject();
+      await loadData();
+    } catch (err: any) {
+      alert('Project restore failed: ' + (err.detail || err.message));
     }
   };
 
@@ -93,25 +168,56 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <div className="flex items-center space-x-2">
-            <h2 className="text-xl font-bold text-white tracking-tight">Master Export Center</h2>
+            <h2 className="text-xl font-bold text-white tracking-tight">Master Export & Project Backup</h2>
             <span className="text-[10px] bg-cinema-gold/15 text-cinema-gold border border-cinema-gold/30 px-2 py-0.5 rounded font-mono font-medium">
-              FFmpeg Hardware Acceleration Ready
+              FFmpeg Multi-Track Acceleration Ready
             </span>
           </div>
           <p className="text-xs text-slate-400">
-            Render theatrical masters, web previews, and social vertical cuts with integrated multi-track audio and burn-in subtitles
+            Render theatrical masters, preview cuts, and complete project backup archives with verified checksum integrity
           </p>
         </div>
 
-        <button
-          onClick={handleLaunchExport}
-          disabled={exporting}
-          className="bg-gradient-to-r from-cinema-amber to-cinema-gold hover:opacity-95 text-studio-950 font-bold px-5 py-2.5 rounded-xl text-xs flex items-center space-x-2 shadow-lg shadow-cinema-amber/15 transition-all active:scale-95 disabled:opacity-50"
-        >
-          <Film className="w-4 h-4 stroke-[2.5]" />
-          <span>{exporting ? 'Rendering Master MP4...' : 'Render Master Film'}</span>
-        </button>
+        <div className="flex items-center space-x-2.5">
+          <button
+            onClick={handleBackup}
+            disabled={backupLoading}
+            className="bg-studio-900 border border-studio-700 hover:border-cinema-gold/50 text-slate-200 font-semibold px-3.5 py-2 rounded-xl text-xs flex items-center space-x-1.5 transition-all"
+          >
+            <Archive className="w-3.5 h-3.5 text-cinema-cyan" />
+            <span>{backupLoading ? 'Archiving...' : 'Backup Project (.zip)'}</span>
+          </button>
+
+          <label className="bg-studio-900 border border-studio-700 hover:border-cinema-gold/50 text-slate-200 font-semibold px-3.5 py-2 rounded-xl text-xs flex items-center space-x-1.5 transition-all cursor-pointer">
+            <Upload className="w-3.5 h-3.5 text-cinema-gold" />
+            <span>Restore Backup</span>
+            <input type="file" accept=".zip" onChange={handleRestoreFile} className="hidden" />
+          </label>
+
+          <button
+            onClick={handleLaunchExport}
+            disabled={exporting}
+            className="bg-gradient-to-r from-cinema-amber to-cinema-gold hover:opacity-95 text-studio-950 font-bold px-5 py-2.5 rounded-xl text-xs flex items-center space-x-2 shadow-lg shadow-cinema-amber/15 transition-all active:scale-95 disabled:opacity-50"
+          >
+            <Film className="w-4 h-4 stroke-[2.5]" />
+            <span>{exporting ? 'Dispatching Job...' : renderMode === 'preview' ? 'Render Preview Cut' : 'Render Final Master'}</span>
+          </button>
+        </div>
       </div>
+
+      {/* Error Alert Box */}
+      {errorMessage && (
+        <div className="p-4 bg-cinema-crimson/15 border border-cinema-crimson/40 rounded-xl flex items-start space-x-3 text-red-200 text-xs">
+          <AlertCircle className="w-4 h-4 shrink-0 text-cinema-crimson mt-0.5" />
+          <div className="flex-1">
+            <div className="font-bold text-red-100">Export Order Blocked</div>
+            <div className="mt-0.5">{errorMessage}</div>
+          </div>
+          <button onClick={() => setErrorMessage(null)} className="text-red-400 hover:text-white">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Video Preview Modal */}
       {activePreviewUrl && (
@@ -138,21 +244,61 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
         </div>
       )}
 
-      {/* Render Preset Selection Cards */}
-      <div className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-xs font-bold uppercase tracking-wider text-white">Select Export Preset</h3>
-          <label className="flex items-center space-x-2 text-xs text-slate-300 font-mono cursor-pointer">
+      {/* Mode & Options Bar */}
+      <div className="p-4 bg-studio-900 border border-studio-800 rounded-xl flex flex-wrap items-center justify-between gap-4 text-xs font-mono">
+        <div className="flex items-center space-x-4">
+          <span className="text-slate-400 font-bold uppercase tracking-wider text-[11px]">Render Mode:</span>
+          <label className="flex items-center space-x-2 cursor-pointer text-slate-200">
+            <input
+              type="radio"
+              name="renderMode"
+              checked={renderMode === 'final'}
+              onChange={() => setRenderMode('final')}
+              className="accent-cinema-gold"
+            />
+            <span className="font-semibold text-white">Final Master (Strict Video Assets Required)</span>
+          </label>
+
+          <label className="flex items-center space-x-2 cursor-pointer text-slate-200">
+            <input
+              type="radio"
+              name="renderMode"
+              checked={renderMode === 'preview'}
+              onChange={() => setRenderMode('preview')}
+              className="accent-cinema-cyan"
+            />
+            <span>Preview Mode (Placeholders Labeled)</span>
+          </label>
+        </div>
+
+        <div className="flex items-center space-x-4">
+          {renderMode === 'final' && (
+            <label className="flex items-center space-x-2 cursor-pointer text-slate-300">
+              <input
+                type="checkbox"
+                checked={allowPlaceholders}
+                onChange={(e) => setAllowPlaceholders(e.target.checked)}
+                className="accent-cinema-gold rounded"
+              />
+              <span>Allow Placeholders if Clips Missing</span>
+            </label>
+          )}
+
+          <label className="flex items-center space-x-2 cursor-pointer text-slate-300">
             <input
               type="checkbox"
               checked={subtitles}
               onChange={(e) => setSubtitles(e.target.checked)}
               className="accent-cinema-gold rounded"
             />
-            <span>Burn-in Screenplay Subtitles</span>
+            <span>Burn-in Subtitles</span>
           </label>
         </div>
+      </div>
 
+      {/* Render Preset Selection Cards */}
+      <div className="space-y-3">
+        <h3 className="text-xs font-bold uppercase tracking-wider text-white">Select Export Preset</h3>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {Object.entries(presets).map(([key, cfg]) => {
             const isSelected = selectedPreset === key;
@@ -190,13 +336,16 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
       {/* Export Jobs History */}
       <div className="p-6 rounded-xl bg-studio-900 border border-studio-800 space-y-4">
         <div className="flex items-center justify-between">
-          <h3 className="text-xs font-bold uppercase tracking-wider text-white">Render Jobs & Master Downloads</h3>
-          <span className="text-[10px] font-mono text-slate-400">{jobs.length} export jobs recorded</span>
+          <h3 className="text-xs font-bold uppercase tracking-wider text-white">Background Render Jobs & Master Downloads</h3>
+          <span className="text-[10px] font-mono text-slate-400">{jobs.length} jobs recorded</span>
         </div>
 
         <div className="space-y-3">
           {jobs.map((job) => {
             const isDone = job.status === 'completed';
+            const isFailed = job.status === 'failed';
+            const isCancelled = job.status === 'cancelled';
+            const isRendering = job.status === 'rendering' || job.status === 'queued' || job.status === 'processing';
             const sizeMb = job.file_size_bytes ? (job.file_size_bytes / (1024 * 1024)).toFixed(1) : '0';
 
             return (
@@ -205,7 +354,9 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
                 className="p-4 rounded-xl bg-studio-950 border border-studio-800/80 flex flex-wrap items-center justify-between gap-4"
               >
                 <div className="flex items-center space-x-3.5">
-                  <div className="w-9 h-9 rounded-lg bg-cinema-amber/10 text-cinema-gold flex items-center justify-center shrink-0">
+                  <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
+                    isDone ? 'bg-emerald-500/10 text-emerald-400' : isFailed ? 'bg-red-500/10 text-red-400' : 'bg-cinema-amber/10 text-cinema-gold'
+                  }`}>
                     <Film className="w-4 h-4" />
                   </div>
                   <div>
@@ -215,23 +366,57 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
                         {job.resolution}
                       </span>
                       <span className="text-[10px] font-mono text-slate-400">{job.fps} FPS</span>
+                      <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded bg-studio-800 text-slate-400">
+                        {job.render_mode || 'final'}
+                      </span>
                     </div>
-                    <span className="text-[10px] font-mono text-slate-400">
-                      Rendered on {new Date(job.created_at).toLocaleString()} • {sizeMb} MB
-                    </span>
+                    <div className="text-[10px] font-mono text-slate-400 mt-0.5">
+                      {new Date(job.created_at).toLocaleString()} • {sizeMb} MB
+                      {job.error_message && (
+                        <span className="text-red-400 ml-2 font-sans truncate max-w-md inline-block align-bottom">
+                          • {job.error_message}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
 
-                <div className="flex items-center space-x-3">
+                <div className="flex items-center space-x-2.5">
                   <span
                     className={`text-[10px] font-mono font-bold px-2.5 py-1 rounded border ${
                       isDone
                         ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                        : 'bg-cinema-amber/10 text-cinema-gold border-cinema-amber/30'
+                        : isFailed
+                        ? 'bg-red-500/10 text-red-400 border-red-500/30'
+                        : isCancelled
+                        ? 'bg-slate-700/30 text-slate-400 border-slate-700'
+                        : 'bg-cinema-amber/10 text-cinema-gold border-cinema-amber/30 animate-pulse'
                     }`}
                   >
-                    {isDone ? 'COMPLETED (100%)' : `RENDERING (${job.progress_pct}%)`}
+                    {isDone ? 'COMPLETED (100%)' : isFailed ? 'FAILED' : isCancelled ? 'CANCELLED' : `RENDERING (${job.progress_pct}%)`}
                   </span>
+
+                  {isRendering && (
+                    <button
+                      onClick={() => handleCancel(job.id)}
+                      className="bg-studio-850 hover:bg-red-950 text-red-300 border border-studio-700 hover:border-red-600 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center space-x-1 transition-all"
+                      title="Cancel Render"
+                    >
+                      <Ban className="w-3.5 h-3.5" />
+                      <span>Cancel</span>
+                    </button>
+                  )}
+
+                  {isFailed && (
+                    <button
+                      onClick={() => handleRetry(job.id)}
+                      className="bg-studio-850 hover:bg-studio-800 text-cinema-gold border border-studio-700 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center space-x-1 transition-all"
+                      title="Retry Render"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Retry</span>
+                    </button>
+                  )}
 
                   {isDone && job.download_url && (
                     <>
@@ -258,9 +443,9 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
             );
           })}
 
-          {jobs.length === 0 && !loading && (
+          {jobs.length === 0 && (
             <div className="py-8 text-center text-slate-500 text-xs font-mono">
-              No export jobs yet. Select a preset above and click "Render Master Film" to export your first master cut!
+              No export jobs yet. Select a preset above and click "Render Final Master" or "Render Preview Cut"!
             </div>
           )}
         </div>

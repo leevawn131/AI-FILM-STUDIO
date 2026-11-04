@@ -3,18 +3,23 @@ Audio Service.
 Implements:
 - Local procedural audio synthesis (cinematic ambient BGM, drones, pads)
 - Scratch voiceover audio track generation
-- Audio ducking (ducking BGM under voiceover dialogue using sidechain compression or volume filters)
-- Multi-track audio mixing
+- Multi-track audio mixing with volume control and timing offsets
+- True sidechain audio ducking (ducking BGM beneath voiceover dialogue)
+- Strict error propagation: NEVER silently copy raw video on mix failure
 """
 
 import subprocess
 import shutil
+import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from sqlalchemy.orm import Session
 from backend.app.config import settings
 from backend.app.models.entities import Project, AudioTrack
 from backend.app.services.ffmpeg_service import ffmpeg_service
+
+logger = logging.getLogger("audio_service")
+
 
 class AudioService:
     @staticmethod
@@ -30,7 +35,6 @@ class AudioService:
         out_path = dest_dir / f"bgm_{int(duration)}s_{mood}.mp3"
 
         # Generate harmonic drone chord with low-frequency rumble, flanger, and reverb
-        # Frequencies: A1 (55Hz), E2 (82.4Hz), A2 (110Hz), C3 (130.8Hz) - Minor chord
         lavfi_expr = (
             f"aevalsrc='0.3*sin(2*PI*55*t)+0.25*sin(2*PI*82.4*t)+0.2*sin(2*PI*110*t)+0.15*sin(2*PI*130.8*t)'"
             f":duration={duration}:sample_rate=44100"
@@ -68,7 +72,7 @@ class AudioService:
         character_name: str = "KAI",
         duration: float = 5.0
     ) -> Path:
-        """Generates a scratch voiceover dialogue audio track using modulated audio tone and beep cues."""
+        """Generates a scratch voiceover dialogue audio track using modulated audio tone and comm filter."""
         dest_dir = settings.projects_dir / project_id / "audio"
         dest_dir.mkdir(parents=True, exist_ok=True)
         safe_name = character_name.replace(" ", "_")
@@ -84,7 +88,7 @@ class AudioService:
             "-y",
             "-f", "lavfi",
             "-i", lavfi_expr,
-            "-af", "highpass=f=300,lowpass=f=3400,volume=1.0", # telephone / comm radio effect
+            "-af", "highpass=f=300,lowpass=f=3400,volume=1.0",
             "-c:a", "libmp3lame",
             "-b:a", "128k",
             str(out_path)
@@ -98,42 +102,100 @@ class AudioService:
         audio_tracks: List[Dict[str, Any]],
         output_path: Path
     ) -> Path:
-        """Mixes background music and voiceover with ducking into the target video."""
+        """
+        Mixes background music, voiceover, and SFX with real sidechain ducking into the target video.
+        
+        Strict Contract:
+        - If audio_tracks is empty, copies video as-is.
+        - If mixing fails, raises RuntimeError with exact FFmpeg stderr.
+        - NEVER silently copies unmixed video and pretends success.
+        """
+        if not video_input.exists():
+            raise FileNotFoundError(f"Source video file not found for audio mixing: {video_input}")
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if not audio_tracks:
-            # If no extra audio, copy as is
+        # Filter valid existing tracks
+        valid_tracks = []
+        for t in audio_tracks:
+            tp = Path(t["file_path"])
+            if tp.exists() and tp.stat().st_size > 0:
+                valid_tracks.append(t)
+
+        if not valid_tracks:
             shutil.copy2(video_input, output_path)
             return output_path
 
-        # Construct FFmpeg complex filter for ducked audio
-        bgm_track = next((t for t in audio_tracks if t.get("track_type") == "music"), None)
-        vo_track = next((t for t in audio_tracks if t.get("track_type") == "voiceover"), None)
+        # Identify tracks for ducking
+        bgm_track = next((t for t in valid_tracks if t.get("track_type") in ("music", "ambient")), None)
+        vo_track = next((t for t in valid_tracks if t.get("track_type") == "voiceover"), None)
+        other_tracks = [t for t in valid_tracks if t is not bgm_track and t is not vo_track]
 
         inputs = ["-i", str(video_input)]
         input_idx = 1
-
         filter_parts = []
+
+        # Process BGM
+        bgm_label = None
         if bgm_track:
             inputs.extend(["-i", str(bgm_track["file_path"])])
-            bgm_vol = bgm_track.get("volume", 0.4)
-            filter_parts.append(f"[{input_idx}:a]volume={bgm_vol}[bgm]")
+            vol = bgm_track.get("volume", 0.6)
+            fade_in = bgm_track.get("fade_in_seconds", 0.0)
+            fade_out = bgm_track.get("fade_out_seconds", 0.0)
+            filters = [f"volume={vol}"]
+            if fade_in > 0:
+                filters.append(f"afade=t=in:ss=0:d={fade_in}")
+            filter_parts.append(f"[{input_idx}:a]{','.join(filters)}[bgm_raw]")
+            bgm_label = "bgm_raw"
             input_idx += 1
 
+        # Process Voiceover
+        vo_label = None
         if vo_track:
             inputs.extend(["-i", str(vo_track["file_path"])])
-            vo_vol = vo_track.get("volume", 1.2)
-            filter_parts.append(f"[{input_idx}:a]volume={vo_vol}[vo]")
+            vol = vo_track.get("volume", 1.2)
+            delay_ms = int(float(vo_track.get("start_time_seconds", 0.0)) * 1000)
+            filters = [f"volume={vol}"]
+            if delay_ms > 0:
+                filters.append(f"adelay={delay_ms}|{delay_ms}")
+            filter_parts.append(f"[{input_idx}:a]{','.join(filters)}[vo_raw]")
+            vo_label = "vo_raw"
             input_idx += 1
 
-        if bgm_track and vo_track:
-            # Duck BGM under VO and mix
-            filter_parts.append("[bgm][vo]amix=inputs=2:duration=first:dropout_transition=2[aout]")
+        # Process Other Tracks (SFX, Ambient)
+        other_labels = []
+        for idx, ot in enumerate(other_tracks):
+            inputs.extend(["-i", str(ot["file_path"])])
+            vol = ot.get("volume", 1.0)
+            delay_ms = int(float(ot.get("start_time_seconds", 0.0)) * 1000)
+            filters = [f"volume={vol}"]
+            if delay_ms > 0:
+                filters.append(f"adelay={delay_ms}|{delay_ms}")
+            label = f"other_{idx}"
+            filter_parts.append(f"[{input_idx}:a]{','.join(filters)}[{label}]")
+            other_labels.append(label)
+            input_idx += 1
+
+        # Build Ducking & Mix Graph
+        if bgm_label and vo_label:
+            # True sidechain ducking: compress BGM when VO audio is active
+            filter_parts.append(
+                f"[{bgm_label}][{vo_label}]sidechaincompress=threshold=0.08:ratio=4:attack=20:release=300:makeup=1[ducked_bgm]"
+            )
+            tracks_to_mix = ["[ducked_bgm]", f"[{vo_label}]"] + [f"[{l}]" for l in other_labels]
+        elif bgm_label:
+            tracks_to_mix = [f"[{bgm_label}]"] + [f"[{l}]" for l in other_labels]
+        elif vo_label:
+            tracks_to_mix = [f"[{vo_label}]"] + [f"[{l}]" for l in other_labels]
+        else:
+            tracks_to_mix = [f"[{l}]" for l in other_labels]
+
+        if len(tracks_to_mix) > 1:
+            mix_inputs_str = "".join(tracks_to_mix)
+            filter_parts.append(f"{mix_inputs_str}amix=inputs={len(tracks_to_mix)}:duration=first:dropout_transition=2[aout]")
             map_audio = "[aout]"
-        elif bgm_track:
-            map_audio = "[bgm]"
-        elif vo_track:
-            map_audio = "[vo]"
+        elif len(tracks_to_mix) == 1:
+            map_audio = tracks_to_mix[0]
         else:
             map_audio = "0:a"
 
@@ -152,9 +214,20 @@ class AudioService:
 
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if res.returncode != 0:
-            # Fallback copy if mix filter encounters mismatch
-            shutil.copy2(video_input, output_path)
+            err_msg = res.stderr.decode("utf-8", errors="replace")
+            # Enforce strict policy: fail clearly, do NOT silently copy raw video
+            if output_path.exists():
+                output_path.unlink(missing_ok=True)
+            raise RuntimeError(f"FFmpeg audio mixing failed with exit code {res.returncode}: {err_msg}")
+
+        # Validate resulting output
+        is_valid, val_msg = ffmpeg_service.validate_video(output_path)
+        if not is_valid:
+            if output_path.exists():
+                output_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Mixed video output failed validation: {val_msg}")
 
         return output_path
+
 
 audio_service = AudioService()

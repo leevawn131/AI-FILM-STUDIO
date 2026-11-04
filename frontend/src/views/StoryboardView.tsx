@@ -3,6 +3,7 @@ import {
   Project,
   Scene,
   Shot,
+  MediaAsset,
   fetchScenes,
   fetchShots,
   createShot,
@@ -14,6 +15,8 @@ import {
   ContinuityReport,
   fetchCheckpointDetail,
   PipelineCheckpointDetail,
+  fetchShotVersions,
+  selectShotVersion,
   ApiClientError
 } from '../api/client';
 import { ViewTab } from '../components/Sidebar';
@@ -75,6 +78,12 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
   const [newDesc, setNewDesc] = useState('');
   const [newLighting, setNewLighting] = useState('High contrast chiaroscuro');
   const [newPrompt, setNewPrompt] = useState('');
+
+  // Video Shot Versioning Modal
+  const [versionModalShot, setVersionModalShot] = useState<Shot | null>(null);
+  const [shotVersions, setShotVersions] = useState<MediaAsset[]>([]);
+  const [loadingVersions, setLoadingVersions] = useState(false);
+  const [versionActionMsg, setVersionActionMsg] = useState<string | null>(null);
 
   const loadScenesAndShots = async () => {
     if (!activeProject) return;
@@ -258,6 +267,34 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
         }
       }
       alert('Failed to create shot: ' + (err.message || String(err)));
+    }
+  };
+
+  const handleOpenVersions = async (shot: Shot) => {
+    setVersionModalShot(shot);
+    setLoadingVersions(true);
+    setVersionActionMsg(null);
+    try {
+      const vers = await fetchShotVersions(shot.id);
+      setShotVersions(vers);
+    } catch (err: any) {
+      console.error('Failed to load shot versions:', err);
+    } finally {
+      setLoadingVersions(false);
+    }
+  };
+
+  const handleSelectVersion = async (mediaAssetId: string) => {
+    if (!versionModalShot) return;
+    try {
+      await selectShotVersion(versionModalShot.id, mediaAssetId);
+      setVersionActionMsg('Version activated successfully!');
+      await loadScenesAndShots();
+      const vers = await fetchShotVersions(versionModalShot.id);
+      setShotVersions(vers);
+      setTimeout(() => setVersionActionMsg(null), 3000);
+    } catch (err: any) {
+      setVersionActionMsg(`Failed: ${err.message || err}`);
     }
   };
 
@@ -583,6 +620,112 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
         </div>
       )}
 
+      {/* Shot Versions Selector Modal */}
+      {versionModalShot && (
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-studio-900 border border-studio-700 rounded-xl max-w-lg w-full p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-studio-800 pb-3">
+              <div>
+                <h3 className="text-sm font-bold text-white uppercase tracking-wider">
+                  Footage Takes for {versionModalShot.shot_code}
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Select which video iteration to display and render for this shot.
+                </p>
+              </div>
+              <button
+                onClick={() => setVersionModalShot(null)}
+                className="text-slate-400 hover:text-white text-base px-1"
+              >
+                ✕
+              </button>
+            </div>
+
+            {versionActionMsg && (
+              <div className="p-2.5 rounded bg-cinema-gold/10 border border-cinema-gold/30 text-cinema-gold text-xs font-mono">
+                {versionActionMsg}
+              </div>
+            )}
+
+            {loadingVersions ? (
+              <div className="py-8 text-center text-xs font-mono text-slate-400 animate-pulse">
+                Loading footage versions...
+              </div>
+            ) : shotVersions.length === 0 ? (
+              <div className="py-8 text-center text-xs font-mono text-slate-500 space-y-2">
+                <Video className="w-8 h-8 mx-auto text-slate-600" />
+                <p>No video files have been ingested for this shot yet.</p>
+                <p className="text-[11px] text-slate-400">
+                  Drop files like <code className="text-cinema-gold">{versionModalShot.shot_code}_v001.mp4</code> into the watched folder.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                {shotVersions.map((v) => {
+                  const isActive = versionModalShot.video_asset_id === v.id;
+                  return (
+                    <div
+                      key={v.id}
+                      className={`p-3 rounded-lg border flex items-center justify-between transition-all ${
+                        isActive
+                          ? 'bg-emerald-950/30 border-emerald-500/50 text-white'
+                          : 'bg-studio-950 border-studio-800 hover:border-studio-700 text-slate-300'
+                      }`}
+                    >
+                      <div className="space-y-1">
+                        <div className="flex items-center space-x-2">
+                          <span className="font-mono font-bold text-xs bg-black/40 px-2 py-0.5 rounded border border-white/10 text-cinema-gold">
+                            v{v.version || 1}
+                          </span>
+                          <span className="text-xs font-mono truncate max-w-[200px]" title={v.filename}>
+                            {v.filename}
+                          </span>
+                          {isActive && (
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-bold border border-emerald-500/30">
+                              ACTIVE
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[10px] text-slate-400 font-mono flex items-center space-x-2">
+                          <span>{v.duration_seconds}s</span>
+                          <span>•</span>
+                          <span>{v.width}x{v.height}</span>
+                          <span>•</span>
+                          <span>{(v.file_size_bytes / (1024 * 1024)).toFixed(1)} MB</span>
+                        </div>
+                      </div>
+
+                      {!isActive ? (
+                        <button
+                          onClick={() => handleSelectVersion(v.id)}
+                          className="bg-cinema-gold hover:bg-cinema-amber text-studio-950 px-3 py-1 rounded text-xs font-bold transition-all"
+                        >
+                          Use This
+                        </button>
+                      ) : (
+                        <span className="text-xs text-emerald-400 font-mono font-bold flex items-center space-x-1">
+                          <Check className="w-4 h-4" />
+                          <span>Active</span>
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="flex justify-end pt-2 border-t border-studio-800">
+              <button
+                onClick={() => setVersionModalShot(null)}
+                className="bg-studio-800 hover:bg-studio-700 text-white px-4 py-1.5 rounded-lg text-xs font-semibold"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Storyboard Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {shots.map((shot) => {
@@ -670,13 +813,36 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
                   </p>
                 </div>
 
-                {/* Media linked indicator if imported */}
-                {shot.media_url && (
-                  <div className="p-2 rounded bg-emerald-500/10 border border-emerald-500/30 flex items-center space-x-2 text-xs text-emerald-400 font-mono">
-                    <Video className="w-4 h-4 shrink-0" />
-                    <span className="truncate">Footage linked: {shot.media_url.split('/').pop()}</span>
+                {/* Media linked indicator & Version Switcher */}
+                <div className="space-y-2 pt-1">
+                  {shot.media_url ? (
+                    <div className="p-2.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-between text-xs text-emerald-400 font-mono">
+                      <div className="flex items-center space-x-2 truncate">
+                        <Video className="w-4 h-4 shrink-0 text-emerald-400" />
+                        <span className="truncate">Active footage: {shot.media_url.split('/').pop()}</span>
+                      </div>
+                      <span className="text-[10px] bg-emerald-950 px-2 py-0.5 rounded border border-emerald-500/40 shrink-0 font-bold">
+                        v{shot.selected_version || 1}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="p-2.5 rounded-lg bg-studio-950 border border-studio-800 flex items-center justify-between text-xs text-slate-500 font-mono">
+                      <span>No footage linked yet</span>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between text-[11px] font-mono px-1">
+                    <span className="text-slate-400">Footage Takes:</span>
+                    <button
+                      onClick={() => handleOpenVersions(shot)}
+                      className="px-2 py-0.5 rounded bg-studio-950 border border-studio-700 hover:border-cinema-gold text-cinema-gold flex items-center space-x-1.5 transition-all"
+                      title="View all ingested video versions for this shot"
+                    >
+                      <Layers className="w-3 h-3" />
+                      <span>{shot.versions_count || (shot.media_url ? 1 : 0)} version{(shot.versions_count || (shot.media_url ? 1 : 0)) !== 1 ? 's' : ''}</span>
+                    </button>
                   </div>
-                )}
+                </div>
               </div>
 
               {/* Card Footer Actions */}

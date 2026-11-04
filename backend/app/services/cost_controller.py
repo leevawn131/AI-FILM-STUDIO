@@ -168,7 +168,8 @@ class CostController:
         actual_cost: Optional[float] = None,
         estimated_cost: Optional[float] = None,
         actual_cost_known: bool = False,
-        currency: str = "USD"
+        currency: str = "USD",
+        effective_provider: Optional[str] = None
     ) -> CostRecord:
         """
         Database-level atomic budget enforcement and provider-aware ledger recording.
@@ -321,7 +322,7 @@ class CostController:
             project_id=project_id,
             scene_id=scene_id,
             shot_id=shot_id,
-            provider=resolved_provider,
+            provider=effective_provider or resolved_provider,
             model=resolved_model,
             operation=op_name,
             input_tokens=input_tokens,

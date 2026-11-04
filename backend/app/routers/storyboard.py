@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from backend.app.database import get_db
 from backend.app.models.entities import Project, Scene, Shot, Character, MediaAsset
-from backend.app.schemas.entities import ShotCreate, ShotUpdate, ShotResponse
+from backend.app.schemas.entities import ShotCreate, ShotUpdate, ShotResponse, MediaAssetResponse
 from backend.app.agents.director_agent import director_agent
 from backend.app.agents.cinematographer_agent import cinematographer_agent
 from backend.app.agents.continuity_agent import continuity_agent
@@ -31,10 +31,17 @@ def list_shots(project_id: str, scene_id: Optional[str] = Query(None), db: Sessi
     res = []
     for s in shots:
         media_url = None
+        selected_version = None
         if s.video_asset_id:
             asset = db.query(MediaAsset).filter(MediaAsset.id == s.video_asset_id).first()
             if asset:
                 media_url = f"/media/{asset.file_path}"
+                selected_version = asset.version
+
+        # Count total media versions available for this shot
+        v_count = db.query(MediaAsset).filter(
+            (MediaAsset.shot_id == s.id) | (MediaAsset.auto_matched_shot_id == s.id)
+        ).count()
 
         res.append({
             "id": s.id,
@@ -56,7 +63,9 @@ def list_shots(project_id: str, scene_id: Optional[str] = Query(None), db: Sessi
             "thumbnail_path": s.thumbnail_path,
             "order_index": s.order_index,
             "created_at": s.created_at,
-            "media_url": media_url
+            "media_url": media_url,
+            "versions_count": v_count,
+            "selected_version": selected_version
         })
     return res
 
@@ -222,9 +231,84 @@ def delete_shot(shot_id: str, db: Session = Depends(get_db)):
     if not shot:
         raise HTTPException(status_code=404, detail="Shot not found")
 
+    # Unlink any media assets referencing this shot
+    media_assets = db.query(MediaAsset).filter(
+        (MediaAsset.shot_id == shot.id) | (MediaAsset.auto_matched_shot_id == shot.id)
+    ).all()
+    for ma in media_assets:
+        ma.shot_id = None
+        ma.auto_matched_shot_id = None
+
     db.delete(shot)
     db.commit()
     return {"status": "deleted", "shot_id": shot_id}
+
+
+@router.get("/shot/{shot_id}/versions", response_model=List[MediaAssetResponse])
+def list_shot_versions(shot_id: str, db: Session = Depends(get_db)):
+    """Lists all video asset versions imported for this storyboard shot."""
+    shot = db.query(Shot).filter(Shot.id == shot_id).first()
+    if not shot:
+        raise HTTPException(status_code=404, detail="Shot not found")
+
+    versions = db.query(MediaAsset).filter(
+        (MediaAsset.shot_id == shot.id) | (MediaAsset.auto_matched_shot_id == shot.id)
+    ).order_by(MediaAsset.version.asc(), MediaAsset.created_at.asc()).all()
+
+    res = []
+    for a in versions:
+        res.append({
+            "id": a.id,
+            "project_id": a.project_id,
+            "shot_id": a.shot_id,
+            "version": a.version or 1,
+            "status": a.status or "ready",
+            "filename": a.filename,
+            "file_path": a.file_path,
+            "media_type": a.media_type,
+            "width": a.width,
+            "height": a.height,
+            "duration_seconds": a.duration_seconds,
+            "fps": a.fps,
+            "codec": a.codec,
+            "file_size_bytes": a.file_size_bytes,
+            "thumbnail_path": a.thumbnail_path,
+            "checksum": a.checksum,
+            "auto_matched_shot_id": a.auto_matched_shot_id,
+            "is_validated": a.is_validated,
+            "validation_notes": a.validation_notes,
+            "created_at": a.created_at,
+            "url": f"/media/{a.file_path}"
+        })
+    return res
+
+
+@router.post("/shot/{shot_id}/select-version/{media_asset_id}")
+def select_shot_version(shot_id: str, media_asset_id: str, db: Session = Depends(get_db)):
+    """Selects which video version is active in the shot and timeline editor."""
+    shot = db.query(Shot).filter(Shot.id == shot_id).first()
+    if not shot:
+        raise HTTPException(status_code=404, detail="Shot not found")
+
+    asset = db.query(MediaAsset).filter(MediaAsset.id == media_asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Media asset not found")
+    if asset.project_id != shot.project_id:
+        raise HTTPException(status_code=400, detail="Media asset belongs to another project")
+
+    asset.shot_id = shot.id
+    shot.video_asset_id = asset.id
+    shot.thumbnail_path = asset.thumbnail_path
+    shot.generation_status = "imported"
+    db.commit()
+
+    return {
+        "status": "success",
+        "shot_id": shot.id,
+        "selected_version": asset.version,
+        "media_asset_id": asset.id,
+        "video_url": f"/media/{asset.file_path}"
+    }
 
 @router.post("/continuity-check/{project_id}")
 def run_continuity_check(project_id: str, db: Session = Depends(get_db)):

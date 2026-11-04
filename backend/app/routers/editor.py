@@ -149,7 +149,9 @@ def render_timeline_preview(project_id: str, req: RenderPreviewRequest, db: Sess
         project_id=project_id,
         resolution=req.resolution or "1280x720",
         fps=req.fps or 24,
-        burn_subtitles=req.burn_subtitles or True
+        burn_subtitles=req.burn_subtitles or True,
+        is_preview=True,
+        allow_placeholders=True
     )
 
     return result

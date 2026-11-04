@@ -150,14 +150,23 @@ class ShotResponse(ShotBase):
     project_id: str
     created_at: datetime
     media_url: Optional[str] = None
+    versions_count: Optional[int] = 0
+    selected_version: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class SelectShotVersionRequest(BaseModel):
+    media_asset_id: str
 
 
 # Media Schemas
 class MediaAssetResponse(BaseModel):
     id: str
     project_id: str
+    shot_id: Optional[str] = None
+    version: int = 1
+    status: str = "ready"
     filename: str
     file_path: str
     media_type: str
@@ -185,6 +194,8 @@ class AudioTrackBase(BaseModel):
     file_path: str
     duration_seconds: Optional[float] = 0.0
     start_time_seconds: Optional[float] = 0.0
+    fade_in_seconds: Optional[float] = 0.0
+    fade_out_seconds: Optional[float] = 0.0
     volume_level: Optional[float] = 1.0
     ducking_enabled: Optional[bool] = False
     ducking_level: Optional[float] = 0.25
@@ -251,6 +262,8 @@ class BudgetSummary(BaseModel):
 class ExportJobCreate(BaseModel):
     project_id: str
     preset_name: Optional[str] = "1080p_cinematic"
+    render_mode: Optional[str] = None
+    allow_placeholders: Optional[bool] = None
     resolution: Optional[str] = "1920x1080"
     aspect_ratio: Optional[str] = "16:9"
     fps: Optional[int] = 24
@@ -260,6 +273,8 @@ class ExportJobResponse(BaseModel):
     id: str
     project_id: str
     preset_name: str
+    render_mode: Optional[str] = "final"
+    allow_placeholders: Optional[bool] = False
     resolution: str
     aspect_ratio: str
     fps: int
