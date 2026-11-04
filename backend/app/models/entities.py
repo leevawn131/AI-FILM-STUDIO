@@ -88,6 +88,9 @@ class Location(Base):
 
 class Scene(Base):
     __tablename__ = "scenes"
+    __table_args__ = (
+        UniqueConstraint("project_id", "scene_number", name="uq_scenes_project_scene_number"),
+    )
 
     id = Column(String(36), primary_key=True, default=gen_uuid)
     project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)

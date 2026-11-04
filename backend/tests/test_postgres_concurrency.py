@@ -36,14 +36,112 @@ from backend.app.services.upload_manager import UploadManager, UploadOwnershipLo
 from backend.app.database import run_migrations
 
 
-def get_postgres_engine():
-    """Builds and verifies PostgreSQL engine. Fails explicitly in CI if unavailable."""
-    pg_url = (
+def get_postgres_url() -> str:
+    return (
         os.environ.get("TEST_POSTGRES_URL")
         or os.environ.get("POSTGRES_URL")
         or os.environ.get("DATABASE_URL")
         or "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/aifilmstudio_test"
     )
+
+
+def _mp_pg_compensation_worker(pg_url: str, project_id: str, rec_id: str, res_queue):
+    from sqlalchemy import create_engine, pool
+    from sqlalchemy.orm import sessionmaker
+    from backend.app.models.entities import CostRecord
+    from backend.app.services.cost_controller import CostController
+    engine = create_engine(pg_url, poolclass=pool.NullPool)
+    SessionLocal = sessionmaker(bind=engine)
+    try:
+        with SessionLocal() as sess:
+            r = sess.query(CostRecord).filter(CostRecord.id == rec_id).first()
+            assert r is not None
+            refund = CostController.record_compensation(
+                db=sess,
+                project_id=project_id,
+                original_record=r,
+                reason="mp_pg_compensation_test"
+            )
+            res_queue.put({"success": True, "refund_id": refund.id})
+    except Exception as e:
+        res_queue.put({"success": False, "error": str(e), "type": type(e).__name__})
+    finally:
+        engine.dispose()
+
+
+def _mp_pg_retry_worker(pg_url: str, project_id: str, payload: dict, charge_amount: float, res_queue):
+    from sqlalchemy import create_engine, pool
+    from sqlalchemy.orm import sessionmaker
+    from backend.app.services.cost_controller import CostController
+    engine = create_engine(pg_url, poolclass=pool.NullPool)
+    SessionLocal = sessionmaker(bind=engine)
+    try:
+        with SessionLocal() as sess:
+            cc = CostController()
+            rec = cc.authorize_and_charge(
+                db=sess,
+                project_id=project_id,
+                action_type="script_generation",
+                provider="gemini",
+                model="gemini-1.5-pro",
+                actual_cost=charge_amount,
+                actual_cost_known=True,
+                payload=payload
+            )
+            res_queue.put({"success": True, "record_id": rec.id, "op_identity": rec.operation_identity})
+    except Exception as e:
+        res_queue.put({"success": False, "error": str(e), "type": type(e).__name__})
+    finally:
+        engine.dispose()
+
+
+def _mp_pg_reservation_worker(pg_url: str, project_id: str, request_data: dict, res_queue):
+    from sqlalchemy import create_engine, pool
+    from sqlalchemy.orm import sessionmaker
+    from backend.app.services.pipeline_orchestrator import acquire_project_write_lock
+    from backend.app.routers.screenplay import reserve_scene_number
+    from backend.app.models.entities import StudioJob
+    from backend.app.services.job_manager import compute_idempotency_key
+    import json
+    from datetime import datetime, timezone, timedelta
+    engine = create_engine(pg_url, poolclass=pool.NullPool)
+    SessionLocal = sessionmaker(bind=engine)
+    try:
+        with SessionLocal() as sess:
+            # 1. Acquire project write lock in PostgreSQL (SELECT FOR UPDATE)
+            project = acquire_project_write_lock(sess, project_id)
+            assert project is not None
+            # 2. Reserve scene number
+            res_num = reserve_scene_number(sess, project_id, requested_scene_number=request_data.get("scene_number"))
+            # 3. Create StudioJob with reservation
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            idemp_key = compute_idempotency_key(project_id, "screenplay_generate", request_data)
+            job = StudioJob(
+                project_id=project_id,
+                job_type="screenplay_generate",
+                idempotency_key=idemp_key,
+                status="RUNNING",
+                worker_id=f"mp-worker-{request_data.get('worker_tag')}",
+                fencing_token=1,
+                lease_token=1,
+                lease_expires_at=now + timedelta(seconds=300),
+                payload=json.dumps({"reserved_scene_number": res_num, **request_data}),
+                retry_count=0,
+                created_at=now,
+                updated_at=now
+            )
+            sess.add(job)
+            sess.commit()
+            res_queue.put({"success": True, "reserved_scene_number": res_num, "job_id": job.id})
+    except Exception as e:
+        res_queue.put({"success": False, "error": str(e), "type": type(e).__name__})
+    finally:
+        engine.dispose()
+
+
+def get_postgres_engine():
+    """Builds and verifies PostgreSQL engine. Fails explicitly in CI if unavailable."""
+    pg_url = get_postgres_url()
 
     is_ci = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
 
@@ -1429,6 +1527,186 @@ def test_pg_worker_lease_vs_cost_charge_race(pg_session_factory):
         assert len(records) == 2  # 1 charge, 1 refund
         net_cost = sum(r.cost_usd for r in records)
         assert abs(net_cost) < 1e-5
+
+
+def test_pg_multiprocess_compensation_idempotency(pg_session_factory):
+    """
+    Multi-process compensation idempotency across true separate OS processes:
+    - Original record is charged on PostgreSQL.
+    - 3 independent OS processes attempt compensation simultaneously.
+    - Exactly one refund record is created.
+    - All 3 processes receive the same refund_id.
+    - Project.budget_spent is decremented exactly once back to 0.0.
+    """
+    import multiprocessing as mp
+    pg_url = get_postgres_url()
+    project_id = f"pg-mp-comp-{uuid.uuid4().hex[:8]}"
+    charge_amount = 25.0
+    cc = CostController()
+
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG MP Comp Proj", budget_total=100.0, budget_spent=0.0)
+        session.add(proj)
+        session.commit()
+
+        rec = cc.authorize_and_charge(
+            db=session,
+            project_id=project_id,
+            action_type="script_generation",
+            provider="gemini",
+            model="gemini-1.5-pro",
+            actual_cost=charge_amount,
+            actual_cost_known=True,
+            payload={"task": "mp_comp"}
+        )
+        rec_id = rec.id
+
+    ctx = mp.get_context("fork")
+    res_queue = ctx.Queue()
+    num_procs = 3
+    procs = [
+        ctx.Process(target=_mp_pg_compensation_worker, args=(pg_url, project_id, rec_id, res_queue))
+        for _ in range(num_procs)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=10.0)
+        assert not p.is_alive(), "Process did not terminate within timeout"
+
+    results = []
+    while not res_queue.empty():
+        results.append(res_queue.get())
+
+    assert len(results) == num_procs
+    for res in results:
+        assert res["success"] is True, f"Worker failed: {res}"
+
+    refund_ids = {r["refund_id"] for r in results}
+    assert len(refund_ids) == 1
+
+    with pg_session_factory() as session:
+        proj_final = session.query(Project).filter(Project.id == project_id).first()
+        assert proj_final.budget_spent == 0.0
+
+        refunds = session.query(CostRecord).filter(CostRecord.operation_identity == f"refund_{rec_id}").all()
+        assert len(refunds) == 1
+        assert refunds[0].cost_usd == -charge_amount
+
+
+def test_pg_multiprocess_retry_identity_serialization(pg_session_factory):
+    """
+    Multi-process retry attempt serialization across true separate OS processes:
+    - Original record charged, then refunded.
+    - 2 independent OS processes attempt to execute with identical payload.
+    - Exactly one retry attempt (:retry:1) is charged.
+    - Both processes receive the exact same record_id and operation_identity.
+    - Project.budget_spent reflects exactly one charge.
+    - Net ledger balance matches budget spent.
+    """
+    import multiprocessing as mp
+    pg_url = get_postgres_url()
+    project_id = f"pg-mp-retry-{uuid.uuid4().hex[:8]}"
+    charge_amount = 30.0
+    payload = {"scene_num": 2, "prompt": "cyberpunk alley rain mp"}
+    cc = CostController()
+
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG MP Retry Proj", budget_total=100.0, budget_spent=0.0)
+        session.add(proj)
+        session.commit()
+
+        rec = cc.authorize_and_charge(
+            db=session,
+            project_id=project_id,
+            action_type="script_generation",
+            provider="gemini",
+            model="gemini-1.5-pro",
+            actual_cost=charge_amount,
+            actual_cost_known=True,
+            payload=payload
+        )
+        cc.record_compensation(session, project_id, rec, reason="prep_mp_retry")
+        session.refresh(proj)
+        assert proj.budget_spent == 0.0
+
+    ctx = mp.get_context("fork")
+    res_queue = ctx.Queue()
+    num_procs = 2
+    procs = [
+        ctx.Process(target=_mp_pg_retry_worker, args=(pg_url, project_id, payload, charge_amount, res_queue))
+        for _ in range(num_procs)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=10.0)
+        assert not p.is_alive(), "Process did not terminate within timeout"
+
+    results = []
+    while not res_queue.empty():
+        results.append(res_queue.get())
+
+    assert len(results) == num_procs
+    for res in results:
+        assert res["success"] is True, f"Worker failed: {res}"
+
+    record_ids = {r["record_id"] for r in results}
+    assert len(record_ids) == 1
+
+    with pg_session_factory() as session:
+        proj_final = session.query(Project).filter(Project.id == project_id).first()
+        assert proj_final.budget_spent == charge_amount
+
+        all_records = session.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+        assert len(all_records) == 3
+        net_ledger = sum(r.cost_usd for r in all_records)
+        assert abs(net_ledger - charge_amount) < 1e-5
+
+
+def test_pg_multiprocess_scene_reservation_serialization(pg_session_factory):
+    """
+    Multi-process scene reservation serialization under write lock in PostgreSQL:
+    - 2 independent OS processes attempt to reserve scene numbers for different requests on the same project.
+    - Write lock (SELECT FOR UPDATE on Project) serializes the reservations.
+    - Processes receive distinct scene numbers: 1 and 2.
+    - No duplicate reservations or race condition collisions.
+    """
+    import multiprocessing as mp
+    pg_url = get_postgres_url()
+    project_id = f"pg-mp-res-{uuid.uuid4().hex[:8]}"
+
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG MP Reservation Proj", budget_total=100.0, budget_spent=0.0)
+        session.add(proj)
+        session.commit()
+
+    ctx = mp.get_context("fork")
+    res_queue = ctx.Queue()
+    req_a = {"worker_tag": "A", "prompt": "scene 1 prompt", "request_token": "token-a"}
+    req_b = {"worker_tag": "B", "prompt": "scene 2 prompt", "request_token": "token-b"}
+
+    p1 = ctx.Process(target=_mp_pg_reservation_worker, args=(pg_url, project_id, req_a, res_queue))
+    p2 = ctx.Process(target=_mp_pg_reservation_worker, args=(pg_url, project_id, req_b, res_queue))
+
+    p1.start()
+    p2.start()
+    p1.join(timeout=10.0)
+    p2.join(timeout=10.0)
+    assert not p1.is_alive()
+    assert not p2.is_alive()
+
+    results = []
+    while not res_queue.empty():
+        results.append(res_queue.get())
+
+    assert len(results) == 2
+    for res in results:
+        assert res["success"] is True, f"Worker failed: {res}"
+
+    reserved_numbers = {r["reserved_scene_number"] for r in results}
+    assert reserved_numbers == {1, 2}
+
 
 
 

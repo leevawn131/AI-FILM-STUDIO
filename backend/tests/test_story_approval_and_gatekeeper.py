@@ -8,6 +8,7 @@ Comprehensive Test Suite for S4 M2.2–M2.4:
 """
 
 import os
+import json
 import uuid
 from datetime import datetime, timezone, timedelta
 import pytest
@@ -16,9 +17,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from backend.app.main import app
 from backend.app.database import get_db, run_migrations
+from backend.app.services.gemini_service import gemini_service
 from backend.app.models.entities import (
     Project, Scene, Shot, PipelineStageState, PipelineCheckpoint, PipelineCheckpointAudit,
     StudioJob, CostRecord, Character, Location
@@ -2042,7 +2044,7 @@ def test_concurrent_scene_generation_policy_a_reservation(test_db_session):
     import concurrent.futures
     session, engine = test_db_session
 
-    project_id = "proj-concurrent-gen"
+    project_id = f"proj-concurrent-gen-{uuid.uuid4().hex[:8]}"
     p = Project(id=project_id, name="Concurrent Scenes Film", genre="Action", budget_total=200.0, budget_spent=0.0)
     session.add(p)
     session.commit()
@@ -2063,6 +2065,14 @@ def test_concurrent_scene_generation_policy_a_reservation(test_db_session):
     print("DEBUG res1:", res1.status_code, res1.json())
     print("DEBUG res2:", res2.status_code, res2.json())
 
+    # Either worker may finish first depending on thread scheduling.
+    # The worker finishing second will strictly detect the snapshot drift from the first insertion (Requirement 3).
+    # Retrying the second worker reuses its original reserved scene number cleanly.
+    if res1.status_code == 409:
+        res1 = worker_generate("Opening scene: bank heist")
+    if res2.status_code == 409:
+        res2 = worker_generate("Second scene: getaway chase")
+
     assert res1.status_code == 200, f"res1 error: {res1.json()}"
     assert res2.status_code == 200, f"res2 error: {res2.json()}"
 
@@ -2079,5 +2089,460 @@ def test_concurrent_scene_generation_policy_a_reservation(test_db_session):
         assert len(scenes) == 2
         assert scenes[0].order_index == 1
         assert scenes[1].order_index == 2
+
+
+def test_scene_generation_idempotency_repeat_post_and_request_token(test_db_session):
+    """
+    Requirement 1: Scene-generation idempotency:
+    - Repeat an identical POST after successful completion:
+      same scene ID, one Scene row in DB, one generation execution, one charge.
+    - Intentionally request a new generation using a new request token:
+      a new job and second scene are created.
+    """
+    session, engine = test_db_session
+    project_id = f"proj-idemp-{uuid.uuid4().hex[:8]}"
+    p = Project(id=project_id, name="Idempotency Test Film", genre="Sci-Fi", budget_total=200.0, budget_spent=0.0)
+    session.add(p)
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+    # 1. First generation request
+    res1 = client.post("/api/scenes/generate", json={
+        "project_id": project_id,
+        "prompt": "Opening hero scene in neon rain"
+    })
+    assert res1.status_code == 200, res1.json()
+    scene1_data = res1.json()
+    scene1_id = scene1_data["id"]
+    assert scene1_data["scene_number"] == 1
+
+    with sessionmaker(bind=engine)() as s:
+        # Exactly 1 Scene created
+        scenes = s.query(Scene).filter(Scene.project_id == project_id).all()
+        assert len(scenes) == 1
+        # Exactly 1 CostRecord
+        costs = s.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+        assert len(costs) == 1
+        # Exactly 1 StudioJob with status COMPLETED
+        jobs = s.query(StudioJob).filter(StudioJob.project_id == project_id).all()
+        assert len(jobs) == 1
+        assert jobs[0].status == "COMPLETED"
+
+    # 2. Repeat the identical POST request: should return cached scene without executing again
+    res2 = client.post("/api/scenes/generate", json={
+        "project_id": project_id,
+        "prompt": "Opening hero scene in neon rain"
+    })
+    assert res2.status_code == 200
+    assert res2.json()["id"] == scene1_id
+    assert res2.json()["scene_number"] == 1
+
+    with sessionmaker(bind=engine)() as s:
+        # Still exactly 1 Scene, 1 CostRecord, 1 StudioJob
+        scenes = s.query(Scene).filter(Scene.project_id == project_id).all()
+        assert len(scenes) == 1
+        costs = s.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+        assert len(costs) == 1
+        jobs = s.query(StudioJob).filter(StudioJob.project_id == project_id).all()
+        assert len(jobs) == 1
+
+    # 3. Intentionally request a second scene with identical prompt using an explicit request_token
+    res3 = client.post("/api/scenes/generate", json={
+        "project_id": project_id,
+        "prompt": "Opening hero scene in neon rain",
+        "request_token": "token-second-scene"
+    })
+    assert res3.status_code == 200
+    scene2_data = res3.json()
+    assert scene2_data["id"] != scene1_id
+    assert scene2_data["scene_number"] == 2
+
+    with sessionmaker(bind=engine)() as s:
+        # Now 2 Scenes, 2 CostRecords, 2 StudioJobs
+        scenes = s.query(Scene).filter(Scene.project_id == project_id).order_by(Scene.scene_number).all()
+        assert len(scenes) == 2
+        costs = s.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+        assert len(costs) == 2
+        jobs = s.query(StudioJob).filter(StudioJob.project_id == project_id).all()
+        assert len(jobs) == 2
+
+
+def test_scene_generation_identical_request_while_running_returns_in_progress(test_db_session):
+    """
+    Requirement 1: Identical request while first job is running:
+    - Same job ID returned as IN_PROGRESS (HTTP 409).
+    - No second AI execution, no second reservation.
+    """
+    import threading
+    session, engine = test_db_session
+    project_id = f"proj-running-{uuid.uuid4().hex[:8]}"
+    p = Project(id=project_id, name="Running Test Film", genre="Drama", budget_total=100.0, budget_spent=0.0)
+    session.add(p)
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+    ai_started = threading.Event()
+    second_request_done = threading.Event()
+    second_response = {}
+
+    orig_write = screenwriter_agent.write_scene
+
+    def paused_write_scene(**kwargs):
+        ai_started.set()
+        # Wait until second request has run and received its response
+        second_request_done.wait(timeout=5.0)
+        return orig_write(**kwargs)
+
+    def worker_second():
+        ai_started.wait(timeout=5.0)
+        # Send identical request while first is in Phase B
+        r = client.post("/api/scenes/generate", json={
+            "project_id": project_id,
+            "prompt": "High tension conference room standoff"
+        })
+        second_response["status"] = r.status_code
+        second_response["data"] = r.json()
+        second_request_done.set()
+
+    t2 = threading.Thread(target=worker_second)
+    t2.start()
+
+    with patch.object(screenwriter_agent, "write_scene", side_effect=paused_write_scene):
+        res1 = client.post("/api/scenes/generate", json={
+            "project_id": project_id,
+            "prompt": "High tension conference room standoff"
+        })
+
+    t2.join(timeout=5.0)
+
+    # First request succeeded
+    assert res1.status_code == 200, res1.json()
+
+    # Second request received 409 IN_PROGRESS with matching job detail
+    assert second_response["status"] == 409
+    assert "already in progress" in second_response["data"]["detail"]
+
+    with sessionmaker(bind=engine)() as s:
+        # Exactly 1 Scene, 1 CostRecord, 1 StudioJob in total
+        scenes = s.query(Scene).filter(Scene.project_id == project_id).all()
+        assert len(scenes) == 1
+        costs = s.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+        assert len(costs) == 1
+        jobs = s.query(StudioJob).filter(StudioJob.project_id == project_id).all()
+        assert len(jobs) == 1
+
+
+def test_scene_generation_retry_failed_job_reuses_reserved_scene_number(test_db_session):
+    """
+    Requirement 1: Retry a failed job:
+    - Same job and same reserved scene number.
+    - Do not silently create a different scene number.
+    """
+    session, engine = test_db_session
+    project_id = f"proj-fail-retry-{uuid.uuid4().hex[:8]}"
+    p = Project(id=project_id, name="Retry Film", genre="Thriller", budget_total=100.0, budget_spent=0.0)
+    session.add(p)
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+    # 1. First attempt fails during AI execution
+    with patch.object(screenwriter_agent, "write_scene", side_effect=RuntimeError("Transient AI provider outage")):
+        res1 = client.post("/api/scenes/generate", json={
+            "project_id": project_id,
+            "prompt": "Undercover agent discovers betrayal"
+        })
+        assert res1.status_code == 500
+
+    with sessionmaker(bind=engine)() as s:
+        # Job marked FAILED, reserved scene number was 1
+        job = s.query(StudioJob).filter(StudioJob.project_id == project_id).first()
+        assert job is not None
+        assert job.status == "FAILED"
+        payload = json.loads(job.payload)
+        assert payload["reserved_scene_number"] == 1
+        job_id = job.id
+
+    # 2. Retry with identical request: succeeds and reuses scene number 1 on same job
+    res2 = client.post("/api/scenes/generate", json={
+        "project_id": project_id,
+        "prompt": "Undercover agent discovers betrayal"
+    })
+    assert res2.status_code == 200, res2.json()
+    assert res2.json()["scene_number"] == 1
+
+    with sessionmaker(bind=engine)() as s:
+        # Same job was reused, retry_count incremented to 1
+        job = s.query(StudioJob).filter(StudioJob.project_id == project_id).first()
+        assert job.id == job_id
+        assert job.status == "COMPLETED"
+        assert job.retry_count == 1
+
+        # Exactly 1 Scene created
+        scenes = s.query(Scene).filter(Scene.project_id == project_id).all()
+        assert len(scenes) == 1
+        assert scenes[0].scene_number == 1
+
+
+def test_scene_number_validation_zero_negative_duplicate_and_explicit(test_db_session):
+    """
+    Requirement 6: Validate scene numbers:
+    - Enforce scene_number >= 1.
+    - Reject zero (422) and negative values (422).
+    - Reject duplicate scene numbers (409).
+    - Allow valid explicit numbers (e.g. 5).
+    """
+    session, engine = test_db_session
+    project_id = f"proj-val-sc-{uuid.uuid4().hex[:8]}"
+    p = Project(id=project_id, name="Val Film", genre="Mystery", budget_total=100.0, budget_spent=0.0)
+    session.add(p)
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+    # 1. Zero value rejected
+    res_zero = client.post("/api/scenes/generate", json={
+        "project_id": project_id,
+        "prompt": "Invalid scene number zero",
+        "scene_number": 0
+    })
+    assert res_zero.status_code == 422
+
+    # 2. Negative value rejected
+    res_neg = client.post("/api/scenes/generate", json={
+        "project_id": project_id,
+        "prompt": "Invalid scene number negative",
+        "scene_number": -3
+    })
+    assert res_neg.status_code == 422
+
+    # 3. Valid explicit number 5
+    res_five = client.post("/api/scenes/generate", json={
+        "project_id": project_id,
+        "prompt": "Explicit scene number five",
+        "scene_number": 5
+    })
+    assert res_five.status_code == 200, res_five.json()
+    assert res_five.json()["scene_number"] == 5
+
+    # 4. Duplicate number 5 rejected with 409
+    res_dup = client.post("/api/scenes/generate", json={
+        "project_id": project_id,
+        "prompt": "Another scene requesting number five",
+        "scene_number": 5
+    })
+    assert res_dup.status_code == 409
+    assert "already taken or reserved" in res_dup.json()["detail"]
+
+
+def test_screenplay_snapshot_drift_detects_insertion_during_ai(test_db_session):
+    """
+    Requirement 3: Validate complete screenplay snapshot:
+    - Start generation with a known snapshot (e.g. initial scene 5).
+    - Insert a different scene number (scene 6) during AI phase.
+    - Verify generation is rejected with 409.
+    - Compensation recorded exactly once.
+    - Generated scene is NOT committed.
+    """
+    session, engine = test_db_session
+    project_id = f"proj-snap-drift-{uuid.uuid4().hex[:8]}"
+    p = Project(id=project_id, name="Snapshot Drift Film", genre="Noir", budget_total=100.0, budget_spent=0.0)
+    session.add(p)
+    # Existing scene 5
+    sc5 = Scene(project_id=project_id, scene_number=5, slugline="INT. MOTEL - NIGHT", order_index=1)
+    session.add(sc5)
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+    orig_write = screenwriter_agent.write_scene
+
+    def inject_scene_during_ai(**kwargs):
+        # While AI is running, insert scene 6 into the project
+        with sessionmaker(bind=engine)() as s:
+            sc6 = Scene(project_id=project_id, scene_number=6, slugline="EXT. ALLEY - NIGHT", order_index=2)
+            s.add(sc6)
+            s.commit()
+        return orig_write(**kwargs)
+
+    with patch.object(screenwriter_agent, "write_scene", side_effect=inject_scene_during_ai):
+        res = client.post("/api/scenes/generate", json={
+            "project_id": project_id,
+            "prompt": "Detective enters the diner"
+        })
+        assert res.status_code == 409
+        assert "drifted" in res.json()["detail"].lower()
+
+    with sessionmaker(bind=engine)() as s:
+        # Only sc5 and sc6 exist in DB; the generated scene was NOT committed
+        scenes = s.query(Scene).filter(Scene.project_id == project_id).all()
+        assert len(scenes) == 2
+        scene_nums = {s.scene_number for s in scenes}
+        assert scene_nums == {5, 6}
+
+        # Net ledger total is 0.0 (charge was compensated)
+        records = s.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+        assert len(records) == 2  # 1 charge, 1 refund
+        assert sum(r.cost_usd for r in records) == 0.0
+
+        # Project budget_spent is 0.0
+        proj = s.query(Project).filter(Project.id == project_id).first()
+        assert proj.budget_spent == 0.0
+
+
+def test_post_charge_failure_paths_compensation_and_job_safety(test_db_session):
+    """
+    Requirement 4: Cover every post-charge failure path:
+    - Selected location deleted during AI execution.
+    - Explicitly selected character deleted during AI execution.
+    - For every case: exactly one compensation under Policy B, budget spent is 0,
+      job marked FAILED, no scene created.
+    """
+    session, engine = test_db_session
+
+    # Case A: Location deleted during AI execution
+    proj_a = f"proj-del-loc-{uuid.uuid4().hex[:8]}"
+    p_a = Project(id=proj_a, name="Loc Del Proj", budget_total=100.0, budget_spent=0.0)
+    loc_a = Location(id=f"loc-{uuid.uuid4().hex[:8]}", project_id=proj_a, name="Old Warehouse")
+    session.add_all([p_a, loc_a])
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(proj_a, db=session)
+
+    orig_write = screenwriter_agent.write_scene
+
+    def delete_location_during_ai(**kwargs):
+        with sessionmaker(bind=engine)() as s:
+            s.query(Location).filter(Location.id == loc_a.id).delete()
+            s.commit()
+        return orig_write(**kwargs)
+
+    with patch.object(screenwriter_agent, "write_scene", side_effect=delete_location_during_ai):
+        res_a = client.post("/api/scenes/generate", json={
+            "project_id": proj_a,
+            "prompt": "Meeting in the warehouse",
+            "location_id": loc_a.id
+        })
+        assert res_a.status_code in (400, 404, 409)
+
+    with sessionmaker(bind=engine)() as s:
+        # Budget spent is 0.0
+        p_check = s.query(Project).filter(Project.id == proj_a).first()
+        assert p_check.budget_spent == 0.0
+        # Exactly 1 charge and 1 refund
+        recs = s.query(CostRecord).filter(CostRecord.project_id == proj_a).all()
+        assert len(recs) == 2
+        assert sum(r.cost_usd for r in recs) == 0.0
+        # No scene created
+        assert s.query(Scene).filter(Scene.project_id == proj_a).count() == 0
+        # Job marked FAILED
+        job = s.query(StudioJob).filter(StudioJob.project_id == proj_a).first()
+        assert job.status == "FAILED"
+
+    # Case B: Character deleted during AI execution
+    proj_b = f"proj-del-char-{uuid.uuid4().hex[:8]}"
+    p_b = Project(id=proj_b, name="Char Del Proj", budget_total=100.0, budget_spent=0.0)
+    char_b = Character(id=f"char-{uuid.uuid4().hex[:8]}", project_id=proj_b, name="TARGET CHARACTER")
+    session.add_all([p_b, char_b])
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(proj_b, db=session)
+
+    def delete_char_during_ai(**kwargs):
+        with sessionmaker(bind=engine)() as s:
+            s.query(Character).filter(Character.id == char_b.id).delete()
+            s.commit()
+        return orig_write(**kwargs)
+
+    with patch.object(screenwriter_agent, "write_scene", side_effect=delete_char_during_ai):
+        res_b = client.post("/api/scenes/generate", json={
+            "project_id": proj_b,
+            "prompt": "Dialogue with character",
+            "character_ids": [char_b.id]
+        })
+        assert res_b.status_code in (400, 404, 409)
+
+    with sessionmaker(bind=engine)() as s:
+        p_check = s.query(Project).filter(Project.id == proj_b).first()
+        assert p_check.budget_spent == 0.0
+        recs = s.query(CostRecord).filter(CostRecord.project_id == proj_b).all()
+        assert len(recs) == 2
+        assert sum(r.cost_usd for r in recs) == 0.0
+        assert s.query(Scene).filter(Scene.project_id == proj_b).count() == 0
+        job = s.query(StudioJob).filter(StudioJob.project_id == proj_b).first()
+        assert job.status == "FAILED"
+
+
+def test_effective_generation_backend_and_offline_fallback(test_db_session):
+    """
+    Requirement 5: Hash effective generation backend and runtime configuration:
+    - Simulate has_gemini = True but force Gemini API failure and offline fallback.
+    - Verify result metadata, cost record, and execution fingerprint identify Offline Studio Engine.
+    - Verify fallback execution is not represented as Gemini execution.
+    - Verify runtime provider/model change cannot silently reuse a result from a different provider.
+    """
+    session, engine = test_db_session
+    project_id = f"proj-fallback-{uuid.uuid4().hex[:8]}"
+    p = Project(id=project_id, name="Fallback Film", genre="Sci-Fi", budget_total=100.0, budget_spent=0.0)
+    session.add(p)
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+    orig_api_key = gemini_service.api_key
+    orig_client = gemini_service._client
+
+    try:
+        # 1. Force Gemini client to fail and fall back to Offline Studio Engine
+        gemini_service.api_key = "fake-key"
+        mock_client = MagicMock()
+        gemini_service._client = mock_client
+        mock_client.models.generate_content.side_effect = RuntimeError("Gemini 503 Unavailable")
+
+        res = client.post("/api/scenes/generate", json={
+            "project_id": project_id,
+            "prompt": "Space station docking sequence"
+        })
+        assert res.status_code == 200, res.json()
+
+        with sessionmaker(bind=engine)() as s:
+            job = s.query(StudioJob).filter(StudioJob.project_id == project_id).first()
+            assert job is not None
+            assert job.status == "COMPLETED"
+            res_payload = json.loads(job.result)
+
+            # Execution fingerprint identifies offline_engine with is_fallback=True
+            assert res_payload["effective_provider"] == "offline_engine"
+            assert res_payload["is_fallback"] is True
+            assert res_payload["effective_fingerprint"] is not None
+
+            # Cost record records offline_engine, not gemini
+            cost = s.query(CostRecord).filter(CostRecord.project_id == project_id).first()
+            assert cost.provider == "offline_engine"
+
+        # 2. Runtime provider change: Gemini is now healthy. Repeating request must NOT silently reuse offline result.
+        mock_response = MagicMock()
+        mock_response.text = json.dumps({
+            "title": "Scene 1: Docking Complete",
+            "slugline": "EXT. STATION - NIGHT",
+            "summary": "Gemini generated dramatic docking.",
+            "script_content": "EXT. STATION - NIGHT\nAir hissed through the seals.",
+            "estimated_duration": 15
+        })
+        mock_response.usage_metadata = MagicMock(prompt_token_count=100, candidates_token_count=50, total_token_count=150)
+        mock_client.models.generate_content.side_effect = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        res_gemini = client.post("/api/scenes/generate", json={
+            "project_id": project_id,
+            "prompt": "Space station docking sequence"
+        })
+        assert res_gemini.status_code == 200
+
+        with sessionmaker(bind=engine)() as s:
+            job_after = s.query(StudioJob).filter(StudioJob.project_id == project_id).first()
+            res_after = json.loads(job_after.result)
+            # Result was regenerated with Gemini, not silently reused from offline fallback!
+            assert res_after["effective_provider"] == "gemini"
+            assert res_after["is_fallback"] is False
+
+    finally:
+        gemini_service.api_key = orig_api_key
+        gemini_service._client = orig_client
+
 
 

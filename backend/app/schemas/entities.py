@@ -69,7 +69,7 @@ class LocationResponse(LocationBase):
 
 # Scene Schemas
 class SceneBase(BaseModel):
-    scene_number: int = 1
+    scene_number: int = Field(1, ge=1)
     slugline: str = "INT. STUDIO - DAY"
     title: Optional[str] = ""
     summary: Optional[str] = ""
@@ -83,7 +83,7 @@ class SceneCreate(SceneBase):
     project_id: str
 
 class SceneUpdate(BaseModel):
-    scene_number: Optional[int] = None
+    scene_number: Optional[int] = Field(None, ge=1)
     slugline: Optional[str] = None
     title: Optional[str] = None
     summary: Optional[str] = None

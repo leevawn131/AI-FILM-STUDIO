@@ -70,6 +70,23 @@ def _is_lease_expired(lease_dt: Optional[datetime], now_dt: datetime) -> bool:
 
 def compute_idempotency_key(project_id: str, job_type: str, payload: Any) -> str:
     """Computes a deterministic SHA-256 hash identifying identical jobs."""
+    if job_type == "screenplay_generate" and isinstance(payload, dict):
+        # Requirement 1: Extract stable request identity, excluding server-assigned reservation and hashes
+        stable_payload = {
+            "project_id": str(project_id),
+            "prompt": str(payload.get("prompt") or ""),
+            "character_ids": sorted(payload.get("character_ids") or []),
+            "location_id": str(payload.get("location_id") or ""),
+            "requested_scene_number": payload.get("requested_scene_number"),
+            "request_token": payload.get("request_token")
+        }
+        raw = json.dumps({
+            "project_id": str(project_id),
+            "job_type": str(job_type),
+            "payload": stable_payload
+        }, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
     raw = json.dumps({
         "project_id": str(project_id),
         "job_type": str(job_type),
