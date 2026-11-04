@@ -923,6 +923,7 @@ def test_pg_concurrency_case_a_worker_wins(pg_engine, pg_session_factory):
         assert inv_audit.artifact_version == v1
 
 
+
 def test_pg_concurrency_case_b_mutation_wins(pg_engine, pg_session_factory):
     """
     Requirement 5: Case B — Mutation wins lock:
@@ -1097,6 +1098,337 @@ def test_pg_concurrency_case_b_mutation_wins(pg_engine, pg_session_factory):
         assert inv_audit is not None
         assert inv_audit.artifact_content_hash == h1
         assert inv_audit.artifact_version == v1
+
+
+def test_pg_record_compensation_concurrent_sessions_barrier(pg_session_factory):
+    """
+    Requirement 1: PostgreSQL concurrent compensation with barrier:
+    - Multiple sessions concurrently call record_compensation() for the same CostRecord.
+    - Barrier ensures genuine concurrency.
+    - Exactly one refund record is created.
+    - Project.budget_spent is reduced exactly once.
+    - Ledger total is accurate (net zero).
+    - Transaction failure between budget update and refund insert rolls back cleanly without partial state.
+    """
+    import threading
+
+    project_id = f"pg-comp-barrier-{uuid.uuid4().hex[:8]}"
+    initial_budget = 100.0
+    charge_amount = 25.0
+
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG Compensation Proj", budget_total=initial_budget, budget_spent=0.0)
+        session.add(proj)
+        session.commit()
+
+        cc = CostController()
+        rec = cc.authorize_and_charge(
+            db=session,
+            project_id=project_id,
+            action_type="script_generation",
+            provider="gemini",
+            model="gemini-1.5-pro",
+            actual_cost=charge_amount,
+            actual_cost_known=True,
+            payload={"task": "comp_test"}
+        )
+        rec_id = rec.id
+
+    # 1. Partial failure test: simulate error between budget update and refund insert
+    with pg_session_factory() as fail_sess:
+        try:
+            # Speculatively decrement budget
+            p_fail = fail_sess.query(Project).filter(Project.id == project_id).first()
+            p_fail.budget_spent -= charge_amount
+            fail_sess.flush()
+            # Simulate unexpected failure before refund record is inserted
+            raise RuntimeError("Simulated crash before refund record commit")
+        except RuntimeError:
+            fail_sess.rollback()
+
+    # Verify no partial state was left behind
+    with pg_session_factory() as verify_sess:
+        p_check = verify_sess.query(Project).filter(Project.id == project_id).first()
+        assert p_check.budget_spent == charge_amount
+        refund_count = verify_sess.query(CostRecord).filter(
+            CostRecord.operation_identity == f"refund_{rec_id}"
+        ).count()
+        assert refund_count == 0
+
+    # 2. Genuine concurrent competition with barrier across 5 sessions
+    num_threads = 5
+    barrier = threading.Barrier(num_threads)
+    refund_ids = []
+    thread_exceptions = []
+    lock = threading.Lock()
+
+    def compensation_worker():
+        try:
+            with pg_session_factory() as sess:
+                r = sess.query(CostRecord).filter(CostRecord.id == rec_id).first()
+                assert r is not None
+                barrier.wait(timeout=5.0)
+                refund_res = CostController.record_compensation(
+                    db=sess,
+                    project_id=project_id,
+                    original_record=r,
+                    reason="barrier_concurrency_test"
+                )
+                with lock:
+                    refund_ids.append(refund_res.id)
+        except Exception as e:
+            with lock:
+                thread_exceptions.append(e)
+
+    threads = [threading.Thread(target=compensation_worker) for _ in range(num_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    if thread_exceptions:
+        raise thread_exceptions[0]
+
+    # Exactly 1 refund record was created and returned to all threads
+    assert len(refund_ids) == num_threads
+    assert len(set(refund_ids)) == 1
+
+    with pg_session_factory() as session:
+        # Check budget_spent was reduced exactly once back to 0.0
+        p_final = session.query(Project).filter(Project.id == project_id).first()
+        assert p_final.budget_spent == 0.0
+
+        # Exactly 1 refund record exists in DB
+        refunds_in_db = session.query(CostRecord).filter(
+            CostRecord.operation_identity == f"refund_{rec_id}"
+        ).all()
+        assert len(refunds_in_db) == 1
+        assert refunds_in_db[0].cost_usd == -charge_amount
+
+        # Net ledger sum is 0.0
+        all_records = session.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+        total_cost = sum(r.cost_usd for r in all_records)
+        assert abs(total_cost) < 1e-5
+
+
+def test_pg_retry_identity_serialization_concurrent_retries(pg_session_factory):
+    """
+    Requirement 2: PostgreSQL serialized retry attempt sequence after compensation:
+    - Original record is charged, then refunded.
+    - Two concurrent retries execute with identical operation payload.
+    - Exactly one retry attempt is charged and committed (:retry:1).
+    - Loser receives the committed retry charge without double charging.
+    - Budget and ledger remain completely consistent.
+    """
+    import threading
+
+    project_id = f"pg-retry-ser-{uuid.uuid4().hex[:8]}"
+    initial_budget = 100.0
+    charge_amount = 15.0
+    payload = {"scene_num": 1, "prompt": "cyberpunk alley rain"}
+
+    cc = CostController()
+
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG Retry Serial Proj", budget_total=initial_budget, budget_spent=0.0)
+        session.add(proj)
+        session.commit()
+
+        # Initial charge
+        rec1 = cc.authorize_and_charge(
+            db=session,
+            project_id=project_id,
+            action_type="script_generation",
+            provider="gemini",
+            model="gemini-1.5-pro",
+            actual_cost=charge_amount,
+            actual_cost_known=True,
+            payload=payload
+        )
+        rec1_id = rec1.id
+
+        # Refund original charge under Policy B
+        refund = cc.record_compensation(session, project_id, rec1, reason="initial_finalization_failure")
+        assert refund is not None
+
+        session.refresh(proj)
+        assert proj.budget_spent == 0.0
+
+    # 2 concurrent retry attempts with same payload
+    num_threads = 2
+    barrier = threading.Barrier(num_threads)
+    retry_records = []
+    thread_exceptions = []
+    lock = threading.Lock()
+
+    def retry_worker():
+        try:
+            with pg_session_factory() as sess:
+                barrier.wait(timeout=5.0)
+                rec = cc.authorize_and_charge(
+                    db=sess,
+                    project_id=project_id,
+                    action_type="script_generation",
+                    provider="gemini",
+                    model="gemini-1.5-pro",
+                    actual_cost=charge_amount,
+                    actual_cost_known=True,
+                    payload=payload
+                )
+                with lock:
+                    retry_records.append(rec.id)
+        except Exception as e:
+            with lock:
+                thread_exceptions.append(e)
+
+    threads = [threading.Thread(target=retry_worker) for _ in range(num_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    if thread_exceptions:
+        raise thread_exceptions[0]
+
+    # Both threads successfully obtain the same valid retry record
+    assert len(retry_records) == 2
+    assert len(set(retry_records)) == 1
+
+    with pg_session_factory() as session:
+        # Budget is charged for exactly one retry attempt ($15.0)
+        proj_after = session.query(Project).filter(Project.id == project_id).first()
+        assert proj_after.budget_spent == charge_amount
+
+        # Exactly 3 CostRecords: initial charge ($15.0), refund ($-15.0), retry charge ($15.0)
+        records = session.query(CostRecord).filter(CostRecord.project_id == project_id).order_by(CostRecord.created_at.asc()).all()
+        assert len(records) == 3
+
+        retry_rec = [r for r in records if ":retry:1" in (r.operation_identity or "")][0]
+        assert retry_rec.cost_usd == charge_amount
+
+        # Net ledger matches budget spent
+        net_ledger = sum(r.cost_usd for r in records)
+        assert abs(net_ledger - charge_amount) < 1e-5
+
+
+def test_pg_worker_lease_vs_cost_charge_race(pg_session_factory):
+    """
+    Requirement 7: Worker lease expiration vs cost charge race in PostgreSQL:
+    - Worker A claims job (token 1) and passes initial ownership check.
+    - Worker A lease expires; Worker B reclaims job (token 2).
+    - Worker A charges cost ledger.
+    - Worker A loses ownership before finalize in Phase C.
+    - Compensation is recorded exactly once according to Policy B.
+    - Worker B maintains ownership (worker_id="worker-b", fencing_token=2).
+    - Worker A does not create Scene, and does not complete or fail Worker B's job.
+    """
+    project_id = f"pg-lease-race-{uuid.uuid4().hex[:8]}"
+    initial_budget = 100.0
+    charge_cost = 20.0
+    payload = {"task": "scene_gen_lease_race"}
+
+    jm_a = JobManager(worker_id="worker-a")
+    jm_b = JobManager(worker_id="worker-b")
+    cc = CostController()
+
+    with pg_session_factory() as session:
+        proj = Project(id=project_id, name="PG Lease Race Proj", budget_total=initial_budget, budget_spent=0.0)
+        session.add(proj)
+        session.commit()
+
+        # 1. Worker A prepares and claims job
+        job_a, action_a = jm_a.prepare_or_claim_job(
+            db=session,
+            project_id=project_id,
+            job_type="screenplay_generate",
+            payload=payload
+        )
+        assert job_a.worker_id == "worker-a"
+        assert job_a.fencing_token == 1
+        job_id = job_a.id
+
+        # 2. Worker A passes initial ownership check
+        jm_a.assert_ownership(
+            db=session,
+            job_id=job_id,
+            worker_id="worker-a",
+            fencing_token=1
+        )
+
+    # 3. Simulate Worker A lease expiry and Worker B reclaiming the job
+    with pg_session_factory() as sess_reclaim:
+        stale_job = sess_reclaim.query(StudioJob).filter(StudioJob.id == job_id).first()
+        stale_job.lease_expires_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=10)
+        sess_reclaim.commit()
+
+        job_b, action_b = jm_b.prepare_or_claim_job(
+            db=sess_reclaim,
+            project_id=project_id,
+            job_type="screenplay_generate",
+            payload=payload
+        )
+        assert action_b == "EXECUTE"
+        assert job_b.worker_id == "worker-b"
+        assert job_b.fencing_token == 2
+
+    # 4. Worker A charges cost ledger before attempting Phase C finalize
+    with pg_session_factory() as sess_w_a:
+        cost_rec = cc.authorize_and_charge(
+            db=sess_w_a,
+            project_id=project_id,
+            action_type="script_generation",
+            provider="gemini",
+            model="gemini-1.5-pro",
+            actual_cost=charge_cost,
+            actual_cost_known=True,
+            payload=payload
+        )
+        assert cost_rec.cost_usd == charge_cost
+
+        # Confirm budget increased
+        p_temp = sess_w_a.query(Project).filter(Project.id == project_id).first()
+        assert p_temp.budget_spent == charge_cost
+
+        # 5. Worker A moves to Phase C finalize and asserts ownership: must raise JobOwnershipLostError
+        with pytest.raises(JobOwnershipLostError):
+            jm_a.assert_ownership(
+                db=sess_w_a,
+                job_id=job_id,
+                worker_id="worker-a",
+                fencing_token=1
+            )
+
+        # 6. Worker A compensates cost under Policy B without modifying/failing Worker B's job
+        comp = cc.record_compensation(
+            db=sess_w_a,
+            project_id=project_id,
+            original_record=cost_rec,
+            reason="ownership_lost_before_finalize"
+        )
+        assert comp is not None
+        assert comp.cost_usd == -charge_cost
+
+    # 7. Verification across DB
+    with pg_session_factory() as session:
+        # Budget restored to 0.0
+        p_final = session.query(Project).filter(Project.id == project_id).first()
+        assert p_final.budget_spent == 0.0
+
+        # No Scene was created by Worker A
+        scenes = session.query(Scene).filter(Scene.project_id == project_id).all()
+        assert len(scenes) == 0
+
+        # Worker B still holds ownership of StudioJob with token 2
+        active_job = session.query(StudioJob).filter(StudioJob.id == job_id).first()
+        assert active_job.worker_id == "worker-b"
+        assert active_job.fencing_token == 2
+        assert active_job.status in ("RUNNING", "PENDING")
+
+        # Net ledger total is 0.0
+        records = session.query(CostRecord).filter(CostRecord.project_id == project_id).all()
+        assert len(records) == 2  # 1 charge, 1 refund
+        net_cost = sum(r.cost_usd for r in records)
+        assert abs(net_cost) < 1e-5
 
 
 

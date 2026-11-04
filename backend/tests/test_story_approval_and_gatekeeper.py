@@ -40,7 +40,7 @@ def test_db_session(tmp_path):
     """Provides an isolated SQLite database and test DB session."""
     db_file = tmp_path / "approval_gatekeeper_test.db"
     db_url = f"sqlite:///{db_file}"
-    engine = create_engine(db_url)
+    engine = create_engine(db_url, connect_args={"timeout": 15.0})
     run_migrations(target_engine=engine, db_url=db_url)
     TestingSessionLocal = sessionmaker(bind=engine)
 
@@ -955,7 +955,7 @@ def test_sqlite_lock_acquisition_and_serialization(tmp_path):
 
     db_file = tmp_path / "sqlite_lock_serialization.db"
     db_url = f"sqlite:///{db_file}"
-    engine = create_engine(db_url)
+    engine = create_engine(db_url, connect_args={"timeout": 15.0})
     run_migrations(target_engine=engine, db_url=db_url)
     SessionFactory = sessionmaker(bind=engine)
 
@@ -1147,7 +1147,7 @@ def test_sqlite_lock_caller_pending_write_preserved_on_rejection(tmp_path):
 
     db_file = tmp_path / "sqlite_lock_pending_write.db"
     db_url = f"sqlite:///{db_file}"
-    engine = create_engine(db_url)
+    engine = create_engine(db_url, connect_args={"timeout": 15.0})
     run_migrations(target_engine=engine, db_url=db_url)
     SessionFactory = sessionmaker(bind=engine)
 
@@ -1192,7 +1192,7 @@ def test_sqlite_lock_reentrancy_and_metadata_cleanup(tmp_path):
 
     db_file = tmp_path / "sqlite_lock_reentrancy.db"
     db_url = f"sqlite:///{db_file}"
-    engine = create_engine(db_url)
+    engine = create_engine(db_url, connect_args={"timeout": 15.0})
     run_migrations(target_engine=engine, db_url=db_url)
     SessionFactory = sessionmaker(bind=engine)
 
@@ -1798,32 +1798,52 @@ def test_cost_controller_policy_b_compensation_and_retry(test_db_session):
 
 def test_sqlite_lock_lifecycle_and_transaction_ownership(test_db_session):
     """
-    Requirement 3: SQLite lock lifecycle in pipeline_orchestrator:
-    - Session close while holding lock cleans up metadata.
-    - begin_nested() before lock acquisition rejected with 409 without losing caller work.
-    - Nested transaction rollback preserves outer write lock.
-    - Outer transaction rollback clears lock metadata.
-    - Query Project failure after lock acquired rolls back helper transaction.
-    - Multiple projects in same write transaction.
+    Requirement 3 & 6: SQLite lock lifecycle and transaction boundary verification:
+    - Caller modifies row in SAVEPOINT.
+    - Lock helper rejects with 409 because transaction/savepoint is already active without lock.
+    - Caller rolls back SAVEPOINT.
+    - Real DB reload confirms row reverted to pre-savepoint state.
+    - Pending outer transaction work is intact and committable.
+    - Outer commit/rollback releases lock.
+    - Session.close releases lock so another Session can immediately acquire it.
+    - Metadata is cleared across all exit paths (commit, rollback, close).
     """
     session, engine = test_db_session
+    SessionLocal = sessionmaker(bind=engine)
 
-    p1 = Project(id="proj-sq-1", name="SQLite Proj 1")
-    p2 = Project(id="proj-sq-2", name="SQLite Proj 2")
+    p1 = Project(id="proj-sq-1", name="SQLite Proj 1", genre="Original Genre")
+    p2 = Project(id="proj-sq-2", name="SQLite Proj 2", genre="Original Genre")
     session.add_all([p1, p2])
     session.commit()
 
-    # 1. begin_nested() before lock acquisition rejected with 409 without losing caller work
+    # 1. Caller begins outer transaction with pending work, then opens a SAVEPOINT
+    p1.genre = "Outer Modified Genre"
     sp = session.begin_nested()
-    p1.name = "Caller Modification Inside Savepoint"
+    p1.name = "Savepoint Modification Name"
+
+    # Lock acquisition inside savepoint must be rejected with 409 without rolling back caller work
     with pytest.raises(HTTPException) as exc_info:
         acquire_project_write_lock(session, "proj-sq-1")
     assert exc_info.value.status_code == 409
 
-    # Caller can rollback savepoint and caller work is intact
+    # Caller rolls back the SAVEPOINT
     sp.rollback()
-    assert p1.name == "Caller Modification Inside Savepoint" or p1 in session.dirty or True
-    session.rollback()
+
+    # Real DB verification: reload from separate connection to confirm savepoint change was never committed
+    with SessionLocal() as check_sess:
+        p1_check = check_sess.query(Project).filter(Project.id == "proj-sq-1").first()
+        assert p1_check.name == "SQLite Proj 1"
+        assert p1_check.genre == "Original Genre"
+
+    # Verify pending outer work remains intact in caller session
+    assert p1.name == "SQLite Proj 1"
+    assert p1.genre == "Outer Modified Genre"
+    session.commit()
+
+    # Confirm outer work was committed to DB
+    with SessionLocal() as check_sess2:
+        p1_check2 = check_sess2.query(Project).filter(Project.id == "proj-sq-1").first()
+        assert p1_check2.genre == "Outer Modified Genre"
 
     # 2. Acquire lock first -> begin_nested() -> nested rollback preserves outer write lock
     acquire_project_write_lock(session, "proj-sq-1")
@@ -1844,13 +1864,19 @@ def test_sqlite_lock_lifecycle_and_transaction_ownership(test_db_session):
     assert session.info.get("_active_sqlite_write_lock_tx") is None
     assert session.info.get("_locked_projects") is None
 
-    # 4. Session close while holding lock cleans up metadata
-    SessionLocal = sessionmaker(bind=engine)
+    # 4. Session close while holding lock cleans up metadata and releases lock for other sessions
     sess_temp = SessionLocal()
     acquire_project_write_lock(sess_temp, "proj-sq-1")
     assert sess_temp.info.get("_active_sqlite_write_lock_tx") is not None
     sess_temp.close()
     assert sess_temp.info.get("_active_sqlite_write_lock_tx") is None
+
+    # Another session can immediately acquire lock
+    sess_next = SessionLocal()
+    acquire_project_write_lock(sess_next, "proj-sq-1")
+    assert sess_next.info.get("_active_sqlite_write_lock_tx") is not None
+    sess_next.rollback()
+    sess_next.close()
 
     # 5. Query Project failure after lock acquired rolls back helper transaction
     sess_fail = SessionLocal()
@@ -1942,4 +1968,116 @@ def test_job_lease_expiration_and_fencing_during_ai_generation(test_db_session):
     ).first()
     assert job_in_db.worker_id == "worker-02"
     assert job_in_db.fencing_token == 2
+
+
+def test_stable_character_selection_and_no_false_drift(test_db_session):
+    """
+    Requirement 4: Stable character and location resolution:
+    - Multiple characters (>2) sorted deterministically by (created_at, id).
+    - Stable character and location IDs included in canonical representation.
+    - Repeated resolution without changes produces identical data and hash (no false drift).
+    - Scene generation automatically selects the first 2 characters in stable order.
+    """
+    session, engine = test_db_session
+    from backend.app.routers.screenplay import (
+        resolve_canonical_characters, resolve_canonical_location,
+        build_canonical_generation_input, compute_generation_input_hash
+    )
+
+    project_id = "proj-stable-chars"
+    p = Project(id=project_id, name="Stable Film", genre="Thriller")
+    session.add(p)
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+    # Create 4 characters with same name but distinct IDs
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    c1 = Character(id="c-01", project_id=project_id, name="Agent Smith", role="Enforcer", created_at=now - timedelta(seconds=40))
+    c2 = Character(id="c-02", project_id=project_id, name="Agent Smith", role="Enforcer", created_at=now - timedelta(seconds=30))
+    c3 = Character(id="c-03", project_id=project_id, name="Trinity", role="Hacker", created_at=now - timedelta(seconds=20))
+    c4 = Character(id="c-04", project_id=project_id, name="Neo", role="Protagonist", created_at=now - timedelta(seconds=10))
+    l1 = Location(id="loc-01", project_id=project_id, name="Rooftop", time_of_day="Rainy Night")
+    session.add_all([c1, c2, c3, c4, l1])
+    session.commit()
+
+    # Default resolution selects exactly first 2 in stable created_at order
+    resolved = resolve_canonical_characters(session, project_id, character_ids=None)
+    assert len(resolved) == 2
+    assert resolved[0]["id"] == "c-01"
+    assert resolved[1]["id"] == "c-02"
+
+    resolved_loc = resolve_canonical_location(session, project_id, location_id="loc-01")
+    assert resolved_loc["id"] == "loc-01"
+
+    # Build canonical input twice: hashes must be identical
+    input1 = build_canonical_generation_input(
+        project_title="Stable Film", project_genre="Thriller", scene_number=1, prompt="Chase",
+        characters=resolved, location=resolved_loc, screenplay_hash=None
+    )
+    input2 = build_canonical_generation_input(
+        project_title="Stable Film", project_genre="Thriller", scene_number=1, prompt="Chase",
+        characters=resolved, location=resolved_loc, screenplay_hash=None
+    )
+    hash1 = compute_generation_input_hash(input1)
+    hash2 = compute_generation_input_hash(input2)
+    assert hash1 == hash2
+
+    # Scene generation without character_ids succeeds without false drift
+    res = client.post("/api/scenes/generate", json={
+        "project_id": project_id,
+        "prompt": "Chase across the rooftops"
+    })
+    assert res.status_code == 200
+    assert res.json()["scene_number"] == 1
+
+
+def test_concurrent_scene_generation_policy_a_reservation(test_db_session):
+    """
+    Requirement 5: Concurrency policy for scene_number (Policy A):
+    - Two concurrent requests generate scenes on the same project.
+    - Each receives a distinct reserved scene number.
+    - Both succeed without colliding or false drift.
+    - Resulting project has two scenes with distinct scene numbers and sequential order indices.
+    """
+    import concurrent.futures
+    session, engine = test_db_session
+
+    project_id = "proj-concurrent-gen"
+    p = Project(id=project_id, name="Concurrent Scenes Film", genre="Action", budget_total=200.0, budget_spent=0.0)
+    session.add(p)
+    session.commit()
+    PipelineOrchestrator.initialize_project_pipeline(project_id, db=session)
+
+    def worker_generate(prompt_text):
+        return client.post("/api/scenes/generate", json={
+            "project_id": project_id,
+            "prompt": prompt_text
+        })
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(worker_generate, "Opening scene: bank heist")
+        f2 = executor.submit(worker_generate, "Second scene: getaway chase")
+        res1 = f1.result()
+        res2 = f2.result()
+
+    print("DEBUG res1:", res1.status_code, res1.json())
+    print("DEBUG res2:", res2.status_code, res2.json())
+
+    assert res1.status_code == 200, f"res1 error: {res1.json()}"
+    assert res2.status_code == 200, f"res2 error: {res2.json()}"
+
+    scene1_num = res1.json()["scene_number"]
+    scene2_num = res2.json()["scene_number"]
+
+    # Both must have distinct scene numbers
+    assert scene1_num != scene2_num
+    assert {scene1_num, scene2_num} == {1, 2}
+
+    # Verify database has both scenes with sequential order
+    with sessionmaker(bind=engine)() as s:
+        scenes = s.query(Scene).filter(Scene.project_id == project_id).order_by(Scene.order_index).all()
+        assert len(scenes) == 2
+        assert scenes[0].order_index == 1
+        assert scenes[1].order_index == 2
+
 

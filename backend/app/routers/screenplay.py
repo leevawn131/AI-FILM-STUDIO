@@ -1,14 +1,17 @@
+from datetime import datetime, timezone
 import json
 import logging
 import hashlib
+import threading
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from backend.app.database import get_db
-from backend.app.models.entities import Project, Scene, Character, Location, Shot
+from backend.app.models.entities import Project, Scene, Character, Location, Shot, StudioJob
 from backend.app.schemas.entities import SceneCreate, SceneUpdate, SceneResponse
 from backend.app.agents.screenwriter_agent import screenwriter_agent
+from backend.app.services.gemini_service import gemini_service
 from backend.app.services.cost_controller import cost_controller
 from backend.app.services.job_manager import job_manager, sanitize_error_message, JobOwnershipLostError
 from backend.app.services.pipeline_orchestrator import PipelineOrchestrator, acquire_project_write_lock
@@ -21,6 +24,8 @@ CANONICAL_SCREENPLAY_FIELDS = {
 }
 
 router = APIRouter(prefix="/api/scenes", tags=["screenplay"])
+
+_reservation_lock = threading.RLock()
 
 
 class GenerateSceneRequest(BaseModel):
@@ -130,6 +135,159 @@ def create_scene(data: SceneCreate, db: Session = Depends(get_db)):
         "shots_count": 0
     }
 
+def resolve_canonical_characters(
+    db: Session,
+    project_id: str,
+    character_ids: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Deterministically resolves character data for canonical generation input.
+    - Stable ordering: order_by(Character.created_at.asc(), Character.id.asc()).
+    - If character_ids given: verifies all IDs belong to project_id.
+    - If not given: takes first 2 characters in deterministic order.
+    - Canonical representation includes stable ID to disambiguate identical names/roles.
+    """
+    if character_ids:
+        chars = (
+            db.query(Character)
+            .filter(
+                Character.id.in_(character_ids),
+                Character.project_id == project_id
+            )
+            .order_by(Character.created_at.asc(), Character.id.asc())
+            .all()
+        )
+        if len(chars) != len(set(character_ids)):
+            raise HTTPException(
+                status_code=400,
+                detail="One or more character IDs are invalid or do not belong to this project."
+            )
+    else:
+        chars = (
+            db.query(Character)
+            .filter(Character.project_id == project_id)
+            .order_by(Character.created_at.asc(), Character.id.asc())
+            .limit(2)
+            .all()
+        )
+
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "role": c.role,
+            "clothing": c.clothing,
+            "facial_characteristics": c.facial_characteristics
+        }
+        for c in chars
+    ]
+
+
+def resolve_canonical_location(
+    db: Session,
+    project_id: str,
+    location_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Deterministically resolves location data for canonical generation input.
+    - Verifies location belongs to project_id.
+    - Canonical representation includes stable location ID.
+    """
+    if not location_id:
+        return None
+    loc = (
+        db.query(Location)
+        .filter(
+            Location.id == location_id,
+            Location.project_id == project_id
+        )
+        .first()
+    )
+    if not loc:
+        raise HTTPException(
+            status_code=400,
+            detail="Location ID is invalid or does not belong to this project."
+        )
+    return {
+        "id": loc.id,
+        "name": loc.name,
+        "time_of_day": loc.time_of_day,
+        "lighting_setup": loc.lighting_setup
+    }
+
+
+def reserve_scene_number(
+    db: Session,
+    project_id: str,
+    requested_scene_number: Optional[int] = None,
+    job_id: Optional[str] = None
+) -> int:
+    """
+    Policy A: Deterministic scene number reservation with ownership and expiry.
+    - Serializes scene number reservations prior to AI execution.
+    - Unexpired running/pending StudioJobs hold reservations.
+    - Expired/abandoned job leases release reservations automatically.
+    - Retries of the same job reuse their existing valid reservation.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # 1. Existing committed scene numbers
+    committed_nums = {
+        s.scene_number
+        for s in db.query(Scene.scene_number).filter(Scene.project_id == project_id).all()
+    }
+
+    # 2. Active reserved scene numbers from unexpired running/pending jobs
+    active_jobs = (
+        db.query(StudioJob)
+        .filter(
+            StudioJob.project_id == project_id,
+            StudioJob.job_type == "screenplay_generate",
+            StudioJob.status.in_(["RUNNING", "PENDING"])
+        )
+        .all()
+    )
+
+    active_reserved: Dict[int, str] = {}
+    reusable_scene_num = None
+
+    for j in active_jobs:
+        if j.lease_expires_at and j.lease_expires_at <= now:
+            # Abandoned reservation: lease expired
+            continue
+        try:
+            payload = json.loads(j.payload) if isinstance(j.payload, str) else (j.payload or {})
+            res_num = payload.get("reserved_scene_number")
+            if res_num is not None:
+                res_int = int(res_num)
+                if job_id and j.id == job_id:
+                    reusable_scene_num = res_int
+                else:
+                    active_reserved[res_int] = j.id
+        except Exception:
+            pass
+
+    # If this specific job already holds a reservation, reuse it (retry safety)
+    if reusable_scene_num is not None:
+        return reusable_scene_num
+
+    if requested_scene_number is not None:
+        req_int = int(requested_scene_number)
+        if req_int in committed_nums or req_int in active_reserved:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Scene number {req_int} is already taken or reserved by an active job."
+            )
+        return req_int
+
+    # Allocate the smallest positive integer not in committed or actively reserved
+    candidate = 1
+    unavailable = committed_nums.union(active_reserved.keys())
+    while candidate in unavailable:
+        candidate += 1
+    return candidate
+
+
 def build_canonical_generation_input(
     project_title: str,
     project_genre: str,
@@ -143,11 +301,12 @@ def build_canonical_generation_input(
 ) -> Dict[str, Any]:
     """
     Constructs a deterministic canonical representation of all actual inputs
-    supplied to the screenwriter agent.
+    supplied to the screenwriter agent, including stable IDs and runtime configuration.
     """
     sorted_characters = sorted(
         [
             {
+                "id": str(c.get("id") or ""),
                 "clothing": str(c.get("clothing") or ""),
                 "facial_characteristics": str(c.get("facial_characteristics") or ""),
                 "name": str(c.get("name") or ""),
@@ -155,12 +314,13 @@ def build_canonical_generation_input(
             }
             for c in (characters or [])
         ],
-        key=lambda x: (x["name"], x["role"])
+        key=lambda x: (x["id"], x["name"])
     )
 
     norm_location = None
     if location:
         norm_location = {
+            "id": str(location.get("id") or ""),
             "lighting_setup": str(location.get("lighting_setup") or ""),
             "name": str(location.get("name") or ""),
             "time_of_day": str(location.get("time_of_day") or "")
@@ -194,79 +354,65 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
     if not project or project.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Validate character_ids: must belong to this project
-    characters_data = []
-    if data.character_ids:
-        chars = db.query(Character).filter(
-            Character.id.in_(data.character_ids),
-            Character.project_id == data.project_id
-        ).all()
-        if len(chars) != len(set(data.character_ids)):
-            raise HTTPException(
-                status_code=400,
-                detail="One or more character IDs are invalid or do not belong to this project."
-            )
-        for c in chars:
-            characters_data.append({
-                "name": c.name, "role": c.role, "clothing": c.clothing,
-                "facial_characteristics": c.facial_characteristics
-            })
-    else:
-        chars = db.query(Character).filter(Character.project_id == data.project_id).limit(2).all()
-        for c in chars:
-            characters_data.append({
-                "name": c.name, "role": c.role, "clothing": c.clothing,
-                "facial_characteristics": c.facial_characteristics
-            })
+    # 1. Resolve canonical characters and location deterministically
+    characters_data = resolve_canonical_characters(db, data.project_id, data.character_ids)
+    loc_data = resolve_canonical_location(db, data.project_id, data.location_id)
 
-    # Validate location_id: must belong to this project
-    loc_data = None
-    if data.location_id:
-        loc = db.query(Location).filter(
-            Location.id == data.location_id,
-            Location.project_id == data.project_id
-        ).first()
-        if not loc:
-            raise HTTPException(
-                status_code=400,
-                detail="Location ID is invalid or does not belong to this project."
-            )
-        loc_data = {"name": loc.name, "time_of_day": loc.time_of_day, "lighting_setup": loc.lighting_setup}
-
-    # Read input snapshot: canonical screenplay hash, scene numbering, and config
-    input_screenplay_hash = PipelineOrchestrator.compute_artifact_hash(db, data.project_id, "screenplay")
-    last_scene = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
-    next_num = (last_scene.scene_number + 1) if last_scene else 1
-
-    generation_config = {"agent": "screenwriter_agent", "version": "1.0"}
-    canonical_input = build_canonical_generation_input(
-        project_title=project.name,
-        project_genre=project.genre,
-        scene_number=next_num,
-        prompt=data.prompt or "",
-        characters=characters_data,
-        location=loc_data,
-        screenplay_hash=input_screenplay_hash,
-        config=generation_config
-    )
-    generation_input_hash = compute_generation_input_hash(canonical_input)
-
-    job_payload = {
-        "project_id": data.project_id,
-        "prompt": data.prompt,
-        "character_ids": data.character_ids,
-        "location_id": data.location_id,
-        "input_screenplay_hash": input_screenplay_hash,
-        "generation_input_hash": generation_input_hash,
-        "canonical_input": canonical_input
+    # 2. Capture actual runtime provider/model/config snapshot
+    actual_provider = "gemini" if gemini_service.has_gemini else "offline_engine"
+    actual_model = gemini_service.model if gemini_service.has_gemini else "offline-studio-engine"
+    generation_config = {
+        "agent": "screenwriter_agent",
+        "provider": actual_provider,
+        "model": actual_model,
+        "version": "1.0"
     }
 
-    job, action = job_manager.prepare_or_claim_job(
-        db=db,
-        project_id=data.project_id,
-        job_type="screenplay_generate",
-        payload=job_payload
-    )
+    # Policy A: Atomically reserve scene number and prepare job under reservation lock
+    with _reservation_lock:
+        # 3. Base screenplay snapshot (scenes that exist at preparation time)
+        base_scenes = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index).all()
+        base_scene_ids = [s.id for s in base_scenes]
+        input_screenplay_hash = PipelineOrchestrator.compute_artifact_hash(db, data.project_id, "screenplay")
+
+        # 4. Policy A: Deterministic scene number reservation
+        reserved_scene_num = reserve_scene_number(
+            db=db,
+            project_id=data.project_id,
+            requested_scene_number=data.scene_number
+        )
+
+        canonical_input = build_canonical_generation_input(
+            project_title=project.name,
+            project_genre=project.genre,
+            scene_number=reserved_scene_num,
+            prompt=data.prompt or "",
+            characters=characters_data,
+            location=loc_data,
+            screenplay_hash=input_screenplay_hash,
+            config=generation_config
+        )
+        generation_input_hash = compute_generation_input_hash(canonical_input)
+
+        job_payload = {
+            "project_id": data.project_id,
+            "prompt": data.prompt,
+            "character_ids": data.character_ids,
+            "location_id": data.location_id,
+            "reserved_scene_number": reserved_scene_num,
+            "base_scene_ids": base_scene_ids,
+            "input_screenplay_hash": input_screenplay_hash,
+            "generation_config": generation_config,
+            "generation_input_hash": generation_input_hash,
+            "canonical_input": canonical_input
+        }
+
+        job, action = job_manager.prepare_or_claim_job(
+            db=db,
+            project_id=data.project_id,
+            job_type="screenplay_generate",
+            payload=job_payload
+        )
 
     if action == "REUSE" and job.result:
         try:
@@ -290,7 +436,7 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
         generated = screenwriter_agent.write_scene(
             project_title=project.name,
             genre=project.genre,
-            scene_number=next_num,
+            scene_number=reserved_scene_num,
             prompt=data.prompt,
             characters=characters_data,
             location=loc_data
@@ -397,56 +543,65 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
         )
 
     # Re-read all canonical inputs under write lock to detect any input drift
-    last_scene_locked = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
-    current_next_num = (last_scene_locked.scene_number + 1) if last_scene_locked else 1
+    current_characters_data = resolve_canonical_characters(db, data.project_id, data.character_ids)
+    current_loc_data = resolve_canonical_location(db, data.project_id, data.location_id)
 
-    current_characters_data = []
-    if data.character_ids:
-        cur_chars = db.query(Character).filter(
-            Character.id.in_(data.character_ids),
-            Character.project_id == data.project_id
-        ).all()
-        for c in cur_chars:
-            current_characters_data.append({
-                "name": c.name, "role": c.role, "clothing": c.clothing,
-                "facial_characteristics": c.facial_characteristics
-            })
+    cur_provider = "gemini" if gemini_service.has_gemini else "offline_engine"
+    cur_model = gemini_service.model if gemini_service.has_gemini else "offline-studio-engine"
+    cur_config = {
+        "agent": "screenwriter_agent",
+        "provider": cur_provider,
+        "model": cur_model,
+        "version": "1.0"
+    }
+
+    reserved_num = job_payload["reserved_scene_number"]
+    collision = db.query(Scene).filter(
+        Scene.project_id == data.project_id,
+        Scene.scene_number == reserved_num
+    ).first()
+
+    screenplay_drifted = False
+    if collision is not None:
+        screenplay_drifted = True
     else:
-        cur_chars = db.query(Character).filter(Character.project_id == data.project_id).limit(2).all()
-        for c in cur_chars:
-            current_characters_data.append({
-                "name": c.name, "role": c.role, "clothing": c.clothing,
-                "facial_characteristics": c.facial_characteristics
-            })
-
-    current_loc_data = None
-    if data.location_id:
-        cur_loc = db.query(Location).filter(
-            Location.id == data.location_id,
-            Location.project_id == data.project_id
-        ).first()
-        if cur_loc:
-            current_loc_data = {
-                "name": cur_loc.name,
-                "time_of_day": cur_loc.time_of_day,
-                "lighting_setup": cur_loc.lighting_setup
-            }
-
-    current_screenplay_hash = PipelineOrchestrator.compute_artifact_hash(db, data.project_id, "screenplay")
+        base_ids = job_payload.get("base_scene_ids", [])
+        if base_ids:
+            cur_base_scenes = db.query(Scene).filter(Scene.id.in_(base_ids)).order_by(Scene.order_index).all()
+            if len(cur_base_scenes) != len(base_ids):
+                screenplay_drifted = True
+            else:
+                canonical_base = [
+                    {
+                        "scene_number": s.scene_number,
+                        "order_index": s.order_index,
+                        "slugline": s.slugline or "",
+                        "title": s.title or "",
+                        "summary": s.summary or "",
+                        "script_content": s.script_content or "",
+                        "estimated_duration": s.estimated_duration or 0
+                    }
+                    for s in cur_base_scenes
+                ]
+                cur_base_hash = hashlib.sha256(
+                    json.dumps(canonical_base, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('utf-8')
+                ).hexdigest()
+                if cur_base_hash != job_payload.get("input_screenplay_hash"):
+                    screenplay_drifted = True
 
     current_canonical_input = build_canonical_generation_input(
         project_title=project.name,
         project_genre=project.genre,
-        scene_number=current_next_num,
+        scene_number=reserved_num,
         prompt=data.prompt or "",
         characters=current_characters_data,
         location=current_loc_data,
-        screenplay_hash=current_screenplay_hash,
-        config=generation_config
+        screenplay_hash=job_payload.get("input_screenplay_hash"),
+        config=cur_config
     )
     current_generation_input_hash = compute_generation_input_hash(current_canonical_input)
 
-    if current_generation_input_hash != generation_input_hash:
+    if screenplay_drifted or current_generation_input_hash != generation_input_hash:
         db.rollback()
         if cost_rec:
             cost_controller.record_compensation(
@@ -467,13 +622,14 @@ def generate_ai_scene(data: GenerateSceneRequest, db: Session = Depends(get_db))
 
     committed = False
     try:
+        last_scene_locked = db.query(Scene).filter(Scene.project_id == data.project_id).order_by(Scene.order_index.desc()).first()
         final_order = (last_scene_locked.order_index + 1) if last_scene_locked else 1
 
         scene = Scene(
             project_id=data.project_id,
-            scene_number=current_next_num,
+            scene_number=reserved_num,
             slugline=generated.get("slugline", "INT. UNKNOWN SET - NIGHT"),
-            title=generated.get("title", f"Scene {current_next_num}"),
+            title=generated.get("title", f"Scene {reserved_num}"),
             summary=generated.get("summary", ""),
             script_content=generated.get("script_content", ""),
             location_id=data.location_id,
