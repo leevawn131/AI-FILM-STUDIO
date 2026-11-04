@@ -261,6 +261,8 @@ export interface BudgetSummary {
   budget_spent: number;
   budget_remaining: number;
   percent_used: number;
+  budget_warning_threshold?: number;
+  warning_triggered?: boolean;
   total_actions: number;
   total_flow_credits?: number;
   provider_breakdown?: Record<string, number>;
@@ -903,6 +905,7 @@ export async function fetchCheckpointDetail(
 }
 
 export interface AIStatusResponse {
+  primary_provider?: string;
   active_provider: string;
   ollama: {
     provider: string;
@@ -911,6 +914,7 @@ export interface AIStatusResponse {
     configured_model?: string;
     model_available?: boolean;
     available_models?: string[];
+    enabled?: boolean;
     error?: string;
   };
   gemini: {
@@ -925,6 +929,17 @@ export interface AIStatusResponse {
     status: string;
     configured_model: string;
   };
+  google_drive?: {
+    enabled: boolean;
+    is_configured: boolean;
+    status: string;
+    message: string;
+  };
+  google_models?: {
+    text: string;
+    image: string;
+    video: string;
+  };
 }
 
 export async function fetchAIStatus(): Promise<AIStatusResponse> {
@@ -932,13 +947,140 @@ export async function fetchAIStatus(): Promise<AIStatusResponse> {
   return parseApiResponse<AIStatusResponse>(res, 'Failed to fetch AI engine status');
 }
 
-export async function updateAIConfig(data: { provider?: string; ollama_host?: string; ollama_model?: string }): Promise<any> {
+export async function updateAIConfig(data: {
+  provider?: string;
+  gemini_api_key?: string;
+  gemini_model?: string;
+  ollama_enabled?: boolean;
+  ollama_host?: string;
+  ollama_model?: string;
+  google_image_model?: string;
+  google_video_model?: string;
+}): Promise<any> {
   const res = await fetch(`${API_BASE}/system/ai-config`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   });
   return parseApiResponse<any>(res, 'Failed to update AI configuration');
+}
+
+// ---------------------------------------------------------------------------
+// Google Cloud AI & Asynchronous Generation Jobs
+// ---------------------------------------------------------------------------
+
+export interface GenerationJob {
+  id: string;
+  project_id: string;
+  scene_id?: string | null;
+  shot_id?: string | null;
+  provider: string;
+  model: string;
+  generation_type: string;
+  input_parameters?: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
+  provider_operation_id?: string | null;
+  supports_cancellation: boolean;
+  result_metadata?: string;
+  result_asset_id?: string | null;
+  error_details?: string;
+  retry_count: number;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+}
+
+export async function fetchGenerationJobs(
+  projectId: string,
+  filters?: { scene_id?: string; shot_id?: string; generation_type?: string }
+): Promise<GenerationJob[]> {
+  const params = new URLSearchParams();
+  if (filters?.scene_id) params.append('scene_id', filters.scene_id);
+  if (filters?.shot_id) params.append('shot_id', filters.shot_id);
+  if (filters?.generation_type) params.append('generation_type', filters.generation_type);
+
+  const qs = params.toString() ? `?${params.toString()}` : '';
+  const res = await fetch(`${API_BASE}/jobs/generation/list/${projectId}${qs}`);
+  return parseApiResponse<GenerationJob[]>(res, 'Failed to fetch generation jobs');
+}
+
+export async function submitImageGenerationJob(payload: {
+  project_id: string;
+  prompt: string;
+  aspect_ratio?: string;
+  entity_type?: string;
+  entity_id?: string;
+  negative_prompt?: string;
+}): Promise<GenerationJob> {
+  const res = await fetch(`${API_BASE}/jobs/generation/image`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiResponse<GenerationJob>(res, 'Failed to submit image generation job');
+}
+
+export async function submitVideoGenerationJob(payload: {
+  project_id: string;
+  shot_id: string;
+  prompt: string;
+  duration_seconds?: number;
+  aspect_ratio?: string;
+  negative_prompt?: string;
+}): Promise<GenerationJob> {
+  const res = await fetch(`${API_BASE}/jobs/generation/video`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiResponse<GenerationJob>(res, 'Failed to submit video generation job');
+}
+
+export async function cancelGenerationJob(jobId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/jobs/generation/${jobId}/cancel`, {
+    method: 'POST',
+  });
+  return parseApiResponse(res, 'Failed to cancel generation job');
+}
+
+export async function retryGenerationJob(jobId: string): Promise<GenerationJob> {
+  const res = await fetch(`${API_BASE}/jobs/generation/${jobId}/retry`, {
+    method: 'POST',
+  });
+  return parseApiResponse<GenerationJob>(res, 'Failed to retry generation job');
+}
+
+export async function fetchGoogleDriveStatus(): Promise<any> {
+  const res = await fetch(`${API_BASE}/system/google-drive/status`);
+  return parseApiResponse(res, 'Failed to fetch Google Drive status');
+}
+
+export async function backupToGoogleDrive(projectId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/system/google-drive/backup/${projectId}`, {
+    method: 'POST',
+  });
+  return parseApiResponse(res, 'Failed to backup project to Google Drive');
+}
+
+export async function checkOperationAuthorization(
+  projectId: string,
+  operation: string,
+  estimatedCost: number
+): Promise<{
+  authorized: boolean;
+  can_proceed: boolean;
+  requires_confirmation: boolean;
+  warning_threshold_exceeded?: boolean;
+  estimated_cost: number;
+  budget_total: number;
+  budget_remaining: number;
+  message?: string;
+  reason?: string;
+}> {
+  const res = await fetch(
+    `${API_BASE}/cost/check-authorization/${projectId}?operation=${encodeURIComponent(operation)}&estimated_cost=${estimatedCost}`
+  );
+  return parseApiResponse(res, 'Failed to check operation budget authorization');
 }
 
 export async function fetchShotVersions(shotId: string): Promise<MediaAsset[]> {

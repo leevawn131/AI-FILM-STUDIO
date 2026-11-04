@@ -1,6 +1,7 @@
 import os
 import shutil
 from pathlib import Path
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -42,19 +43,33 @@ class Settings(BaseSettings):
     allowed_image_extensions: list[str] = [".jpg", ".jpeg", ".png", ".webp"]
     allowed_audio_extensions: list[str] = [".mp3", ".wav", ".aac", ".m4a", ".ogg"]
     
-    # AI Engine & Provider Configuration
-    ai_provider: str = os.getenv("AI_PROVIDER", "ollama") # ollama, gemini, offline_template
+    # AI Engine & Provider Configuration (Google Cloud AI First)
+    ai_provider: str = os.getenv("AI_PROVIDER", "gemini") # gemini (default), ollama (optional local fallback), offline_template
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "60"))
+    gemini_max_retries: int = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
+    
+    # Google Generative Media Services (Imagen & Veo)
+    google_image_model: str = os.getenv("GOOGLE_IMAGE_MODEL", "imagen-3.0-generate-002")
+    google_video_model: str = os.getenv("GOOGLE_VIDEO_MODEL", "veo-2.0-generate-001")
+    
+    # Optional Google Drive Integration
+    google_drive_enabled: bool = os.getenv("GOOGLE_DRIVE_ENABLED", "false").lower() in ("true", "1")
+    google_drive_credentials_file: Optional[str] = os.getenv("GOOGLE_DRIVE_CREDENTIALS_FILE", None)
+    
+    # Optional Local Fallback Providers
+    ollama_enabled: bool = os.getenv("OLLAMA_ENABLED", "false").lower() in ("true", "1")
     ollama_host: str = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.2")
     ollama_timeout_seconds: int = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90"))
-    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     
-    # Filmmaking Defaults
+    # Filmmaking Defaults & Budget
     default_fps: int = 24
     default_aspect_ratio: str = "16:9"
     default_resolution: str = "1920x1080"
     default_project_budget: float = 100.0
+    budget_warning_threshold: float = float(os.getenv("BUDGET_WARNING_THRESHOLD", "0.8"))
     
     # FFmpeg tool discovery
     ffmpeg_path: str = shutil.which("ffmpeg") or "ffmpeg"

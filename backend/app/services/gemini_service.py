@@ -1,10 +1,11 @@
 """
-AI Generation Service with Ollama local engine, Google Gemini, and Offline Studio Engine.
+AI Generation Service with Google Cloud Gemini primary intelligence, optional Ollama fallback, and Offline Studio Engine.
 Enforces:
-- Local Ollama execution by default (zero external cost, offline private processing)
-- Google Gemini when configured with GEMINI_API_KEY
+- Google Cloud Gemini execution by default (Google Cloud AI First architecture)
+- Optional Ollama local fallback only when explicitly enabled (settings.ollama_enabled = True)
 - Seamless fallback to Offline Studio Engine with explicit metadata
 - Accurate attribution of provider, model, tokens, and fallback status
+- Zero silent faking of AI generation
 """
 
 import logging
@@ -131,8 +132,8 @@ class GeminiService:
             except Exception as e:
                 logger.warning(f"Gemini screenplay call failed ({e}). Attempting local engine.")
 
-        # 2. Try Local Ollama if active
-        if chosen_provider in ("ollama", "local", None) and not self.has_gemini:
+        # 2. Try Local Ollama if explicitly enabled
+        if (chosen_provider == "ollama" or (chosen_provider in ("local", None) and getattr(settings, "ollama_enabled", False))) and not self.has_gemini:
             try:
                 from backend.app.services.ai_provider import OllamaProvider
                 ollama = OllamaProvider()
@@ -204,8 +205,8 @@ class GeminiService:
             except Exception as e:
                 logger.warning(f"Gemini shot generation failed ({e}). Attempting local engine.")
 
-        # 2. Try Local Ollama
-        if chosen_provider in ("ollama", "local", None) and not self.has_gemini:
+        # 2. Try Local Ollama if explicitly enabled
+        if (chosen_provider == "ollama" or (chosen_provider in ("local", None) and getattr(settings, "ollama_enabled", False))) and not self.has_gemini:
             try:
                 from backend.app.services.ai_provider import OllamaProvider
                 ollama = OllamaProvider()

@@ -14,6 +14,8 @@ Enforces:
 
 import os
 import json
+import time
+import random
 import logging
 import urllib.request
 import urllib.error
@@ -275,6 +277,7 @@ class GeminiProvider(BaseAIProvider):
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
         self.model = model or settings.gemini_model
+        self.max_retries = getattr(settings, "gemini_max_retries", 3)
         self._client = None
         if self.api_key:
             try:
@@ -293,7 +296,7 @@ class GeminiProvider(BaseAIProvider):
                 "provider": "gemini",
                 "status": "not_configured",
                 "configured_model": self.model,
-                "note": "GEMINI_API_KEY is not set. Ollama or Offline Engine will be used."
+                "note": "GEMINI_API_KEY is not set. Add your API key in settings to enable Google Cloud AI."
             }
         return {
             "provider": "gemini",
@@ -305,6 +308,37 @@ class GeminiProvider(BaseAIProvider):
     def get_available_models(self) -> List[str]:
         return ["gemini-2.5-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
 
+    def _execute_with_retry(self, fn, *args, **kwargs):
+        """
+        Executes a call against Google GenAI with exponential backoff on transient errors.
+        Handles:
+        - Rate limits (HTTP 429)
+        - Service Unavailable (HTTP 503)
+        - Connection timeouts
+        Never retries indefinitely (max_retries = 3).
+        Non-transient errors (auth error, invalid argument, quota exhaustion) raise immediately.
+        """
+        attempt = 0
+        while attempt <= self.max_retries:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                err_str = str(e).lower()
+                is_transient = any(term in err_str for term in ["429", "rate limit", "503", "unavailable", "timeout", "resource exhausted", "overloaded"])
+                
+                # If non-transient or exhausted retries, raise immediately
+                if not is_transient or attempt >= self.max_retries:
+                    if "api_key" in err_str or "unauthenticated" in err_str or "403" in err_str:
+                        raise AIProviderError(f"Google Gemini authentication failed: {e}")
+                    if "404" in err_str or "not found" in err_str:
+                        raise AIModelNotFoundError(f"Google Gemini model '{self.model}' not found: {e}")
+                    raise AIProviderError(f"Google Gemini API error: {e}")
+
+                attempt += 1
+                backoff = (1.5 ** attempt) + (random.uniform(0.1, 0.4))
+                logger.warning(f"Google Gemini transient error ({e}). Retrying attempt {attempt}/{self.max_retries} in {backoff:.2f}s...")
+                time.sleep(backoff)
+
     def generate_text(
         self,
         prompt: str,
@@ -314,12 +348,21 @@ class GeminiProvider(BaseAIProvider):
         if not self._client:
             raise AIProviderError("Google Gemini API is not configured. Provide GEMINI_API_KEY.")
 
+        from google.genai import types
         sys_inst = system_prompt or "You are an expert Hollywood cinematic AI assistant."
-        response = self._client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config={"system_instruction": sys_inst}
+        config = types.GenerateContentConfig(
+            system_instruction=sys_inst,
+            temperature=kwargs.get("temperature", 0.7)
         )
+
+        def _call():
+            return self._client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=config
+            )
+
+        response = self._execute_with_retry(_call)
         content = response.text or ""
 
         # Extract tokens
@@ -335,7 +378,8 @@ class GeminiProvider(BaseAIProvider):
             "total_tokens": tot_tokens,
             "usage_known": prompt_tokens is not None,
             "is_fallback": False,
-            "engine_label": f"Google Gemini ({self.model})"
+            "engine_label": f"Google Gemini ({self.model})",
+            "generation_status": "completed"
         }
         return content, meta
 
@@ -346,17 +390,70 @@ class GeminiProvider(BaseAIProvider):
         system_prompt: Optional[str] = None,
         **kwargs
     ) -> Tuple[T, Dict[str, Any]]:
-        schema_json = json.dumps(schema.model_json_schema(), indent=2)
-        full_sys = (
-            (system_prompt or "You are an expert Hollywood screenwriter and director AI.")
-            + f"\nCRITICAL: Output ONLY a single JSON object strictly matching this schema:\n{schema_json}"
+        if not self._client:
+            raise AIProviderError("Google Gemini API is not configured. Provide GEMINI_API_KEY.")
+
+        from google.genai import types
+        sys_inst = (system_prompt or "You are an expert Hollywood screenwriter and director AI.")
+        config = types.GenerateContentConfig(
+            system_instruction=sys_inst,
+            response_mime_type="application/json",
+            response_schema=schema,
+            temperature=kwargs.get("temperature", 0.7)
         )
-        raw_text, meta = self.generate_text(prompt=prompt, system_prompt=full_sys)
+
+        def _call():
+            return self._client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=config
+            )
+
+        response = self._execute_with_retry(_call)
+        raw_text = response.text or ""
+
+        prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", None) if hasattr(response, "usage_metadata") else None
+        cand_tokens = getattr(response.usage_metadata, "candidates_token_count", None) if hasattr(response, "usage_metadata") else None
+        tot_tokens = (prompt_tokens or 0) + (cand_tokens or 0)
+
+        meta = {
+            "provider": "gemini",
+            "model": self.model,
+            "input_tokens": prompt_tokens,
+            "output_tokens": cand_tokens,
+            "total_tokens": tot_tokens,
+            "usage_known": prompt_tokens is not None,
+            "is_fallback": False,
+            "engine_label": f"Google Gemini ({self.model})",
+            "generation_status": "completed"
+        }
+
         validated, err = parse_and_validate_structured_json(raw_text, schema)
         if validated:
             return validated, meta
 
-        raise AIStructuredOutputError(f"Gemini output failed schema validation for {schema.__name__}: {err}")
+        # 1-step self-correction retry
+        logger.warning(f"Gemini structured output validation failed: {err}. Retrying with correction prompt...")
+        correction_prompt = (
+            f"Original prompt:\n{prompt}\n\n"
+            f"Your previous response had JSON/schema validation errors:\n{err}\n"
+            "Please output ONLY the corrected, valid JSON conforming to the requested schema."
+        )
+
+        def _call_retry():
+            return self._client.models.generate_content(
+                model=self.model,
+                contents=correction_prompt,
+                config=config
+            )
+
+        retry_resp = self._execute_with_retry(_call_retry)
+        retry_text = retry_resp.text or ""
+        validated_retry, retry_err = parse_and_validate_structured_json(retry_text, schema)
+        if validated_retry:
+            return validated_retry, meta
+
+        raise AIStructuredOutputError(f"Gemini output failed schema validation for {schema.__name__}: {retry_err}")
 
 
 class OfflineTemplateProvider(BaseAIProvider):
@@ -537,14 +634,27 @@ def get_ai_provider(provider_override: Optional[str] = None) -> BaseAIProvider:
     Factory function returning the configured AI provider.
     Priority:
     1. Explicit provider_override if given.
-    2. settings.ai_provider ("ollama", "gemini", "offline_template").
+    2. settings.ai_provider ("gemini", "ollama", "offline_template").
+    Default is "gemini" (Google Cloud AI First).
+    If "gemini" is selected but no GEMINI_API_KEY is configured:
+    - If settings.ollama_enabled is True, check if Ollama is online.
+    - Otherwise, falls back to OfflineTemplateProvider with clear is_fallback attribution.
     """
-    target = (provider_override or settings.ai_provider or "ollama").lower().strip()
+    target = (provider_override or settings.ai_provider or "gemini").lower().strip()
 
     if target == "gemini":
-        return GeminiProvider()
+        gemini = GeminiProvider()
+        if gemini.api_key:
+            return gemini
+        if getattr(settings, "ollama_enabled", False):
+            ollama = OllamaProvider()
+            if ollama.health_check().get("status") == "online":
+                return ollama
+        return OfflineTemplateProvider()
     elif target in ("offline", "offline_template", "template"):
         return OfflineTemplateProvider()
-    else:
-        # Default to Ollama for local-first execution
+    elif target == "ollama":
         return OllamaProvider()
+    else:
+        # Default fallback to Gemini
+        return GeminiProvider()

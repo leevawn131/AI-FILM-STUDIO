@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AI Film Studio - Hybrid Edition
-# Local Production Startup Script for Ubuntu Linux
+# AI FILM STUDIO — LOCAL WEB APPLICATION, GOOGLE CLOUD AI ECOSYSTEM
+# Production Startup Script for Ubuntu/Debian Linux
 # ==============================================================================
 
 set -e
@@ -10,7 +10,8 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 cd "$DIR"
 
 echo "=========================================================="
-echo "🎬 STARTING AI FILM STUDIO - LOCAL PRODUCTION EDITION"
+echo "🎬 STARTING AI FILM STUDIO"
+echo "   Architecture: Local Web Application + Google Cloud AI"
 echo "=========================================================="
 
 # 1. Environment & Directories
@@ -20,16 +21,32 @@ HOST="${STUDIO_HOST:-127.0.0.1}"
 BACKEND_PORT="${PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 
-# 2. Check FFmpeg and FFprobe
+# 2. Check Backend Dependencies
+if [ ! -d "backend/venv" ] || [ ! -f "backend/venv/bin/uvicorn" ]; then
+    echo "❌ Error: Python virtual environment not found in backend/venv."
+    echo "👉 Please set up: cd backend && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+    exit 1
+fi
+echo "✅ Backend Python virtualenv detected."
+
+# 3. Check Frontend Dependencies
+if [ ! -d "frontend/node_modules" ]; then
+    echo "❌ Error: Frontend node_modules not found."
+    echo "👉 Please install frontend packages: cd frontend && npm install"
+    exit 1
+fi
+echo "✅ Frontend Node dependencies detected."
+
+# 4. Check FFmpeg and FFprobe (Local Video Processing)
 if ! command -v ffmpeg &> /dev/null || ! command -v ffprobe &> /dev/null; then
     echo "❌ Error: FFmpeg and/or FFprobe not found in PATH."
     echo "👉 Please install FFmpeg on Ubuntu: sudo apt update && sudo apt install -y ffmpeg"
     exit 1
 else
-    echo "✅ FFmpeg & FFprobe detected: $(ffmpeg -version | head -n 1)"
+    echo "✅ Local FFmpeg & FFprobe detected: $(ffmpeg -version | head -n 1)"
 fi
 
-# 3. Check for Port Conflicts
+# 5. Check for Port Conflicts
 check_port() {
     local port=$1
     if command -v lsof &> /dev/null; then
@@ -56,32 +73,47 @@ if ! check_port "$FRONTEND_PORT"; then
     exit 1
 fi
 
-# 4. Check AI Provider & Ollama Status
-OLLAMA_URL="${OLLAMA_HOST:-http://127.0.0.1:11434}"
-OLLAMA_MODEL_NAME="${OLLAMA_MODEL:-llama3.2}"
-
-echo "🧠 Checking AI Provider connection ($OLLAMA_URL)..."
-if curl -s --max-time 2 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
-    echo "✅ Local Ollama is online!"
-    if curl -s "$OLLAMA_URL/api/tags" | grep -q "\"$OLLAMA_MODEL_NAME"; then
-        echo "✅ Model '$OLLAMA_MODEL_NAME' is installed and ready."
-    else
-        echo "⚠️ Model '$OLLAMA_MODEL_NAME' not found in Ollama."
-        echo "👉 Recommended: Run 'ollama pull $OLLAMA_MODEL_NAME' in another terminal."
-        echo "👉 Studio will fall back to Offline Studio Engine until model is pulled."
-    fi
-else
-    echo "ℹ️ Local Ollama is not running at $OLLAMA_URL."
-    echo "👉 To enable local AI: Install from https://ollama.com and run 'ollama serve'."
-    echo "👉 Studio will operate with built-in Offline Studio Engine (or Gemini if API key set)."
+# 6. Check Google Cloud AI (Gemini) Configuration
+ENV_FILE="backend/.env"
+GEMINI_KEY="${GEMINI_API_KEY}"
+if [ -z "$GEMINI_KEY" ] && [ -f "$ENV_FILE" ]; then
+    GEMINI_KEY=$(grep -E "^GEMINI_API_KEY=" "$ENV_FILE" | cut -d'=' -f2- | tr -d ' "' || true)
 fi
 
-# 5. Run Database Migrations
+echo "🧠 Checking Google Cloud AI Intelligence Configuration..."
+if [ -n "$GEMINI_KEY" ]; then
+    echo "✅ Google Gemini API Key configured."
+    # Fast network check (timeout 3s)
+    if curl -s --max-time 3 "https://generativelanguage.googleapis.com" >/dev/null 2>&1; then
+        echo "✅ Connected to Google Generative Language service."
+    else
+        echo "⚠️ Note: Google Cloud AI endpoint connectivity test timed out. Cloud operations will retry automatically."
+    fi
+else
+    echo "ℹ️ GEMINI_API_KEY is not configured yet."
+    echo "👉 AI Film Studio will open in Local Workspace mode (full access to projects, media, and timeline)."
+    echo "👉 You can enter your Gemini API key in the UI header anytime to activate cloud AI features."
+fi
+
+# Check optional Ollama status only if explicitly enabled
+OLLAMA_IS_ENABLED="${OLLAMA_ENABLED:-false}"
+if [ "$OLLAMA_IS_ENABLED" = "true" ]; then
+    OLLAMA_URL="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+    if curl -s --max-time 2 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+        echo "✅ Optional local Ollama fallback is online ($OLLAMA_URL)."
+    else
+        echo "ℹ️ Optional Ollama is enabled but not responding at $OLLAMA_URL."
+    fi
+else
+    echo "ℹ️ Local Ollama fallback is disabled (OLLAMA_ENABLED=false). Ollama is NOT required."
+fi
+
+# 7. Run Database Migrations
 echo "🔄 Applying Alembic database migrations..."
 export PYTHONPATH=.
 backend/venv/bin/alembic upgrade head
 
-# 6. Trap signals for clean shutdown
+# 8. Trap signals for clean shutdown
 cleanup() {
     echo ""
     echo "🛑 Gracefully shutting down AI Film Studio servers..."
@@ -97,7 +129,7 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM EXIT
 
-# 7. Start FastAPI Backend (Bound strictly to 127.0.0.1 by default)
+# 9. Start FastAPI Backend (Strictly bound to 127.0.0.1)
 echo "🚀 Launching FastAPI Backend on http://$HOST:$BACKEND_PORT..."
 backend/venv/bin/uvicorn backend.app.main:app --host "$HOST" --port "$BACKEND_PORT" &
 BACKEND_PID=$!
@@ -111,7 +143,7 @@ for i in {1..20}; do
     sleep 0.5
 done
 
-# 8. Start Vite Frontend (Bound strictly to 127.0.0.1 by default)
+# 10. Start Vite Frontend (Strictly bound to 127.0.0.1)
 echo "✨ Launching Vite React Cinematic Frontend on http://$HOST:$FRONTEND_PORT..."
 cd frontend
 npm run dev -- --host "$HOST" --port "$FRONTEND_PORT" &

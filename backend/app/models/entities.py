@@ -25,6 +25,7 @@ class Project(Base):
     visual_style = Column(Text, default="Cinematic 35mm film look, anamorphic lens flares, rich color grading, natural depth of field")
     budget_total = Column(Float, default=100.0)
     budget_spent = Column(Float, default=0.0)
+    budget_warning_threshold = Column(Float, default=0.8)
     # Soft deletion timestamp (preserves immutable audit journal and stage histories)
     deleted_at = Column(DateTime, nullable=True)
 
@@ -45,6 +46,7 @@ class Project(Base):
     cost_records = relationship("CostRecord", back_populates="project", cascade="all, delete-orphan")
     export_jobs = relationship("ExportJob", back_populates="project", cascade="all, delete-orphan")
     studio_jobs = relationship("StudioJob", back_populates="project", cascade="all, delete-orphan")
+    generation_jobs = relationship("GenerationJob", back_populates="project", cascade="all, delete-orphan")
     upload_operations = relationship("UploadOperation", back_populates="project", cascade="all, delete-orphan")
     stage_states = relationship("PipelineStageState", back_populates="project", passive_deletes=True)
     checkpoints = relationship("PipelineCheckpoint", back_populates="project", passive_deletes=True)
@@ -129,6 +131,7 @@ class Shot(Base):
     seed = Column(Integer, nullable=True)
     generation_status = Column(String(32), default="pending") # pending, ready_for_flow, generating, imported, approved
     video_asset_id = Column(String(36), ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True)
+    generation_job_id = Column(String(36), nullable=True)
     thumbnail_path = Column(String(512), default="")
     flow_credits_spent = Column(Float, default=0.0) # Flow subscription credits recorded for this shot
     generation_attempts = Column(Integer, default=0) # count of Flow generation / regeneration attempts
@@ -139,6 +142,7 @@ class Shot(Base):
     scene = relationship("Scene", back_populates="shots")
     video_asset = relationship("MediaAsset", foreign_keys=[video_asset_id])
     media_versions = relationship("MediaAsset", foreign_keys="[MediaAsset.shot_id]", back_populates="shot")
+    generation_jobs = relationship("GenerationJob", foreign_keys="[GenerationJob.shot_id]", back_populates="shot")
 
 
 class MediaAsset(Base):
@@ -277,6 +281,39 @@ class StudioJob(Base):
     completed_at = Column(DateTime, nullable=True)
 
     project = relationship("Project", back_populates="studio_jobs")
+
+
+class GenerationJob(Base):
+    __tablename__ = "generation_jobs"
+
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    scene_id = Column(String(36), ForeignKey("scenes.id", ondelete="SET NULL"), nullable=True, index=True)
+    shot_id = Column(String(36), ForeignKey("shots.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    provider = Column(String(64), nullable=False, default="gemini") # gemini, google_imagen, google_veo, ollama, offline_template
+    model = Column(String(64), nullable=False)
+    generation_type = Column(String(64), nullable=False, index=True) # text_scene, structured_breakdown, character_design, location_design, cinematography, continuity, image_generation, video_generation
+
+    input_parameters = Column(Text, default="{}") # JSON encoded input payload
+    status = Column(String(32), nullable=False, default="pending", index=True) # pending, processing, completed, failed, cancelled
+
+    provider_operation_id = Column(String(256), nullable=True, index=True) # e.g. Google Veo operation resource name
+    supports_cancellation = Column(Boolean, default=False)
+
+    result_metadata = Column(Text, default="{}") # JSON encoded response metadata, token counts, etc.
+    result_asset_id = Column(String(36), ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True)
+    error_details = Column(Text, default="")
+    retry_count = Column(Integer, default=0)
+
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+    completed_at = Column(DateTime, nullable=True)
+
+    project = relationship("Project", back_populates="generation_jobs")
+    scene = relationship("Scene")
+    shot = relationship("Shot", back_populates="generation_jobs")
+    result_asset = relationship("MediaAsset", foreign_keys=[result_asset_id])
 
 
 class UploadOperation(Base):

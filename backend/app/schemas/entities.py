@@ -252,6 +252,8 @@ class BudgetSummary(BaseModel):
     budget_spent: float
     budget_remaining: float
     percent_used: float
+    budget_warning_threshold: Optional[float] = 0.8
+    warning_triggered: Optional[bool] = False
     total_actions: int
     total_flow_credits: Optional[float] = 0.0
     records: List[CostRecordResponse]
@@ -310,6 +312,47 @@ class StudioJobResponse(BaseModel):
     completed_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class GenerationJobResponse(BaseModel):
+    id: str
+    project_id: str
+    scene_id: Optional[str] = None
+    shot_id: Optional[str] = None
+    provider: str
+    model: str
+    generation_type: str
+    input_parameters: Optional[str] = "{}"
+    status: str
+    provider_operation_id: Optional[str] = None
+    supports_cancellation: bool = False
+    result_metadata: Optional[str] = "{}"
+    result_asset_id: Optional[str] = None
+    error_details: Optional[str] = ""
+    retry_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GenerateImageRequest(BaseModel):
+    project_id: str
+    prompt: str
+    aspect_ratio: Optional[str] = "16:9"
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    negative_prompt: Optional[str] = None
+
+
+class GenerateVideoRequest(BaseModel):
+    project_id: str
+    shot_id: str
+    prompt: str
+    duration_seconds: Optional[int] = 5
+    aspect_ratio: Optional[str] = "16:9"
+    negative_prompt: Optional[str] = None
 
 
 class UploadOperationResponse(BaseModel):

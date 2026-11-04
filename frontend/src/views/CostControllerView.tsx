@@ -122,6 +122,20 @@ export const CostControllerView: React.FC<CostControllerViewProps> = ({
         </div>
       )}
 
+      {/* Warning Threshold Alert Banner */}
+      {summary?.warning_triggered && (
+        <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-start space-x-3 text-amber-300">
+          <AlertTriangle className="w-5 h-5 flex-shrink-0 text-amber-400 mt-0.5" />
+          <div>
+            <h4 className="text-sm font-bold text-amber-200">Budget Warning Threshold Exceeded</h4>
+            <p className="text-xs text-amber-300/90 mt-0.5">
+              You have consumed {percentUsed.toFixed(1)}% of your project budget (threshold: {((summary.budget_warning_threshold ?? 0.8) * 100).toFixed(0)}%).
+              High-consumption cloud operations like video generation will request confirmation before deducting API quota.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
         <div className="p-5 rounded-xl bg-studio-900 border border-studio-800 space-y-1">

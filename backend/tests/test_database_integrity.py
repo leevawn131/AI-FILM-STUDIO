@@ -217,7 +217,7 @@ def test_2_valid_legacy_database_migration_with_backup_and_data_preservation(tmp
     # Verify upgraded columns exist
     cur.execute("SELECT version_num FROM alembic_version")
     ver = cur.fetchone()[0]
-    assert ver in ("0007_upload_operation_lease_fencing", "0008_pipeline_orchestration_tables", "0009_pipeline_fk_restrict", "0010_media_versioning_and_export_modes")
+    assert ver in ("0007_upload_operation_lease_fencing", "0008_pipeline_orchestration_tables", "0009_pipeline_fk_restrict", "0010_media_versioning_and_export_modes", "0011_google_cloud_ai_and_generation_jobs")
 
     cur.execute("PRAGMA table_info(studio_jobs)")
     job_cols = [c[1] for c in cur.fetchall()]
@@ -300,7 +300,7 @@ def test_5_existing_alembic_managed_database_upgrades(tmp_path):
     vconn = sqlite3.connect(str(alembic_db))
     cur = vconn.cursor()
     cur.execute("SELECT version_num FROM alembic_version")
-    assert cur.fetchone()[0] in ("0007_upload_operation_lease_fencing", "0008_pipeline_orchestration_tables", "0009_pipeline_fk_restrict", "0010_media_versioning_and_export_modes")
+    assert cur.fetchone()[0] in ("0007_upload_operation_lease_fencing", "0008_pipeline_orchestration_tables", "0009_pipeline_fk_restrict", "0010_media_versioning_and_export_modes", "0011_google_cloud_ai_and_generation_jobs")
     vconn.close()
 
 def test_database_backup_procedure(tmp_path):

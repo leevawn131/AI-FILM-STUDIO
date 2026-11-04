@@ -10,14 +10,20 @@ from backend.app.database import get_db, backup_database
 from backend.app.services.security import validate_safe_path
 from backend.app.services.ai_provider import OllamaProvider, GeminiProvider, OfflineTemplateProvider
 from backend.app.services.project_backup import project_backup_service
+from backend.app.services.google_drive_service import google_drive_service
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
 class AIConfigRequest(BaseModel):
     provider: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    gemini_model: Optional[str] = None
+    ollama_enabled: Optional[bool] = None
     ollama_host: Optional[str] = None
     ollama_model: Optional[str] = None
+    google_image_model: Optional[str] = None
+    google_video_model: Optional[str] = None
 
 
 @router.get("/ai-status")
@@ -32,31 +38,89 @@ def get_ai_status():
     offline_status = offline.health_check()
 
     return {
+        "primary_provider": "gemini",
         "active_provider": settings.ai_provider,
-        "ollama": ollama_status,
         "gemini": gemini_status,
-        "offline_template": offline_status
+        "ollama": {
+            **ollama_status,
+            "enabled": getattr(settings, "ollama_enabled", False)
+        },
+        "offline_template": offline_status,
+        "google_drive": google_drive_service.get_status(),
+        "google_models": {
+            "text": settings.gemini_model,
+            "image": getattr(settings, "google_image_model", "imagen-3.0-generate-002"),
+            "video": getattr(settings, "google_video_model", "veo-2.0-generate-001")
+        }
     }
 
 
 @router.post("/ai-config")
 def update_ai_config(req: AIConfigRequest):
-    """Dynamically updates active AI provider or Ollama settings."""
+    """Dynamically updates active AI provider, Gemini API key, or optional Ollama settings."""
     if req.provider:
         prov = req.provider.lower().strip()
         if prov not in ("ollama", "gemini", "offline_template", "offline"):
-            raise HTTPException(status_code=400, detail=f"Invalid AI provider '{req.provider}'. Must be 'ollama', 'gemini', or 'offline_template'.")
+            raise HTTPException(status_code=400, detail=f"Invalid AI provider '{req.provider}'. Must be 'gemini', 'ollama', or 'offline_template'.")
         settings.ai_provider = prov
+
+    if req.gemini_api_key is not None:
+        settings.gemini_api_key = req.gemini_api_key.strip()
+        os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
+
+    if req.gemini_model:
+        settings.gemini_model = req.gemini_model.strip()
+
+    if req.ollama_enabled is not None:
+        settings.ollama_enabled = req.ollama_enabled
+
     if req.ollama_host:
         settings.ollama_host = req.ollama_host.strip()
+
     if req.ollama_model:
         settings.ollama_model = req.ollama_model.strip()
+
+    if req.google_image_model:
+        settings.google_image_model = req.google_image_model.strip()
+
+    if req.google_video_model:
+        settings.google_video_model = req.google_video_model.strip()
 
     return {
         "status": "success",
         "active_provider": settings.ai_provider,
+        "gemini_configured": bool(settings.gemini_api_key),
+        "gemini_model": settings.gemini_model,
+        "ollama_enabled": getattr(settings, "ollama_enabled", False),
         "ollama_host": settings.ollama_host,
         "ollama_model": settings.ollama_model
+    }
+
+
+@router.get("/google-drive/status")
+def get_google_drive_status():
+    """Returns optional Google Drive cloud backup availability status."""
+    return google_drive_service.get_status()
+
+
+@router.get("/google-drive/backups")
+def list_google_drive_backups():
+    """Lists remote project backups stored in Google Drive."""
+    return google_drive_service.list_remote_backups()
+
+
+@router.post("/google-drive/backup/{project_id}")
+def backup_to_google_drive(project_id: str, db: Session = Depends(get_db)):
+    """Exports project ZIP package and uploads it to Google Drive."""
+    # 1. Create local zip package
+    res = project_backup_service.export_project_archive(db, project_id)
+    zip_path = Path(res["archive_path"])
+
+    # 2. Upload to Google Drive if configured
+    drive_res = google_drive_service.upload_project_backup(project_id, zip_path)
+    return {
+        "local_backup": res,
+        "drive_sync": drive_res
     }
 
 @router.post("/backup")

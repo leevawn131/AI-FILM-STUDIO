@@ -17,6 +17,8 @@ import {
   PipelineCheckpointDetail,
   fetchShotVersions,
   selectShotVersion,
+  submitVideoGenerationJob,
+  checkOperationAuthorization,
   ApiClientError
 } from '../api/client';
 import { ViewTab } from '../components/Sidebar';
@@ -295,6 +297,35 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
       setTimeout(() => setVersionActionMsg(null), 3000);
     } catch (err: any) {
       setVersionActionMsg(`Failed: ${err.message || err}`);
+    }
+  };
+
+  const handleGenerateWithVeo = async (shot: Shot) => {
+    if (!activeProject) return;
+    try {
+      const auth = await checkOperationAuthorization(activeProject.id, 'veo_video_generation', 0.20);
+      if (!auth.authorized) {
+        alert(auth.reason || 'Insufficient project budget for video generation.');
+        return;
+      }
+      if (auth.requires_confirmation) {
+        const confirmGen = window.confirm(
+          `Google Veo Cloud Generation:\n\nEstimated cost: $0.20\nRemaining budget: $${auth.budget_remaining.toFixed(2)}\n\nSubmit asynchronous video generation for shot ${shot.shot_code}?`
+        );
+        if (!confirmGen) return;
+      }
+
+      await submitVideoGenerationJob({
+        project_id: activeProject.id,
+        shot_id: shot.id,
+        prompt: shot.video_prompt || shot.visual_description,
+        duration_seconds: Math.round(shot.duration_seconds || 5),
+        aspect_ratio: activeProject.aspect_ratio || '16:9'
+      });
+      alert(`Google Veo generation submitted for ${shot.shot_code}! Status set to generating.`);
+      await loadScenesAndShots();
+    } catch (err: any) {
+      alert('Veo submission failed: ' + (err.message || String(err)));
     }
   };
 
@@ -855,12 +886,23 @@ export const StoryboardView: React.FC<StoryboardViewProps> = ({
                   <span>Cinematographer Polish</span>
                 </button>
 
-                <button
-                  onClick={() => handleCopyPrompt(shot)}
-                  className="bg-studio-800 hover:bg-studio-700 text-slate-200 px-3 py-1 rounded text-[11px] font-semibold border border-studio-700 transition-colors"
-                >
-                  {isCopied ? 'Copied to Clipboard' : 'Copy Flow Prompt'}
-                </button>
+                <div className="flex items-center space-x-2">
+                  <button
+                    onClick={() => handleGenerateWithVeo(shot)}
+                    className="bg-cinema-cyan/20 hover:bg-cinema-cyan/30 text-cinema-cyan px-2.5 py-1 rounded text-[11px] font-bold border border-cinema-cyan/40 transition-colors flex items-center space-x-1"
+                    title="Submit asynchronous generation to Google Veo"
+                  >
+                    <Video className="w-3 h-3" />
+                    <span>Veo Video</span>
+                  </button>
+
+                  <button
+                    onClick={() => handleCopyPrompt(shot)}
+                    className="bg-studio-800 hover:bg-studio-700 text-slate-200 px-3 py-1 rounded text-[11px] font-semibold border border-studio-700 transition-colors"
+                  >
+                    {isCopied ? 'Copied' : 'Flow Prompt'}
+                  </button>
+                </div>
               </div>
             </div>
           );
