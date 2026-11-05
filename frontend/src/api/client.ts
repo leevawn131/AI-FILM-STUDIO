@@ -759,6 +759,71 @@ export async function deleteAudioTrack(trackId: string): Promise<void> {
   if (!res.ok) throw new Error('Failed to delete audio track');
 }
 
+export interface GoogleTTSVoicesResponse {
+  provider: string;
+  default_model: string;
+  voices: Record<string, { gender: string; tone: string; suggested_roles: string[] }>;
+}
+
+export async function fetchTTSVoices(): Promise<GoogleTTSVoicesResponse> {
+  const res = await fetch(`${API_BASE}/audio/voices`);
+  if (!res.ok) throw new Error('Failed to fetch TTS voices');
+  return res.json();
+}
+
+export async function generateGoogleTTSDialogue(
+  projectId: string,
+  data: {
+    text: string;
+    voice_name?: string;
+    character_name?: string;
+    character_id?: string;
+    emotion?: string;
+    speaking_pace?: number;
+    language_code?: string;
+    scene_id?: string;
+    shot_id?: string;
+    track_type?: string;
+  }
+): Promise<AudioTrack> {
+  const res = await fetch(`${API_BASE}/audio/tts/generate/${projectId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to generate Google TTS speech');
+  }
+  return res.json();
+}
+
+export async function generateGoogleLyriaMusic(
+  projectId: string,
+  data: {
+    mood?: string;
+    genre?: string;
+    bpm?: number;
+    instruments?: string[];
+    energy?: string;
+    duration_seconds?: number;
+    instrumental?: boolean;
+    scene_id?: string;
+    prompt?: string;
+  }
+): Promise<AudioTrack> {
+  const res = await fetch(`${API_BASE}/audio/music/generate/${projectId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to generate Google Lyria music');
+  }
+  return res.json();
+}
+
 // Export API methods
 export async function fetchExportPresets(): Promise<Record<string, PresetConfig>> {
   const res = await fetch(`${API_BASE}/export/presets`);

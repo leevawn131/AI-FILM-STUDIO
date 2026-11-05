@@ -46,13 +46,26 @@ class Settings(BaseSettings):
     # AI Engine & Provider Configuration (Google Cloud AI First)
     ai_provider: str = os.getenv("AI_PROVIDER", "gemini") # gemini (default), ollama (optional local fallback), offline_template
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "60"))
     gemini_max_retries: int = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
     
-    # Google Generative Media Services (Imagen & Veo)
-    google_image_model: str = os.getenv("GOOGLE_IMAGE_MODEL", "imagen-3.0-generate-002")
-    google_video_model: str = os.getenv("GOOGLE_VIDEO_MODEL", "veo-2.0-generate-001")
+    # Google Generative Media Services
+    # Image Generation (Nano Banana 2 family)
+    google_image_model: str = os.getenv("GOOGLE_IMAGE_MODEL", "gemini-3.1-flash-image")
+    google_image_pro_model: str = os.getenv("GOOGLE_IMAGE_PRO_MODEL", "gemini-3-pro-image")
+    google_image_lite_model: str = os.getenv("GOOGLE_IMAGE_LITE_MODEL", "gemini-3.1-flash-lite-image")
+
+    # Video Generation (Gemini Omni Flash 1.1 via Interactions API)
+    google_video_model: str = os.getenv("GOOGLE_VIDEO_MODEL", "gemini-omni-1.1-flash")
+
+    # Text-to-Speech (Gemini TTS)
+    google_tts_model: str = os.getenv("GOOGLE_TTS_MODEL", "gemini-3.8-flash-tts")
+    google_tts_lite_model: str = os.getenv("GOOGLE_TTS_LITE_MODEL", "gemini-3.8-flash-lite-tts")
+
+    # Music Generation (Lyria 3.5 via Interactions API)
+    google_music_model: str = os.getenv("GOOGLE_MUSIC_MODEL", "lyria-3.5")
+    google_music_clip_model: str = os.getenv("GOOGLE_MUSIC_CLIP_MODEL", "lyria-3-clip-preview")
     
     # Optional Google Drive Integration
     google_drive_enabled: bool = os.getenv("GOOGLE_DRIVE_ENABLED", "false").lower() in ("true", "1")

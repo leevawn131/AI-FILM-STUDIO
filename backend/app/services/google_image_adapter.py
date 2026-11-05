@@ -1,18 +1,21 @@
 """
-Google Imagen 3 Image Generation Adapter.
-Officially supported Google Generative AI image generation via `google-genai` SDK.
+Google Nano Banana 2 Image Generation Adapter.
+Officially supported Google Cloud AI image generation via `google-genai` SDK.
 
 Capabilities:
+- Nano Banana 2 (`gemini-3.1-flash-image`) default fast cinematic image generation
+- Nano Banana Pro (`gemini-3-pro-image`) high-fidelity artistic renders
+- Nano Banana 2 Lite (`gemini-3.1-flash-lite-image`) lightweight rapid ideation
 - Character reference portraits and costume sheets
 - Location architectural and environment concept art
 - Storyboard visual frames
-- Concept art rendering
 - Local file persistence in studio data directory
 - Automatic MediaAsset registration in SQLite database
 """
 
 import os
 import uuid
+import base64
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
@@ -26,7 +29,7 @@ logger = logging.getLogger("google_image_adapter")
 
 
 class GoogleImageAdapterError(Exception):
-    """Raised when Google Imagen generation fails."""
+    """Raised when Google Nano Banana image generation fails."""
     pass
 
 
@@ -40,11 +43,30 @@ class GoogleImageAdapter:
                 from google import genai
                 self._client = genai.Client(api_key=self.api_key)
             except Exception as e:
-                logger.warning(f"Could not initialize google-genai client for Imagen: {e}")
+                logger.warning(f"Could not initialize google-genai client for Nano Banana: {e}")
 
     @property
     def is_available(self) -> bool:
         return bool(self._client and self.api_key)
+
+    def _resolve_model(self, model: Optional[str] = None, tier: str = "default") -> Tuple[str, float]:
+        """Resolves target Nano Banana model and corresponding estimated cost."""
+        if model:
+            target_model = model
+        elif tier == "pro":
+            target_model = getattr(settings, "google_image_pro_model", "gemini-3-pro-image")
+        elif tier == "lite":
+            target_model = getattr(settings, "google_image_lite_model", "gemini-3.1-flash-lite-image")
+        else:
+            target_model = self.model or getattr(settings, "google_image_model", "gemini-3.1-flash-image")
+
+        if "pro" in target_model.lower():
+            cost = 0.04
+        elif "lite" in target_model.lower():
+            cost = 0.01
+        else:
+            cost = 0.02
+        return target_model, cost
 
     def generate_image(
         self,
@@ -54,16 +76,20 @@ class GoogleImageAdapter:
         aspect_ratio: str = "16:9", # "1:1", "3:4", "4:3", "9:16", "16:9"
         entity_type: Optional[str] = None, # "character", "location", "storyboard"
         entity_id: Optional[str] = None,
-        negative_prompt: Optional[str] = None
+        negative_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        tier: str = "default"
     ) -> Dict[str, Any]:
         """
-        Generates an image via official Google Imagen 3 API,
+        Generates an image via official Google Nano Banana 2 API,
         saves the output locally in the project assets folder,
         and registers a local MediaAsset record in SQLite.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
             raise ValueError(f"Project '{project_id}' not found.")
+
+        target_model, est_cost = self._resolve_model(model=model, tier=tier)
 
         # Ensure project references directory exists
         dest_dir = settings.projects_dir / project_id / "references"
@@ -72,7 +98,7 @@ class GoogleImageAdapter:
         if not self.is_available:
             # Deterministic fallback when Google API key is not configured
             # Generates a clean concept placeholder with explicit fallback attribution
-            logger.info("Google Imagen 3 API key not configured. Generating deterministic reference visual.")
+            logger.info("Google API key not configured for Nano Banana. Generating deterministic reference visual.")
             return self._generate_fallback_reference(
                 prompt=prompt,
                 project=project,
@@ -84,7 +110,7 @@ class GoogleImageAdapter:
 
         from google.genai import types
 
-        # Normalize aspect ratio for Imagen 3
+        # Normalize aspect ratio for Nano Banana
         valid_ratios = ["1:1", "3:4", "4:3", "9:16", "16:9"]
         clean_ratio = aspect_ratio if aspect_ratio in valid_ratios else "16:9"
 
@@ -99,23 +125,51 @@ class GoogleImageAdapter:
 
         config = types.GenerateImagesConfig(**config_kwargs)
 
+        img_bytes = None
         try:
-            logger.info(f"Submitting image generation to Google Imagen 3 ({self.model})...")
+            logger.info(f"Submitting image generation to Google Nano Banana 2 ({target_model})...")
+            # Try official generate_images first
             response = self._client.models.generate_images(
-                model=self.model,
+                model=target_model,
                 prompt=prompt,
                 config=config
             )
+            if hasattr(response, "generated_images") and response.generated_images:
+                img_obj = response.generated_images[0]
+                if hasattr(img_obj, "image") and hasattr(img_obj.image, "image_bytes"):
+                    img_bytes = img_obj.image.image_bytes
+                elif hasattr(img_obj, "image_bytes"):
+                    img_bytes = img_obj.image_bytes
         except Exception as e:
-            err_msg = str(e)
-            logger.error(f"Google Imagen 3 generation failed: {err_msg}")
-            raise GoogleImageAdapterError(f"Google Imagen 3 API error: {err_msg}")
+            # If generate_images is unsupported or model requires generate_content
+            logger.info(f"generate_images attempt ({e}); trying generate_content multimodal route...")
+            try:
+                gc_config = types.GenerateContentConfig(
+                    response_modalities=["IMAGE"]
+                )
+                gc_resp = self._client.models.generate_content(
+                    model=target_model,
+                    contents=prompt,
+                    config=gc_config
+                )
+                if hasattr(gc_resp, "candidates") and gc_resp.candidates:
+                    parts = gc_resp.candidates[0].content.parts
+                    for part in parts:
+                        inline = getattr(part, "inline_data", None)
+                        if inline and hasattr(inline, "data"):
+                            raw_data = inline.data
+                            if isinstance(raw_data, str):
+                                img_bytes = base64.b64decode(raw_data)
+                            else:
+                                img_bytes = raw_data
+                            break
+            except Exception as e2:
+                err_msg = f"Nano Banana generation failed: {e}; multimodal route failed: {e2}"
+                logger.error(err_msg)
+                raise GoogleImageAdapterError(err_msg)
 
-        if not response.generated_images:
-            raise GoogleImageAdapterError("Google Imagen 3 returned no images in response.")
-
-        img_obj = response.generated_images[0]
-        img_bytes = img_obj.image.image_bytes
+        if not img_bytes:
+            raise GoogleImageAdapterError(f"Google Nano Banana ({target_model}) returned no image bytes in response.")
 
         # Save to local project directory
         asset_id = str(uuid.uuid4())
@@ -156,12 +210,12 @@ class GoogleImageAdapter:
             db=db,
             project_id=project_id,
             action_type="image_generation",
-            provider="google_imagen",
-            model=self.model,
+            provider="google_nano_banana",
+            model=target_model,
             operation="image_generation",
-            details=f"Google Imagen 3 generation for {entity_type or 'concept'} ({entity_id or 'general'})",
-            estimated_cost=0.03,
-            actual_cost=0.03,
+            details=f"Google Nano Banana 2 generation for {entity_type or 'concept'} ({entity_id or 'general'})",
+            estimated_cost=est_cost,
+            actual_cost=est_cost,
             actual_cost_known=True,
             allow_duplicate=True
         )
@@ -169,8 +223,8 @@ class GoogleImageAdapter:
 
         return {
             "status": "completed",
-            "provider": "google_imagen",
-            "model": self.model,
+            "provider": "google_nano_banana",
+            "model": target_model,
             "asset_id": media_asset.id,
             "file_path": str(file_path),
             "filename": filename,
@@ -205,7 +259,7 @@ class GoogleImageAdapter:
   <rect width="1280" height="720" fill="url(#bg)"/>
   <rect x="40" y="40" width="1200" height="640" fill="none" stroke="#38bdf8" stroke-width="2" stroke-dasharray="8 8" opacity="0.4"/>
   <text x="640" y="280" font-family="monospace" font-size="28" font-weight="bold" fill="#38bdf8" text-anchor="middle" letter-spacing="4">{title}</text>
-  <text x="640" y="340" font-family="sans-serif" font-size="18" fill="#94a3b8" text-anchor="middle">Google Imagen 3 API Key Not Set (Local Concept Reference)</text>
+  <text x="640" y="340" font-family="sans-serif" font-size="18" fill="#94a3b8" text-anchor="middle">Google Nano Banana 2 API Key Not Set (Local Concept Reference)</text>
   <text x="640" y="400" font-family="sans-serif" font-size="14" fill="#cbd5e1" text-anchor="middle" max-width="800">{prompt[:90]}...</text>
   <text x="640" y="460" font-family="monospace" font-size="12" fill="#64748b" text-anchor="middle">Project: {project.name} | Genre: {project.genre}</text>
 </svg>"""

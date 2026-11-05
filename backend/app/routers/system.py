@@ -23,7 +23,13 @@ class AIConfigRequest(BaseModel):
     ollama_host: Optional[str] = None
     ollama_model: Optional[str] = None
     google_image_model: Optional[str] = None
+    google_image_pro_model: Optional[str] = None
+    google_image_lite_model: Optional[str] = None
     google_video_model: Optional[str] = None
+    google_tts_model: Optional[str] = None
+    google_tts_lite_model: Optional[str] = None
+    google_music_model: Optional[str] = None
+    google_music_clip_model: Optional[str] = None
 
 
 @router.get("/ai-status")
@@ -37,10 +43,18 @@ def get_ai_status():
     gemini_status = gemini.health_check()
     offline_status = offline.health_check()
 
+    # Never expose raw API key to the client
+    raw_key = settings.gemini_api_key or ""
+    masked_key = f"{raw_key[:4]}...{raw_key[-4:]}" if len(raw_key) >= 8 else ("(configured)" if raw_key else "not_configured")
+
     return {
         "primary_provider": "gemini",
         "active_provider": settings.ai_provider,
-        "gemini": gemini_status,
+        "gemini": {
+            **gemini_status,
+            "api_key_configured": bool(raw_key),
+            "masked_key": masked_key
+        },
         "ollama": {
             **ollama_status,
             "enabled": getattr(settings, "ollama_enabled", False)
@@ -49,8 +63,14 @@ def get_ai_status():
         "google_drive": google_drive_service.get_status(),
         "google_models": {
             "text": settings.gemini_model,
-            "image": getattr(settings, "google_image_model", "imagen-3.0-generate-002"),
-            "video": getattr(settings, "google_video_model", "veo-2.0-generate-001")
+            "image": getattr(settings, "google_image_model", "gemini-3.1-flash-image"),
+            "image_pro": getattr(settings, "google_image_pro_model", "gemini-3-pro-image"),
+            "image_lite": getattr(settings, "google_image_lite_model", "gemini-3.1-flash-lite-image"),
+            "video": getattr(settings, "google_video_model", "gemini-omni-1.1-flash"),
+            "tts": getattr(settings, "google_tts_model", "gemini-3.8-flash-tts"),
+            "tts_lite": getattr(settings, "google_tts_lite_model", "gemini-3.8-flash-lite-tts"),
+            "music": getattr(settings, "google_music_model", "lyria-3.5"),
+            "music_clip": getattr(settings, "google_music_clip_model", "lyria-3-clip-preview")
         }
     }
 
@@ -83,13 +103,35 @@ def update_ai_config(req: AIConfigRequest):
     if req.google_image_model:
         settings.google_image_model = req.google_image_model.strip()
 
+    if req.google_image_pro_model:
+        settings.google_image_pro_model = req.google_image_pro_model.strip()
+
+    if req.google_image_lite_model:
+        settings.google_image_lite_model = req.google_image_lite_model.strip()
+
     if req.google_video_model:
         settings.google_video_model = req.google_video_model.strip()
+
+    if req.google_tts_model:
+        settings.google_tts_model = req.google_tts_model.strip()
+
+    if req.google_tts_lite_model:
+        settings.google_tts_lite_model = req.google_tts_lite_model.strip()
+
+    if req.google_music_model:
+        settings.google_music_model = req.google_music_model.strip()
+
+    if req.google_music_clip_model:
+        settings.google_music_clip_model = req.google_music_clip_model.strip()
+
+    raw_key = settings.gemini_api_key or ""
+    masked_key = f"{raw_key[:4]}...{raw_key[-4:]}" if len(raw_key) >= 8 else ("(configured)" if raw_key else "not_configured")
 
     return {
         "status": "success",
         "active_provider": settings.ai_provider,
         "gemini_configured": bool(settings.gemini_api_key),
+        "masked_key": masked_key,
         "gemini_model": settings.gemini_model,
         "ollama_enabled": getattr(settings, "ollama_enabled", False),
         "ollama_host": settings.ollama_host,

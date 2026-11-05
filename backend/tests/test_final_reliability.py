@@ -571,7 +571,7 @@ def test_task3_gemini_usage_propagation_to_cost_ledger(tmp_path):
                 CostRecord.provider == "gemini",
                 CostRecord.input_tokens == 320,
                 CostRecord.output_tokens == 650
-            ).first()
+            ).order_by(CostRecord.created_at.desc()).first()
 
             assert record is not None
             assert record.model == settings.gemini_model

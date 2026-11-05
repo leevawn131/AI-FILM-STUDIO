@@ -11,6 +11,8 @@ from backend.app.schemas.entities import AudioTrackCreate, AudioTrackUpdate, Aud
 from backend.app.services.audio_service import audio_service
 from backend.app.services.ffmpeg_service import ffmpeg_service
 from backend.app.services.security import save_upload_file_securely, validate_safe_path, sanitize_filename
+from backend.app.services.google_tts_adapter import google_tts_adapter, SUPPORTED_VOICES
+from backend.app.services.google_music_adapter import google_music_adapter
 
 router = APIRouter(prefix="/api/audio", tags=["audio"])
 
@@ -23,6 +25,40 @@ class GenerateVoiceoverRequest(BaseModel):
     character_name: Optional[str] = "REN SHINODA"
     dialogue_text: str
     duration: Optional[float] = 4.0
+
+class GenerateTTSDialogueRequest(BaseModel):
+    text: str
+    voice_name: Optional[str] = "Puck"
+    character_name: Optional[str] = "Character"
+    character_id: Optional[str] = None
+    emotion: Optional[str] = "neutral"
+    speaking_pace: Optional[float] = 1.0
+    language_code: Optional[str] = "en-US"
+    scene_id: Optional[str] = None
+    shot_id: Optional[str] = None
+    track_type: Optional[str] = "dialogue"
+    model: Optional[str] = None
+
+class GenerateLyriaMusicRequest(BaseModel):
+    mood: Optional[str] = "atmospheric"
+    genre: Optional[str] = "cinematic synthwave"
+    bpm: Optional[int] = 110
+    instruments: Optional[List[str]] = None
+    energy: Optional[str] = "medium"
+    duration_seconds: Optional[int] = 30
+    instrumental: Optional[bool] = True
+    scene_id: Optional[str] = None
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+
+@router.get("/voices")
+def get_tts_voices():
+    """Returns available official Google Gemini TTS voice profiles."""
+    return {
+        "provider": "google_tts",
+        "default_model": settings.google_tts_model,
+        "voices": google_tts_adapter.get_available_voices()
+    }
 
 @router.get("/{project_id}", response_model=List[AudioTrackResponse])
 def list_audio_tracks(project_id: str, db: Session = Depends(get_db)):
@@ -282,3 +318,90 @@ def delete_audio_track(track_id: str, db: Session = Depends(get_db)):
     db.delete(track)
     db.commit()
     return {"status": "deleted", "track_id": track_id}
+
+
+@router.post("/tts/generate/{project_id}", response_model=AudioTrackResponse)
+def generate_dialogue_speech(project_id: str, req: GenerateTTSDialogueRequest, db: Session = Depends(get_db)):
+    """Generates expressive character dialogue using Google Gemini TTS."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        res = google_tts_adapter.generate_dialogue_speech(
+            text=req.text,
+            project_id=project_id,
+            db=db,
+            voice_name=req.voice_name or "Puck",
+            character_name=req.character_name or "Character",
+            character_id=req.character_id,
+            language_code=req.language_code or "en-US",
+            emotion=req.emotion or "neutral",
+            speaking_pace=req.speaking_pace or 1.0,
+            scene_id=req.scene_id,
+            shot_id=req.shot_id,
+            track_type=req.track_type or "dialogue",
+            model=req.model
+        )
+        track = db.query(AudioTrack).filter(AudioTrack.id == res["track_id"]).first()
+        return {
+            "id": track.id,
+            "project_id": track.project_id,
+            "track_type": track.track_type,
+            "title": track.title,
+            "file_path": track.file_path,
+            "duration_seconds": track.duration_seconds,
+            "start_time_seconds": track.start_time_seconds,
+            "volume_level": track.volume_level,
+            "ducking_enabled": track.ducking_enabled,
+            "ducking_level": track.ducking_level,
+            "scene_id": track.scene_id,
+            "shot_id": track.shot_id,
+            "created_at": track.created_at,
+            "url": f"/media/{track.file_path}"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
+
+
+@router.post("/music/generate/{project_id}", response_model=AudioTrackResponse)
+def generate_music_score(project_id: str, req: GenerateLyriaMusicRequest, db: Session = Depends(get_db)):
+    """Generates cinematic background score using Google Lyria 3.5."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        res = google_music_adapter.generate_music_score(
+            project_id=project_id,
+            db=db,
+            mood=req.mood or "atmospheric",
+            genre=req.genre or "cinematic synthwave",
+            bpm=req.bpm or 110,
+            instruments=req.instruments,
+            energy=req.energy or "medium",
+            duration_seconds=req.duration_seconds or 30,
+            instrumental=req.instrumental if req.instrumental is not None else True,
+            scene_id=req.scene_id,
+            prompt=req.prompt,
+            model=req.model
+        )
+        track = db.query(AudioTrack).filter(AudioTrack.id == res["track_id"]).first()
+        return {
+            "id": track.id,
+            "project_id": track.project_id,
+            "track_type": track.track_type,
+            "title": track.title,
+            "file_path": track.file_path,
+            "duration_seconds": track.duration_seconds,
+            "start_time_seconds": track.start_time_seconds,
+            "volume_level": track.volume_level,
+            "ducking_enabled": track.ducking_enabled,
+            "ducking_level": track.ducking_level,
+            "scene_id": track.scene_id,
+            "shot_id": track.shot_id,
+            "created_at": track.created_at,
+            "url": f"/media/{track.file_path}"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Music generation failed: {str(e)}")

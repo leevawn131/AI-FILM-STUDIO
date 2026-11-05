@@ -298,15 +298,27 @@ class GeminiProvider(BaseAIProvider):
                 "configured_model": self.model,
                 "note": "GEMINI_API_KEY is not set. Add your API key in settings to enable Google Cloud AI."
             }
+        masked_key = f"{self.api_key[:4]}...{self.api_key[-4:]}" if len(self.api_key) >= 8 else "(configured)"
         return {
             "provider": "gemini",
             "status": "configured" if self._client else "init_failed",
             "configured_model": self.model,
-            "has_client": bool(self._client)
+            "has_client": bool(self._client),
+            "masked_key": masked_key
         }
 
     def get_available_models(self) -> List[str]:
-        return ["gemini-2.5-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
+        return [
+            "gemini-3.8-flash",
+            "gemini-3.1-flash-image",
+            "gemini-3-pro-image",
+            "gemini-3.1-flash-lite-image",
+            "gemini-omni-1.1-flash",
+            "gemini-3.8-flash-tts",
+            "gemini-3.8-flash-lite-tts",
+            "lyria-3.5",
+            "lyria-3-clip-preview"
+        ]
 
     def _execute_with_retry(self, fn, *args, **kwargs):
         """

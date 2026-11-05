@@ -84,6 +84,38 @@ ACCOUNTING_OPERATIONS = {
         "consumes_flow_credits": False,
         "default_flow_credits": 0.0,
         "default_estimated_cost": 0.0
+    },
+    "image_generation": {
+        "provider": "google_nano_banana",
+        "default_model": getattr(settings, "google_image_model", "gemini-3.1-flash-image"),
+        "description": "Google Nano Banana 2 image generation",
+        "consumes_flow_credits": False,
+        "default_flow_credits": 0.0,
+        "default_estimated_cost": 0.02
+    },
+    "video_generation": {
+        "provider": "google_omni",
+        "default_model": getattr(settings, "google_video_model", "gemini-omni-1.1-flash"),
+        "description": "Google Gemini Omni Flash 1.1 video generation via Interactions API",
+        "consumes_flow_credits": False,
+        "default_flow_credits": 0.0,
+        "default_estimated_cost": 0.15
+    },
+    "tts_generation": {
+        "provider": "google_tts",
+        "default_model": getattr(settings, "google_tts_model", "gemini-3.8-flash-tts"),
+        "description": "Google Gemini TTS dialogue speech synthesis",
+        "consumes_flow_credits": False,
+        "default_flow_credits": 0.0,
+        "default_estimated_cost": 0.01
+    },
+    "music_generation": {
+        "provider": "google_lyria",
+        "default_model": getattr(settings, "google_music_model", "lyria-3.5"),
+        "description": "Google Lyria 3.5 score music generation via Interactions API",
+        "consumes_flow_credits": False,
+        "default_flow_credits": 0.0,
+        "default_estimated_cost": 0.05
     }
 }
 
@@ -96,6 +128,10 @@ COST_RATES = {
     "continuity_check": {"credits": 0.5, "cost_usd": 0.0},
     "audio_synthesis": {"credits": 1.5, "cost_usd": 0.0},
     "video_render": {"credits": 3.0, "cost_usd": 0.0},
+    "image_generation": {"credits": 0.0, "cost_usd": 0.02},
+    "video_generation": {"credits": 0.0, "cost_usd": 0.15},
+    "tts_generation": {"credits": 0.0, "cost_usd": 0.01},
+    "music_generation": {"credits": 0.0, "cost_usd": 0.05},
 }
 
 class CostController:
