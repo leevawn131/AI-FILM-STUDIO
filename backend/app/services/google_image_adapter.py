@@ -28,6 +28,24 @@ from backend.app.services.cost_controller import cost_controller
 logger = logging.getLogger("google_image_adapter")
 
 
+SUPPORTED_IMAGE_SIZES = {
+    "gemini-3.1-flash-image": ["512", "1K", "2K", "4K"],
+    "gemini-3.1-flash-lite-image": ["512", "1K"],
+    "gemini-3-pro-image": ["1K", "2K", "4K"],
+}
+
+
+def get_supported_image_sizes_for_model(model_name: str) -> List[str]:
+    """Returns the list of officially supported image sizes for a given model."""
+    m = model_name.lower()
+    if "lite" in m:
+        return ["512", "1K"]
+    elif "pro" in m:
+        return ["1K", "2K", "4K"]
+    else:
+        return ["512", "1K", "2K", "4K"]
+
+
 class GoogleImageAdapterError(Exception):
     """Raised when Google Nano Banana image generation fails."""
     pass
@@ -98,6 +116,13 @@ class GoogleImageAdapter:
             cost = 0.02
         return target_model, cost
 
+    @staticmethod
+    def get_supported_image_sizes(model_name: Optional[str] = None) -> Any:
+        """Returns supported image sizes by model or all models."""
+        if model_name:
+            return get_supported_image_sizes_for_model(model_name)
+        return SUPPORTED_IMAGE_SIZES
+
     def generate_image(
         self,
         prompt: str,
@@ -123,6 +148,22 @@ class GoogleImageAdapter:
 
         target_model, est_cost = self._resolve_model(model=model, tier=tier)
 
+        # Enforce model-specific image-size limitations per documentation:
+        # - Flash Image: 512, 1K, 2K, 4K
+        # - Flash Lite Image: 512, 1K
+        # - Pro Image: 1K, 2K, 4K
+        supported_sizes = get_supported_image_sizes_for_model(target_model)
+        if image_size not in supported_sizes:
+            raise ValueError(
+                f"Image size '{image_size}' is not supported by model '{target_model}'. "
+                f"Supported sizes: {supported_sizes}"
+            )
+        clean_size = image_size
+
+        # Normalize aspect ratio for Nano Banana
+        valid_ratios = ["1:1", "3:4", "4:3", "9:16", "16:9"]
+        clean_ratio = aspect_ratio if aspect_ratio in valid_ratios else "16:9"
+
         # Ensure project references directory exists
         dest_dir = settings.projects_dir / project_id / "references"
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -139,12 +180,6 @@ class GoogleImageAdapter:
                 entity_id=entity_id,
                 db=db
             )
-
-        # Normalize aspect ratio and image size for Nano Banana
-        valid_ratios = ["1:1", "3:4", "4:3", "9:16", "16:9"]
-        clean_ratio = aspect_ratio if aspect_ratio in valid_ratios else "16:9"
-        valid_sizes = ["512", "1K", "2K", "4K"]
-        clean_size = image_size if image_size in valid_sizes else "1K"
 
         img_bytes = None
         provider_op_id = None

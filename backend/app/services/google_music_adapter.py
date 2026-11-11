@@ -132,21 +132,30 @@ class GoogleMusicAdapter:
                 db=db
             )
 
-        # Build prompt describing musical composition requirements
+        # Build prompt expressing musical requirements per official API documentation.
+        # Do not use unsupported audio_config dictionary parameters.
         inst_list = ", ".join(instruments) if instruments else "analog synthesizers, cinematic sub-bass, orchestral strings"
         pref = "Instrumental only, no vocals." if instrumental else "Atmospheric vocal chops and pads."
         
+        if is_clip_model:
+            # Lyria 3 Clip Preview is a fixed 30-second model; do not promise exact arbitrary duration
+            duration_instruction = "30-second musical clip preview / scene cue."
+        else:
+            # Lyria 3.5 supports full-length composition
+            duration_instruction = f"Full-length cinematic track with target duration approximately {effective_duration} seconds."
+
         if prompt:
             full_prompt = (
                 f"Cinematic score: {prompt}. Mood: {mood}. Genre: {genre}. "
-                f"Tempo: {bpm} BPM. Energy: {energy}. Instruments: {inst_list}. {pref} Duration: {effective_duration}s."
+                f"Tempo: {bpm} BPM. Energy: {energy}. Featured instruments: {inst_list}. {pref} "
+                f"{duration_instruction}"
             )
         else:
             full_prompt = (
                 f"Cinematic {genre} score with a {mood} atmosphere. "
                 f"Tempo: {bpm} BPM. Energy dynamic: {energy}. "
                 f"Featured instrumentation: {inst_list}. {pref} "
-                f"Designed as a movie background soundtrack with duration {effective_duration}s."
+                f"{duration_instruction}"
             )
 
         response_format = {"type": "audio", "mime_type": "audio/mp3"}
@@ -316,34 +325,41 @@ class GoogleMusicAdapter:
         scene_id: Optional[str],
         db: Session
     ) -> Dict[str, Any]:
-        """Generates deterministic local audio placeholder with explicit fallback attribution."""
+        """Generates deterministic local MP3 audio placeholder with explicit fallback attribution."""
         asset_id = str(uuid.uuid4())
         safe_mood = "".join(c for c in mood.lower().replace(" ", "_") if c.isalnum() or c == "_")
-        filename = f"score_{safe_mood}_{asset_id[:8]}_offline.wav"
+        filename = f"score_{safe_mood}_{asset_id[:8]}_offline.mp3"
         file_path = dest_dir / filename
 
-        # 2 seconds of clean 16-bit 44.1kHz stereo silence as offline reference placeholder
-        num_samples = 44100 * 2
-        byte_rate = 44100 * 4
-        data_size = num_samples * 4
-        total_size = 36 + data_size
-        wav_header = bytearray()
-        wav_header.extend(b'RIFF')
-        wav_header.extend(total_size.to_bytes(4, 'little'))
-        wav_header.extend(b'WAVEfmt ')
-        wav_header.extend((16).to_bytes(4, 'little')) # Subchunk1Size
-        wav_header.extend((1).to_bytes(2, 'little'))  # PCM
-        wav_header.extend((2).to_bytes(2, 'little'))  # Stereo
-        wav_header.extend((44100).to_bytes(4, 'little')) # Sample rate
-        wav_header.extend(byte_rate.to_bytes(4, 'little')) # Byte rate
-        wav_header.extend((4).to_bytes(2, 'little'))  # Block align
-        wav_header.extend((16).to_bytes(2, 'little')) # Bits per sample
-        wav_header.extend(b'data')
-        wav_header.extend(data_size.to_bytes(4, 'little'))
-        wav_header.extend(bytes(data_size))
-
-        file_path.write_bytes(bytes(wav_header))
+        # Generates a 2-second deterministic silent MP3 reference placeholder
         actual_duration = 2.0
+        generated = False
+        try:
+            import subprocess
+            cmd = [
+                "ffmpeg", "-y", "-f", "lavfi",
+                "-i", "anullsrc=r=44100:cl=stereo",
+                "-t", str(actual_duration),
+                "-c:a", "libmp3lame",
+                "-b:a", "128k",
+                str(file_path)
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            generated = True
+        except Exception:
+            pass
+
+        if not generated:
+            # Fallback raw MPEG-1 Layer 3 frame sequence
+            mp3_frame = b"\xff\xfb\x90d" + b"\x00" * 414
+            file_path.write_bytes(mp3_frame * int(max(1, actual_duration) * 38))
+
+        try:
+            meta = ffmpeg_service.inspect_media(file_path)
+            actual_duration = float(meta.get("duration") or actual_duration)
+            codec_found = meta.get("audio_codec") or meta.get("codec") or "mp3"
+        except Exception:
+            codec_found = "mp3"
 
         rel_path = f"projects/{project.id}/audio/{filename}"
         track_title = f"Score (Offline Placeholder): {mood.capitalize()} ({genre.capitalize()})"
@@ -371,7 +387,7 @@ class GoogleMusicAdapter:
             file_path=str(file_path),
             media_type="audio",
             duration_seconds=actual_duration,
-            file_size_bytes=len(wav_header)
+            file_size_bytes=file_path.stat().st_size
         )
         db.add(media_asset)
         db.commit()
@@ -389,6 +405,7 @@ class GoogleMusicAdapter:
             "mood": mood,
             "genre": genre,
             "bpm": 120,
+            "audio_codec": codec_found,
             "is_fallback": True
         }
 

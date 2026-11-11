@@ -1003,7 +1003,14 @@ export interface AIStatusResponse {
   google_models?: {
     text: string;
     image: string;
+    image_pro?: string;
+    image_lite?: string;
     video: string;
+    tts?: string;
+    tts_lite?: string;
+    music?: string;
+    music_clip?: string;
+    image_sizes?: Record<string, string[]>;
   };
 }
 

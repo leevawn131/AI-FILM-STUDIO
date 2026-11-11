@@ -144,35 +144,49 @@ class GoogleTTSAdapter:
                 db=db
             )
 
-        # Style annotation for speech synthesis
-        style_desc = f"{emotion} style, pace {speaking_pace}x" if emotion != "neutral" else f"natural dialogue cadence, pace {speaking_pace}x"
-        text_bytes_len = len(text.encode("utf-8"))
+        # Natural language delivery instruction in speech_metadata.style
+        style_parts = []
+        if emotion and emotion != "neutral":
+            style_parts.append(f"{emotion} delivery")
+        if speaking_pace and speaking_pace != 1.0:
+            style_parts.append(f"pace {speaking_pace}x")
+        if language_code and language_code != "en-US":
+            style_parts.append(f"in {language_code}")
+        style_desc = ", ".join(style_parts) if style_parts else "natural dialogue cadence"
 
-        input_payload: Dict[str, Any] = {
-            "type": "text",
-            "text": text,
-            "annotations": [
-                {
-                    "type": "speech_metadata",
-                    "speaker": speaker_label,
-                    "style": style_desc,
-                    "start_index": 0,
-                    "end_index": text_bytes_len,
-                }
-            ],
-        }
+        # Documented single-speaker request structure:
+        # - input: list containing a user_input item
+        # - content: list containing a text item
+        # - annotations: list containing speech_metadata
+        # - response_format: {"type": "audio"}
+        # - generation_config.speech_config: list of voice configurations, e.g. [{"voice": "Puck"}]
+        input_payload = [
+            {
+                "type": "user_input",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": text,
+                        "annotations": [
+                            {
+                                "type": "speech_metadata",
+                                "speaker": speaker_label,
+                                "style": style_desc,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
 
         generation_config = {
-            "speech_config": {
-                "voice": chosen_voice,
-                "language": language_code,
-                "speaker": speaker_label,
-            }
+            "speech_config": [
+                {"voice": chosen_voice}
+            ]
         }
 
         response_format = {
-            "type": "audio",
-            "mime_type": "audio/wav",
+            "type": "audio"
         }
 
         audio_bytes = None
@@ -315,42 +329,237 @@ class GoogleTTSAdapter:
         dialogue_turns: List[Dict[str, Any]],
         project_id: str,
         db: Session,
-        scene_id: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+        scene_id: Optional[str] = None,
+        shot_id: Optional[str] = None,
+        model: Optional[str] = None,
+        split_turns: bool = False
+    ) -> Any:
         """
-        Generates individual speech tracks for multi-speaker screenplay scenes.
-        dialogue_turns format:
-        [
-            {"speaker": "REN", "voice": "Puck", "text": "We need to move now.", "emotion": "urgent"},
-            {"speaker": "ELENA", "voice": "Kore", "text": "Wait, the perimeter is still locked.", "emotion": "tense"}
-        ]
+        Generates dialogue speech for multi-speaker screenplay scenes.
+        Uses documented multi-speaker configuration when generating dialogue with multiple characters:
+        - generation_config.speech_config: list of voice configs with speaker mappings: [{"voice": "Puck", "speaker": "REN"}, ...]
+        - input: list of user_input items for each character turn with speech_metadata annotations
+        - response_format: {"type": "audio"}
         """
-        results = []
-        for turn in dialogue_turns:
-            speaker = turn.get("speaker", "Speaker")
-            text = turn.get("text", "")
-            voice = turn.get("voice", "Puck")
-            emotion = turn.get("emotion", "neutral")
-            pace = float(turn.get("pace", 1.0))
-            shot_id = turn.get("shot_id")
+        valid_turns = [t for t in dialogue_turns if t.get("text", "").strip()]
+        if not valid_turns:
+            return [] if split_turns else {}
 
-            if not text.strip():
-                continue
+        if split_turns:
+            results = []
+            for turn in valid_turns:
+                res = self.generate_dialogue_speech(
+                    text=turn["text"],
+                    project_id=project_id,
+                    db=db,
+                    voice_name=turn.get("voice", "Puck"),
+                    character_name=turn.get("speaker", "Speaker"),
+                    emotion=turn.get("emotion", "neutral"),
+                    speaking_pace=float(turn.get("pace", 1.0)),
+                    scene_id=scene_id,
+                    shot_id=turn.get("shot_id") or shot_id,
+                    track_type="dialogue",
+                    model=model
+                )
+                results.append(res)
+            return results
 
-            res = self.generate_dialogue_speech(
-                text=text,
-                project_id=project_id,
-                db=db,
-                voice_name=voice,
-                character_name=speaker,
-                emotion=emotion,
-                speaking_pace=pace,
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            raise ValueError(f"Project '{project_id}' not found.")
+
+        target_model = model or self.model
+        dest_dir = settings.projects_dir / project_id / "audio"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.is_available:
+            logger.info("Google API key not configured for TTS. Generating offline reference dialogue.")
+            combined_text = " ".join([t["text"] for t in valid_turns])
+            return self._generate_fallback_audio(
+                text=combined_text,
+                project=project,
+                dest_dir=dest_dir,
+                speaker_label="MultiSpeaker",
+                voice_name="Puck",
                 scene_id=scene_id,
                 shot_id=shot_id,
-                track_type="dialogue"
+                track_type="dialogue",
+                db=db
             )
-            results.append(res)
-        return results
+
+        # Documented multi-speaker speech_config
+        seen_speakers = set()
+        speech_config = []
+        for turn in valid_turns:
+            spk = turn.get("speaker", "Speaker")
+            vc = turn.get("voice", "Puck")
+            if spk not in seen_speakers:
+                seen_speakers.add(spk)
+                chosen_v = vc if vc in SUPPORTED_VOICES else "Puck"
+                speech_config.append({"voice": chosen_v, "speaker": spk})
+
+        # Documented multi-turn input structure with speech_metadata annotations
+        input_payload = []
+        for turn in valid_turns:
+            spk = turn.get("speaker", "Speaker")
+            emo = turn.get("emotion", "neutral")
+            pace = float(turn.get("pace", 1.0))
+            style_parts = []
+            if emo and emo != "neutral":
+                style_parts.append(f"{emo} delivery")
+            if pace and pace != 1.0:
+                style_parts.append(f"pace {pace}x")
+            style_desc = ", ".join(style_parts) if style_parts else "natural dialogue cadence"
+
+            input_payload.append({
+                "type": "user_input",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": turn["text"],
+                        "annotations": [
+                            {
+                                "type": "speech_metadata",
+                                "speaker": spk,
+                                "style": style_desc,
+                            }
+                        ],
+                    }
+                ],
+            })
+
+        generation_config = {
+            "speech_config": speech_config
+        }
+        response_format = {
+            "type": "audio"
+        }
+
+        audio_bytes = None
+        provider_op_id = None
+        try:
+            logger.info(
+                f"Generating multi-speaker Gemini TTS dialogue ({len(speech_config)} speakers, "
+                f"{len(input_payload)} turns) using {target_model} via Interactions API..."
+            )
+            interaction = self.client.interactions.create(
+                model=target_model,
+                input=input_payload,
+                generation_config=generation_config,
+                response_format=response_format
+            )
+            provider_op_id = getattr(interaction, "id", None)
+
+            output_audio = getattr(interaction, "output_audio", None)
+            if output_audio:
+                raw_data = getattr(output_audio, "data", None)
+                if raw_data:
+                    if isinstance(raw_data, str):
+                        try:
+                            audio_bytes = base64.b64decode(raw_data)
+                        except Exception:
+                            audio_bytes = raw_data.encode("utf-8")
+                    else:
+                        audio_bytes = raw_data
+                elif getattr(output_audio, "uri", None):
+                    import urllib.request
+                    audio_bytes = urllib.request.urlopen(output_audio.uri).read()
+
+            if not audio_bytes and hasattr(interaction, "candidates") and interaction.candidates:
+                candidate = interaction.candidates[0]
+                if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
+                    for part in candidate.content.parts:
+                        inline = getattr(part, "inline_data", None)
+                        if inline and hasattr(inline, "data"):
+                            raw_inline = inline.data
+                            audio_bytes = base64.b64decode(raw_inline) if isinstance(raw_inline, str) else raw_inline
+                            break
+        except Exception as e:
+            err_msg = str(e)
+            logger.error(f"Gemini multi-speaker TTS call failed: {err_msg}")
+            raise GoogleTTSAdapterError(f"Google Gemini multi-speaker TTS failed: {err_msg}")
+
+        if not audio_bytes:
+            raise GoogleTTSAdapterError(
+                f"Gemini TTS model '{target_model}' returned no audio candidates for multi-speaker dialogue."
+            )
+
+        asset_id = str(uuid.uuid4())
+        filename = f"tts_multispeaker_{scene_id or 'dialogue'}_{asset_id[:8]}.wav"
+        file_path = dest_dir / filename
+        file_path.write_bytes(audio_bytes)
+
+        try:
+            meta = ffmpeg_service.inspect_media(file_path)
+            duration = float(meta.get("duration", 4.0))
+        except Exception:
+            duration = 4.0
+
+        rel_path = f"projects/{project_id}/audio/{filename}"
+        track_title = f"Dialogue: {', '.join(list(seen_speakers)[:3])} Scene Exchange"
+
+        audio_track = AudioTrack(
+            project_id=project_id,
+            track_type="dialogue",
+            title=track_title,
+            file_path=rel_path,
+            duration_seconds=duration,
+            start_time_seconds=0.0,
+            volume_level=1.1,
+            ducking_enabled=False,
+            scene_id=scene_id,
+            shot_id=shot_id
+        )
+        db.add(audio_track)
+
+        media_asset = MediaAsset(
+            id=asset_id,
+            project_id=project_id,
+            shot_id=shot_id,
+            version=1,
+            status="ready",
+            filename=filename,
+            file_path=str(file_path),
+            media_type="audio",
+            duration_seconds=duration,
+            file_size_bytes=len(audio_bytes)
+        )
+        db.add(media_asset)
+
+        est_cost = 0.01 * len(speech_config)
+        cost_controller.authorize_and_charge(
+            db=db,
+            project_id=project_id,
+            scene_id=scene_id,
+            shot_id=shot_id,
+            action_type="tts_generation",
+            provider="google_tts",
+            model=target_model,
+            operation="tts_generation",
+            details=f"Gemini multi-speaker dialogue ({', '.join(seen_speakers)})",
+            estimated_cost=est_cost,
+            actual_cost=None,
+            actual_cost_known=False,
+            allow_duplicate=True
+        )
+        db.commit()
+        db.refresh(audio_track)
+
+        return {
+            "status": "completed",
+            "provider": "google_tts",
+            "model": target_model,
+            "track_id": audio_track.id,
+            "asset_id": media_asset.id,
+            "file_path": str(file_path),
+            "filename": filename,
+            "duration_seconds": duration,
+            "speakers": list(seen_speakers),
+            "is_multi_speaker": True,
+            "provider_operation_id": provider_op_id,
+            "interaction_id": provider_op_id,
+            "is_fallback": False
+        }
 
     def _generate_fallback_audio(
         self,

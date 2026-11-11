@@ -204,21 +204,26 @@ def main():
         tts_text = "AI Film Studio system operational. Ready for scene production."
         tts_interaction = client.interactions.create(
             model=settings.google_tts_model,
-            input={
-                "type": "text",
-                "text": tts_text,
-                "annotations": [
-                    {
-                        "type": "speech_metadata",
-                        "speaker": "Puck",
-                        "style": "natural, articulate",
-                        "start_index": 0,
-                        "end_index": len(tts_text.encode("utf-8"))
-                    }
-                ]
-            },
-            generation_config={"speech_config": {"voice": "Puck", "language": "en-US"}},
-            response_format={"type": "audio", "mime_type": "audio/wav"}
+            input=[
+                {
+                    "type": "user_input",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": tts_text,
+                            "annotations": [
+                                {
+                                    "type": "speech_metadata",
+                                    "speaker": "Puck",
+                                    "style": "natural dialogue cadence, articulate delivery"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ],
+            generation_config={"speech_config": [{"voice": "Puck"}]},
+            response_format={"type": "audio"}
         )
         latency = time.time() - t0
         tts_op_id = getattr(tts_interaction, "id", None)

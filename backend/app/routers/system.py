@@ -70,7 +70,12 @@ def get_ai_status():
             "tts": getattr(settings, "google_tts_model", "gemini-3.8-flash-tts"),
             "tts_lite": getattr(settings, "google_tts_lite_model", "gemini-3.8-flash-lite-tts"),
             "music": getattr(settings, "google_music_model", "lyria-3.5"),
-            "music_clip": getattr(settings, "google_music_clip_model", "lyria-3-clip-preview")
+            "music_clip": getattr(settings, "google_music_clip_model", "lyria-3-clip-preview"),
+            "image_sizes": {
+                "gemini-3.1-flash-image": ["512", "1K", "2K", "4K"],
+                "gemini-3.1-flash-lite-image": ["512", "1K"],
+                "gemini-3-pro-image": ["1K", "2K", "4K"]
+            }
         }
     }
 

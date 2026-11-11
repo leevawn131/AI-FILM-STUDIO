@@ -14,6 +14,7 @@ Implements:
 import math
 import uuid
 import json
+import logging
 import hashlib
 import threading
 from typing import Optional, Any, Dict, Tuple
@@ -23,6 +24,8 @@ from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException
 from backend.app.config import settings
 from backend.app.models.entities import Project, Scene, Shot, CostRecord
+
+logger = logging.getLogger("cost_controller")
 
 # Global re-entrant lock to ensure thread safety
 _budget_lock = threading.RLock()
@@ -492,11 +495,13 @@ class CostController:
         shot_id: Optional[str] = None,
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        job_id: Optional[str] = None,
         details: str = "Pre-flight budget reservation"
     ) -> CostRecord:
         """
         Reserves estimated cost against project/scene budget prior to initiating an external cloud AI call.
         """
+        full_details = f"{details} job:{job_id}" if job_id else details
         return CostController.authorize_and_charge(
             db=db,
             project_id=project_id,
@@ -506,12 +511,55 @@ class CostController:
             provider=provider,
             model=model,
             operation=operation,
-            details=details,
+            details=full_details,
             estimated_cost=estimated_cost,
             actual_cost=None,
             actual_cost_known=False,
             allow_duplicate=True
         )
+
+    @staticmethod
+    def finalize_reservation(
+        db: Session,
+        project_id: str,
+        reservation_record: CostRecord,
+        actual_cost: Optional[float] = None,
+        actual_cost_known: bool = False,
+        local_processing_status: str = "completed",
+        error_details: Optional[str] = None
+    ) -> CostRecord:
+        """
+        Finalizes an outstanding budget reservation when provider generation has succeeded.
+        - If actual_cost is known and differs from estimated_cost, adjusts Project.budget_spent.
+        - If actual_cost is not provided, maintains the reserved estimated cost as spent budget.
+        - Sets action_type to the operational action (e.g. video_generation).
+        - If local media processing failed, explicitly preserves the incurred provider expense,
+          recording the provider outcome and local processing failure separately so that
+          incurred cloud AI expenses are NEVER silently erased due to local downstream errors.
+        """
+        with _budget_lock:
+            project = db.query(Project).filter(Project.id == project_id).first()
+            if actual_cost_known and actual_cost is not None:
+                diff = actual_cost - (reservation_record.estimated_cost or 0.0)
+                if diff != 0.0 and project:
+                    project.budget_spent = max(0.0, (project.budget_spent or 0.0) + diff)
+                reservation_record.actual_cost = actual_cost
+                reservation_record.actual_cost_known = True
+
+            op_name = reservation_record.operation or "video_generation"
+            reservation_record.action_type = op_name
+
+            if local_processing_status == "failed":
+                reservation_record.details = (
+                    f"Provider generation succeeded ({reservation_record.provider} {reservation_record.model}); "
+                    f"local media processing failed: {error_details or 'Unknown error'}"
+                )
+            else:
+                reservation_record.details = (
+                    f"Completed {reservation_record.provider} {reservation_record.model} {op_name}"
+                )
+            db.flush()
+            return reservation_record
 
     @staticmethod
     def release_reservation(
@@ -521,8 +569,9 @@ class CostController:
         reason: str = "operation_failed_or_cancelled"
     ) -> Optional[CostRecord]:
         """
-        Releases reserved budget if the operation failed, timed out, or was cancelled.
+        Releases reserved budget if the operation failed at the provider or was cancelled prior to generation.
         Decreases Project.budget_spent by the reserved amount and records a compensation entry.
+        Never call this if provider generation has completed.
         """
         return CostController.record_compensation(
             db=db,
@@ -530,6 +579,86 @@ class CostController:
             original_record=reservation_record,
             reason=reason
         )
+
+    @staticmethod
+    def recover_orphaned_job_reservation(
+        db: Session,
+        job_id: str,
+        project_id: str
+    ) -> Optional[CostRecord]:
+        """
+        Releases any unfinalized budget reservation for a job that terminated before reaching the cloud provider.
+        """
+        target_details = f"job:{job_id}"
+        reservation = (
+            db.query(CostRecord)
+            .filter(
+                CostRecord.project_id == project_id,
+                CostRecord.action_type == "budget_reservation",
+                CostRecord.details.like(f"%{target_details}%")
+            )
+            .first()
+        )
+        if reservation:
+            refund = db.query(CostRecord).filter(
+                CostRecord.operation_identity == f"refund_{reservation.id}"
+            ).first()
+            if not refund:
+                logger.info(f"Releasing orphaned budget reservation {reservation.id} for job {job_id}")
+                return CostController.release_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation,
+                    reason="orphaned_job_local_backend_restart"
+                )
+        return None
+
+    @staticmethod
+    def recover_interrupted_reservations(db: Session) -> int:
+        """
+        Scans for all outstanding unrefunded 'budget_reservation' records across projects
+        that are associated with dead jobs and safely releases them.
+        """
+        from backend.app.models.entities import GenerationJob
+        reservations = (
+            db.query(CostRecord)
+            .filter(CostRecord.action_type == "budget_reservation")
+            .all()
+        )
+        released_count = 0
+        for res_rec in reservations:
+            refund = db.query(CostRecord).filter(
+                CostRecord.operation_identity == f"refund_{res_rec.id}"
+            ).first()
+            if refund:
+                continue
+
+            is_orphaned = True
+            if "job:" in (res_rec.details or ""):
+                try:
+                    parts = res_rec.details.split("job:")[1].split()
+                    job_id = parts[0].strip() if parts else ""
+                    active_job = db.query(GenerationJob).filter(
+                        GenerationJob.id == job_id,
+                        GenerationJob.status.in_(["pending", "processing"])
+                    ).first()
+                    if active_job and active_job.provider_operation_id:
+                        is_orphaned = False
+                except Exception:
+                    is_orphaned = True
+
+            if is_orphaned:
+                CostController.release_reservation(
+                    db=db,
+                    project_id=res_rec.project_id,
+                    reservation_record=res_rec,
+                    reason="interrupted_reservation_backend_recovery"
+                )
+                released_count += 1
+
+        if released_count > 0:
+            db.commit()
+        return released_count
 
     @staticmethod
     def record_flow_credit_usage(

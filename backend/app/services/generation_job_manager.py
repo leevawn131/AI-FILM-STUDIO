@@ -31,6 +31,7 @@ from backend.app.services.google_image_adapter import google_image_adapter
 from backend.app.services.google_video_adapter import google_video_adapter
 from backend.app.services.google_tts_adapter import google_tts_adapter
 from backend.app.services.google_music_adapter import google_music_adapter
+from backend.app.services.cost_controller import cost_controller, CostController
 from backend.app.services.ai_provider import get_ai_provider
 
 logger = logging.getLogger("generation_job_manager")
@@ -175,67 +176,138 @@ class GenerationJobManager:
         duration_seconds = params.get("duration_seconds", 5)
         aspect_ratio = params.get("aspect_ratio", "16:9")
         task = params.get("task", "text_to_video")
+        resolution = params.get("resolution", "720p")
 
-        # 1. Submit to Google Gemini Omni Flash via Interactions API
-        submission = google_video_adapter.submit_video_generation(
-            prompt=prompt,
-            project_id=job.project_id,
-            shot_id=job.shot_id,
+        # 1. Pre-flight budget reservation
+        est_cost = 0.15
+        reservation = cost_controller.reserve_budget(
             db=db,
-            duration_seconds=duration_seconds,
-            aspect_ratio=aspect_ratio,
-            task=task,
-            input_image_path=params.get("input_image_path"),
-            input_video_path=params.get("input_video_path"),
-            negative_prompt=params.get("negative_prompt")
+            project_id=job.project_id,
+            estimated_cost=est_cost,
+            operation="video_generation",
+            provider="google_omni",
+            model=job.model,
+            scene_id=job.scene_id,
+            shot_id=job.shot_id,
+            job_id=job.id,
+            details=f"Budget reservation for video generation"
         )
-
-        job.provider_operation_id = submission["provider_operation_id"]
-        job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.commit()
 
-        # 2. Poll until complete
+        # 2. Submit to Google Gemini Omni Flash via Interactions API
+        try:
+            submission = google_video_adapter.submit_video_generation(
+                prompt=prompt,
+                project_id=job.project_id,
+                shot_id=job.shot_id,
+                db=db,
+                duration_seconds=duration_seconds,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                task=task,
+                input_image_path=params.get("input_image_path"),
+                input_video_path=params.get("input_video_path"),
+                negative_prompt=params.get("negative_prompt")
+            )
+            job.provider_operation_id = submission["provider_operation_id"]
+            job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            db.commit()
+        except Exception as sub_err:
+            cost_controller.release_reservation(
+                db=db,
+                project_id=job.project_id,
+                reservation_record=reservation,
+                reason=f"provider_submission_failed: {sub_err}"
+            )
+            job.status = "failed"
+            job.error_details = f"Video submission failed: {sub_err}"
+            if job.shot_id:
+                shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
+                if shot and shot.generation_status == "generating":
+                    shot.generation_status = "pending"
+            db.commit()
+            return
+
+        # 3. Poll until complete
         op_id = job.provider_operation_id
         poll_interval = 4
         max_polls = 60 # Up to 5-8 minutes
 
         for _ in range(max_polls):
             time.sleep(poll_interval)
-            # Re-read status to verify if user cancelled
             db.refresh(job)
             if job.status == "cancelled":
                 logger.info(f"Job {job.id} was marked cancelled while polling.")
+                cost_controller.release_reservation(
+                    db=db,
+                    project_id=job.project_id,
+                    reservation_record=reservation,
+                    reason="cancelled_by_user"
+                )
+                db.commit()
                 return
 
             poll_res = google_video_adapter.poll_operation_status(op_id)
             if poll_res["status"] == "completed":
-                # Import completed video locally
-                media_asset = google_video_adapter.import_completed_video(
-                    project_id=job.project_id,
-                    shot_id=job.shot_id,
-                    video_bytes=poll_res.get("video_bytes"),
-                    video_uri=poll_res.get("video_uri"),
-                    db=db,
-                    audio_bytes=poll_res.get("audio_bytes"),
-                    audio_uri=poll_res.get("audio_uri")
-                )
-                job.status = "completed"
-                job.result_asset_id = media_asset.id
-                job.result_metadata = json.dumps({
-                    "provider": "google_omni",
-                    "model": job.model,
-                    "task": task,
-                    "asset_id": media_asset.id,
-                    "filename": media_asset.filename,
-                    "duration_seconds": media_asset.duration_seconds
-                })
-                job.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                db.commit()
-                return
+                # Provider generation outcome: SUCCEEDED
+                try:
+                    media_asset = google_video_adapter.import_completed_video(
+                        project_id=job.project_id,
+                        shot_id=job.shot_id,
+                        video_bytes=poll_res.get("video_bytes"),
+                        video_uri=poll_res.get("video_uri"),
+                        db=db,
+                        audio_bytes=poll_res.get("audio_bytes"),
+                        audio_uri=poll_res.get("audio_uri"),
+                        reservation_record=reservation,
+                        raise_on_processing_error=True
+                    )
+                    # Local media processing outcome: SUCCEEDED
+                    job.status = "completed"
+                    job.result_asset_id = media_asset.id
+                    job.result_metadata = json.dumps({
+                        "provider": "google_omni",
+                        "model": job.model,
+                        "task": task,
+                        "asset_id": media_asset.id,
+                        "filename": media_asset.filename,
+                        "duration_seconds": media_asset.duration_seconds
+                    })
+                    job.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    db.commit()
+                    return
+                except Exception as local_err:
+                    # Local media processing outcome: FAILED
+                    # Incurred provider expense is preserved and NOT refunded
+                    logger.error(f"Provider generation succeeded, but local media processing failed: {local_err}")
+                    cost_controller.finalize_reservation(
+                        db=db,
+                        project_id=job.project_id,
+                        reservation_record=reservation,
+                        actual_cost=None,
+                        actual_cost_known=False,
+                        local_processing_status="failed",
+                        error_details=str(local_err)
+                    )
+                    job.status = "failed"
+                    job.error_details = f"Google Omni Flash generated video successfully, but local media processing failed: {local_err}"
+                    job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    if job.shot_id:
+                        shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
+                        if shot:
+                            shot.generation_status = "pending"
+                    db.commit()
+                    return
 
             elif poll_res["status"] == "failed":
+                cost_controller.release_reservation(
+                    db=db,
+                    project_id=job.project_id,
+                    reservation_record=reservation,
+                    reason=f"provider_failed: {poll_res.get('error', '')}"
+                )
                 job.status = "failed"
-                job.error_details = poll_res.get("error", "Omni Flash video generation failed.")
+                job.error_details = poll_res.get("error", "Omni Flash video generation failed remotely.")
                 job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 if job.shot_id:
                     shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
@@ -245,13 +317,29 @@ class GenerationJobManager:
                 return
 
             elif poll_res["status"] == "cancelled":
+                cost_controller.release_reservation(
+                    db=db,
+                    project_id=job.project_id,
+                    reservation_record=reservation,
+                    reason="provider_cancelled"
+                )
                 job.status = "cancelled"
                 job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                if job.shot_id:
+                    shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
+                    if shot:
+                        shot.generation_status = "pending"
                 db.commit()
                 return
 
             poll_interval = min(10, poll_interval + 1)
 
+        cost_controller.release_reservation(
+            db=db,
+            project_id=job.project_id,
+            reservation_record=reservation,
+            reason="polling_timeout"
+        )
         raise TimeoutError("Gemini Omni Flash video generation timed out while waiting for operation completion.")
 
     def _execute_tts_job(self, job: GenerationJob, params: Dict[str, Any], db: Session) -> None:
@@ -452,7 +540,7 @@ class GenerationJobManager:
         """
         Scans for generation jobs left in 'processing' or 'pending' state upon local server restart.
         If a provider_operation_id exists, it resumes polling via background executor.
-        Otherwise, marks orphaned in-memory jobs as failed so the user can cleanly retry them.
+        Otherwise, marks orphaned in-memory jobs as failed and releases unincurred budget reservations.
         """
         interrupted = db.query(GenerationJob).filter(
             GenerationJob.status.in_(["pending", "processing"])
@@ -469,7 +557,12 @@ class GenerationJobManager:
                     shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
                     if shot and shot.generation_status == "generating":
                         shot.generation_status = "pending"
+                cost_controller.recover_orphaned_job_reservation(db=db, job_id=job.id, project_id=job.project_id)
                 recovered_count += 1
+
+        # Reconcile any lingering orphaned budget reservations across the database
+        cost_controller.recover_interrupted_reservations(db=db)
+
         if recovered_count > 0:
             db.commit()
         return recovered_count

@@ -369,11 +369,17 @@ def test_google_tts_adapter_dialogue_generation(test_db, sample_project):
     assert res["interaction_id"] == "interactions/tts-turn-987"
     assert Path(res["file_path"]).exists()
 
-    # Verify Interactions API call payload schema
+    # Verify Interactions API call payload schema per documented contract
     call_kwargs = mock_client.interactions.create.call_args[1]
-    assert call_kwargs["response_format"] == {"type": "audio", "mime_type": "audio/wav"}
-    assert call_kwargs["generation_config"]["speech_config"]["voice"] == "Charon"
-    assert call_kwargs["input"]["annotations"][0]["type"] == "speech_metadata"
+    assert call_kwargs["response_format"] == {"type": "audio"}
+    assert call_kwargs["generation_config"]["speech_config"] == [{"voice": "Charon"}]
+    assert isinstance(call_kwargs["input"], list)
+    assert call_kwargs["input"][0]["type"] == "user_input"
+    assert call_kwargs["input"][0]["content"][0]["type"] == "text"
+    assert call_kwargs["input"][0]["content"][0]["text"] == "The core is destabilizing. We have thirty seconds."
+    assert call_kwargs["input"][0]["content"][0]["annotations"][0]["type"] == "speech_metadata"
+    assert call_kwargs["input"][0]["content"][0]["annotations"][0]["speaker"] == "REN"
+    assert "urgent" in call_kwargs["input"][0]["content"][0]["annotations"][0]["style"]
 
     # Verify AudioTrack in DB
     track = test_db.query(AudioTrack).filter(AudioTrack.id == res["track_id"]).first()
@@ -420,6 +426,15 @@ def test_google_music_adapter_score_generation(test_db, sample_project):
     assert track is not None
     assert track.track_type == "music"
     assert track.ducking_enabled is True
+
+    # Verify Interactions API arguments: no unsupported audio_config dictionary
+    call_kwargs = mock_client.interactions.create.call_args[1]
+    assert call_kwargs["response_format"] == {"type": "audio", "mime_type": "audio/mp3"}
+    assert "generation_config" not in call_kwargs or "audio_config" not in call_kwargs.get("generation_config", {})
+    prompt_str = call_kwargs["input"]
+    assert "dark cyberpunk" in prompt_str
+    assert "synthwave" in prompt_str
+    assert "120 BPM" in prompt_str
 
 
 def test_asynchronous_generation_job_lifecycle(test_db, sample_project):
@@ -788,3 +803,271 @@ def test_dynamic_ai_config_runtime_updates(client):
     assert google_music_adapter.model == "lyria-3-clip-preview"
     assert google_image_adapter.model == "gemini-3-pro-image"
     assert google_video_adapter.api_key == "AIzaSyNEWKEYFORTESTING1234567890"
+
+
+def test_google_tts_adapter_multispeaker_contract(test_db, sample_project):
+    """Verifies documented multi-speaker dialogue configuration with speaker mappings."""
+    adapter = GoogleTTSAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    mock_interaction = MagicMock()
+    mock_interaction.id = "interactions/tts-multi-555"
+    wav_bytes = b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00D\xac\x00\x00\x88X\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    mock_interaction.output_audio.data = base64.b64encode(wav_bytes).decode("utf-8")
+    mock_client.interactions.create.return_value = mock_interaction
+    adapter._client = mock_client
+
+    turns = [
+        {"speaker": "REN", "voice": "Puck", "text": "We need to evacuate now.", "emotion": "urgent"},
+        {"speaker": "ELENA", "voice": "Kore", "text": "The blast doors are already locked.", "emotion": "tense"}
+    ]
+
+    res = adapter.generate_multi_speaker_dialogue(
+        dialogue_turns=turns,
+        project_id=sample_project.id,
+        db=test_db,
+        scene_id="scene-multi-01"
+    )
+
+    assert res["status"] == "completed"
+    assert res["is_multi_speaker"] is True
+    assert set(res["speakers"]) == {"REN", "ELENA"}
+    assert Path(res["file_path"]).exists()
+
+    # Inspect call arguments
+    call_kwargs = mock_client.interactions.create.call_args[1]
+    assert call_kwargs["response_format"] == {"type": "audio"}
+    speech_cfg = call_kwargs["generation_config"]["speech_config"]
+    assert len(speech_cfg) == 2
+    assert {"voice": "Puck", "speaker": "REN"} in speech_cfg
+    assert {"voice": "Kore", "speaker": "ELENA"} in speech_cfg
+
+    # Multi-turn user_input verification
+    input_items = call_kwargs["input"]
+    assert len(input_items) == 2
+    assert input_items[0]["type"] == "user_input"
+    assert input_items[0]["content"][0]["annotations"][0]["speaker"] == "REN"
+    assert "urgent" in input_items[0]["content"][0]["annotations"][0]["style"]
+    assert input_items[1]["type"] == "user_input"
+    assert input_items[1]["content"][0]["annotations"][0]["speaker"] == "ELENA"
+    assert "tense" in input_items[1]["content"][0]["annotations"][0]["style"]
+
+
+def test_google_image_adapter_model_size_limitations(test_db, sample_project):
+    """Verifies model-specific image-size limitations for Flash, Flash Lite, and Pro."""
+    import pytest
+    adapter = GoogleImageAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    mock_interaction = MagicMock()
+    mock_interaction.id = "interactions/img-limit-test"
+    # Small valid JPEG byte buffer
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (320, 240), color="red").save(buf, format="JPEG")
+    mock_interaction.output_image.data = base64.b64encode(buf.getvalue()).decode("utf-8")
+    mock_client.interactions.create.return_value = mock_interaction
+    adapter._client = mock_client
+
+    # 1. Flash Lite Image accepts 512 and 1K, but rejects 2K and 4K
+    res_lite_1k = adapter.generate_image(
+        prompt="Cyberpunk drone",
+        project_id=sample_project.id,
+        db=test_db,
+        model="gemini-3.1-flash-lite-image",
+        image_size="1K"
+    )
+    assert res_lite_1k["status"] == "completed"
+
+    with pytest.raises(ValueError, match="not supported"):
+        adapter.generate_image(
+            prompt="Cyberpunk drone",
+            project_id=sample_project.id,
+            db=test_db,
+            model="gemini-3.1-flash-lite-image",
+            image_size="2K"
+        )
+
+    with pytest.raises(ValueError, match="not supported"):
+        adapter.generate_image(
+            prompt="Cyberpunk drone",
+            project_id=sample_project.id,
+            db=test_db,
+            model="gemini-3.1-flash-lite-image",
+            image_size="4K"
+        )
+
+    # 2. Pro Image accepts 1K, 2K, 4K, but rejects 512
+    res_pro_2k = adapter.generate_image(
+        prompt="Masterpiece painting",
+        project_id=sample_project.id,
+        db=test_db,
+        model="gemini-3-pro-image",
+        image_size="2K"
+    )
+    assert res_pro_2k["status"] == "completed"
+
+    with pytest.raises(ValueError, match="not supported"):
+        adapter.generate_image(
+            prompt="Masterpiece painting",
+            project_id=sample_project.id,
+            db=test_db,
+            model="gemini-3-pro-image",
+            image_size="512"
+        )
+
+
+def test_google_video_adapter_files_api_upload_workflow(test_db, sample_project, tmp_path):
+    """Verifies official Google Files API upload workflow for video input with active state polling."""
+    vid_file = tmp_path / "input_clip.mp4"
+    vid_file.write_bytes(b"FAKE_INPUT_MP4_VIDEO_HEADER_DATA")
+
+    adapter = GoogleVideoAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    mock_file = MagicMock()
+    mock_file.name = "files/test-upload-name-99"
+    mock_file.uri = "https://generativelanguage.googleapis.com/v1beta/files/test-upload-name-99"
+    # State transition: PROCESSING -> ACTIVE
+    mock_file.state.name = "ACTIVE"
+    mock_client.files.upload.return_value = mock_file
+    mock_client.files.get.return_value = mock_file
+
+    mock_interaction = MagicMock()
+    mock_interaction.id = "interactions/omni-files-7788"
+    mock_client.interactions.create.return_value = mock_interaction
+    adapter._client = mock_client
+
+    scene = Scene(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_number=2,
+        slugline="INT. LAB - EXTENSION",
+        script_content="Continued lab sequence."
+    )
+    test_db.add(scene)
+    test_db.commit()
+
+    shot = Shot(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_id=scene.id,
+        shot_code="SC02_SH01",
+        video_prompt="Extend this scene"
+    )
+    test_db.add(shot)
+    test_db.commit()
+
+    sub = adapter.submit_video_generation(
+        prompt="Extend camera movement",
+        project_id=sample_project.id,
+        shot_id=shot.id,
+        db=test_db,
+        task="extend",
+        aspect_ratio="9:16",
+        resolution="1080p",
+        input_video_path=str(vid_file)
+    )
+
+    assert sub["status"] == "processing"
+    assert sub["aspect_ratio"] == "9:16"
+    assert mock_client.files.upload.called
+
+    # Check that interactions.create received the file URI (not base64 payload)
+    call_kwargs = mock_client.interactions.create.call_args[1]
+    video_input = [item for item in call_kwargs["input"] if item.get("type") == "video"][0]
+    assert video_input["uri"] == mock_file.uri
+    assert video_input["mime_type"] == "video/mp4"
+    assert call_kwargs["response_format"] == {"type": "video", "aspect_ratio": "9:16", "resolution": "1080p"}
+
+
+def test_cost_accounting_edge_case_provider_succeeded_local_processing_failed(test_db, sample_project):
+    """
+    Verifies that when Google successfully generates a video but local FFmpeg processing fails:
+    - Incurred provider expense is NOT erased or refunded.
+    - Outstanding reservation is finalized with local_processing_status='failed'.
+    - Project.budget_spent remains charged.
+    """
+    from backend.app.services.cost_controller import CostController
+    from backend.app.services.google_video_adapter import LocalMediaProcessingError
+
+    initial_spent = sample_project.budget_spent or 0.0
+
+    # 1. Pre-flight reservation
+    reservation = CostController.reserve_budget(
+        db=test_db,
+        project_id=sample_project.id,
+        estimated_cost=0.15,
+        operation="video_generation",
+        provider="google_omni",
+        model="gemini-omni-1.1-flash",
+        details="Pre-flight video reservation for edge case test"
+    )
+    test_db.commit()
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - initial_spent, 2) == 0.15
+
+    # 2. Simulate local media processing failure after provider completion
+    mux_error = LocalMediaProcessingError("FFmpeg: Audio stream corrupted during muxing")
+    finalized = CostController.finalize_reservation(
+        db=test_db,
+        project_id=sample_project.id,
+        reservation_record=reservation,
+        actual_cost=None,
+        actual_cost_known=False,
+        local_processing_status="failed",
+        error_details=str(mux_error)
+    )
+    test_db.commit()
+
+    # 3. Verify that the provider expense remains charged against the project budget
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - initial_spent, 2) == 0.15
+    assert finalized.action_type == "video_generation"
+    assert "local media processing failed" in finalized.details
+
+    # 4. Verify no refund was recorded
+    refund = test_db.query(CostRecord).filter(
+        CostRecord.operation_identity == f"refund_{reservation.id}"
+    ).first()
+    assert refund is None
+
+
+def test_interrupted_reservation_recovery_after_backend_shutdown(test_db, sample_project):
+    """
+    Verifies that an orphaned budget reservation from a local crash before cloud dispatch
+    is safely released during backend startup recovery.
+    """
+    from backend.app.services.cost_controller import CostController
+    from backend.app.services.generation_job_manager import generation_job_manager
+
+    initial_spent = sample_project.budget_spent or 0.0
+    dead_job_id = f"dead-job-{uuid.uuid4().hex[:8]}"
+
+    # Simulate an orphaned reservation created by a job that died before remote dispatch
+    reservation = CostController.reserve_budget(
+        db=test_db,
+        project_id=sample_project.id,
+        estimated_cost=0.15,
+        operation="video_generation",
+        provider="google_omni",
+        job_id=dead_job_id,
+        details="Pre-flight video reservation before crash"
+    )
+    test_db.commit()
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - initial_spent, 2) == 0.15
+
+    # Run recovery
+    released = CostController.recover_orphaned_job_reservation(
+        db=test_db,
+        job_id=dead_job_id,
+        project_id=sample_project.id
+    )
+    test_db.commit()
+
+    assert released is not None
+    assert released.action_type == "refund"
+    assert released.cost_usd == -0.15
+
+    # Project budget should be fully restored
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - initial_spent, 2) == 0.0

@@ -39,6 +39,11 @@ class GoogleVideoAdapterError(Exception):
     pass
 
 
+class LocalMediaProcessingError(GoogleVideoAdapterError):
+    """Raised when provider video generation succeeded, but local media processing/muxing failed."""
+    pass
+
+
 class GoogleVideoAdapter:
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self._api_key = api_key
@@ -93,6 +98,7 @@ class GoogleVideoAdapter:
         db: Session,
         duration_seconds: int = 5,
         aspect_ratio: str = "16:9",
+        resolution: str = "720p",
         task: str = "text_to_video",
         input_image_path: Optional[str] = None,
         input_video_path: Optional[str] = None,
@@ -100,6 +106,10 @@ class GoogleVideoAdapter:
     ) -> Dict[str, Any]:
         """
         Submits an asynchronous video generation request to Gemini Omni Flash 1.1 via Interactions API.
+        Uses documented tasks: text_to_video, image_to_video, reference_to_video, edit, extend.
+        Uses documented aspect ratios: 16:9, 9:16.
+        Uses documented resolutions: 720p, 1080p.
+        For video input, prefers the official Google Files API upload workflow, waits for active state, and passes URI.
         Returns initial job information including provider interaction ID.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
@@ -116,10 +126,13 @@ class GoogleVideoAdapter:
                 "Configure your key in settings to enable Google Cloud AI video rendering."
             )
 
-        clean_ratio = aspect_ratio if aspect_ratio in ["16:9", "9:16", "1:1", "4:3"] else "16:9"
+        # Documented aspect ratios: strictly 16:9 and 9:16
+        clean_ratio = aspect_ratio if aspect_ratio in ["16:9", "9:16"] else "16:9"
+        # Documented resolutions: 720p, 1080p
+        clean_resolution = resolution if resolution in ["720p", "1080p"] else "720p"
         clean_duration = 5 if duration_seconds <= 5 else 8
 
-        # Determine task: valid tasks for VideoConfig are text_to_video, image_to_video, reference_to_video, edit, extend
+        # Documented tasks for Omni Flash video: text_to_video, image_to_video, reference_to_video, edit, extend
         valid_tasks = ["text_to_video", "image_to_video", "reference_to_video", "edit", "extend"]
         resolved_task = task
         if input_image_path and (task == "text_to_video" or task not in valid_tasks):
@@ -141,7 +154,7 @@ class GoogleVideoAdapter:
         response_format = {
             "type": "video",
             "aspect_ratio": clean_ratio,
-            "resolution": "720p"
+            "resolution": clean_resolution
         }
 
         # Format input prompt (and references if applicable)
@@ -163,11 +176,43 @@ class GoogleVideoAdapter:
         elif input_video_path:
             vid_p = Path(input_video_path)
             if vid_p.exists():
-                vid_data = base64.b64encode(vid_p.read_bytes()).decode("utf-8")
-                input_payload = [
-                    {"type": "text", "text": full_text},
-                    {"type": "video", "data": vid_data, "mime_type": "video/mp4"}
-                ]
+                file_uri = None
+                # Prefer official Google Files API upload workflow for video input
+                if hasattr(self.client, "files") and hasattr(self.client.files, "upload"):
+                    try:
+                        logger.info(f"Uploading input video '{input_video_path}' via Google Files API...")
+                        uploaded_file = self.client.files.upload(file=str(vid_p))
+                        # Wait for the file to become ACTIVE
+                        import time
+                        for _ in range(30):
+                            state = getattr(uploaded_file, "state", None)
+                            state_name = getattr(state, "name", str(state)).upper()
+                            if "PROCESSING" in state_name:
+                                time.sleep(1)
+                                if hasattr(self.client.files, "get") and getattr(uploaded_file, "name", None):
+                                    uploaded_file = self.client.files.get(name=uploaded_file.name)
+                            elif "FAILED" in state_name or "ERROR" in state_name:
+                                raise GoogleVideoAdapterError(f"Files API video processing failed: {state_name}")
+                            else:
+                                break
+                        file_uri = getattr(uploaded_file, "uri", None)
+                    except GoogleVideoAdapterError:
+                        raise
+                    except Exception as e_files:
+                        logger.warning(f"Google Files API upload encountered issue: {e_files}; falling back to base64 attachment.")
+                        file_uri = None
+
+                if file_uri:
+                    input_payload = [
+                        {"type": "text", "text": full_text},
+                        {"type": "video", "uri": file_uri, "mime_type": "video/mp4"}
+                    ]
+                else:
+                    vid_data = base64.b64encode(vid_p.read_bytes()).decode("utf-8")
+                    input_payload = [
+                        {"type": "text", "text": full_text},
+                        {"type": "video", "data": vid_data, "mime_type": "video/mp4"}
+                    ]
 
         try:
             logger.info(
@@ -313,13 +358,16 @@ class GoogleVideoAdapter:
         video_uri: Optional[str] = None,
         db: Optional[Session] = None,
         audio_bytes: Optional[bytes] = None,
-        audio_uri: Optional[str] = None
+        audio_uri: Optional[str] = None,
+        reservation_record: Optional[Any] = None,
+        raise_on_processing_error: bool = False
     ) -> MediaAsset:
         """
         Saves the generated video to the local project media directory,
         multiplexes native audio output via FFmpeg if present,
         inspects true stream dimensions/duration with FFprobe,
         creates a MediaAsset record with take versioning,
+        finalizes the budget reservation (or charges cost),
         and links it to the Shot as the active take.
         """
         if db is None:
@@ -377,7 +425,9 @@ class GoogleVideoAdapter:
                     pass
                 logger.info(f"Successfully multiplexed Omni Flash native audio into {filename}")
             except Exception as mux_err:
-                logger.warning(f"FFmpeg audio muxing failed (proceeding with video-only): {mux_err}")
+                logger.warning(f"FFmpeg audio muxing failed: {mux_err}")
+                if raise_on_processing_error:
+                    raise LocalMediaProcessingError(f"Local FFmpeg audio muxing failed: {mux_err}") from mux_err
 
         # Probe video metadata using local FFprobe / ffmpeg service
         try:
@@ -411,23 +461,35 @@ class GoogleVideoAdapter:
         shot.generation_status = "ready"
         shot.generation_attempts = (shot.generation_attempts or 0) + 1
 
-        # Record Cloud AI cost in CostController
+        # Record or finalize Cloud AI cost in CostController
         # Estimated cost for Omni Flash video generation (~$0.15); actual cost is not known a priori
-        cost_controller.authorize_and_charge(
-            db=db,
-            project_id=project_id,
-            shot_id=shot_id,
-            action_type="video_generation",
-            provider="google_omni",
-            model=self.model,
-            operation="video_generation",
-            details=f"Gemini Omni Flash 1.1 video generation take {next_ver} for shot {shot.shot_code}",
-            estimated_cost=0.15,
-            actual_cost=None,
-            actual_cost_known=False,
-            allow_duplicate=True
-        )
+        if reservation_record is not None:
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="completed"
+            )
+        else:
+            cost_controller.authorize_and_charge(
+                db=db,
+                project_id=project_id,
+                shot_id=shot_id,
+                action_type="video_generation",
+                provider="google_omni",
+                model=self.model,
+                operation="video_generation",
+                details=f"Gemini Omni Flash 1.1 video generation take {next_ver} for shot {shot.shot_code}",
+                estimated_cost=0.15,
+                actual_cost=None,
+                actual_cost_known=False,
+                allow_duplicate=True
+            )
         db.commit()
+        db.refresh(media_asset)
+        return media_asset
         db.refresh(media_asset)
         return media_asset
 
