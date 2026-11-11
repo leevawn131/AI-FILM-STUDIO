@@ -44,9 +44,9 @@ class FFmpegService:
         video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
         audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
 
-        width = int(video_stream.get("width", 1920)) if video_stream else 1920
-        height = int(video_stream.get("height", 1080)) if video_stream else 1080
-        codec = video_stream.get("codec_name", "unknown") if video_stream else "unknown"
+        width = int(video_stream["width"]) if (video_stream and video_stream.get("width") is not None) else None
+        height = int(video_stream["height"]) if (video_stream and video_stream.get("height") is not None) else None
+        codec = video_stream.get("codec_name") if video_stream else (audio_stream.get("codec_name") if audio_stream else "unknown")
 
         # Calculate FPS from fraction (e.g. "24/1")
         fps = 24.0
@@ -62,7 +62,7 @@ class FFmpegService:
                 fps = 24.0
 
         # Duration
-        dur_str = fmt.get("duration") or (video_stream.get("duration") if video_stream else "0")
+        dur_str = fmt.get("duration") or (video_stream.get("duration") if video_stream else (audio_stream.get("duration") if audio_stream else "0"))
         try:
             duration = round(float(dur_str), 2)
         except Exception:
@@ -76,6 +76,9 @@ class FFmpegService:
             "duration": duration,
             "fps": fps,
             "codec": codec,
+            "audio_codec": audio_stream.get("codec_name") if audio_stream else None,
+            "sample_rate": int(audio_stream.get("sample_rate")) if (audio_stream and audio_stream.get("sample_rate")) else None,
+            "channels": int(audio_stream.get("channels")) if (audio_stream and audio_stream.get("channels")) else None,
             "size_bytes": size_bytes,
             "has_audio": bool(audio_stream)
         }
@@ -152,6 +155,29 @@ class FFmpegService:
                 str(output_path)
             ]
             subprocess.run(cmd_simple, check=True)
+        return output_path
+
+    def mux_video_and_audio(
+        self,
+        video_path: Path,
+        audio_path: Path,
+        output_path: Path,
+    ) -> Path:
+        """Muxes video and audio streams using local FFmpeg."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            self.ffmpeg,
+            "-y",
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            str(output_path),
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"FFmpeg muxing failed: {res.stderr}")
         return output_path
 
 ffmpeg_service = FFmpegService()

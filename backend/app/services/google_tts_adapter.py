@@ -50,19 +50,49 @@ class GoogleTTSAdapterError(Exception):
 
 class GoogleTTSAdapter:
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
-        self.api_key = api_key or settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-        self.model = model or getattr(settings, "google_tts_model", "gemini-3.8-flash-tts")
+        self._api_key = api_key
+        self._model = model
         self._client = None
-        if self.api_key:
+        self._cached_api_key = None
+
+    @property
+    def api_key(self) -> str:
+        return self._api_key or settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+
+    @property
+    def model(self) -> str:
+        return self._model or getattr(settings, "google_tts_model", "gemini-3.8-flash-tts")
+
+    @property
+    def client(self):
+        if self._client is not None and getattr(self, "_injected_client", False):
+            return self._client
+        curr_key = self.api_key
+        if not curr_key:
+            return None
+        if self._client is not None and self._cached_api_key is None:
+            self._cached_api_key = curr_key
+            return self._client
+        if self._client is None or self._cached_api_key != curr_key:
             try:
                 from google import genai
-                self._client = genai.Client(api_key=self.api_key)
+                self._client = genai.Client(api_key=curr_key)
+                self._cached_api_key = curr_key
+                self._injected_client = False
             except Exception as e:
                 logger.warning(f"Could not initialize google-genai client for Gemini TTS: {e}")
+                self._client = None
+        return self._client
+
+    @client.setter
+    def client(self, value):
+        self._client = value
+        self._cached_api_key = self.api_key
+        self._injected_client = True
 
     @property
     def is_available(self) -> bool:
-        return bool(self._client and self.api_key)
+        return bool(self.client and self.api_key)
 
     @staticmethod
     def get_available_voices() -> Dict[str, Any]:
@@ -86,7 +116,7 @@ class GoogleTTSAdapter:
         model: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Generates expressive character speech from dialogue text using Gemini TTS.
+        Generates expressive character speech from dialogue text using Gemini TTS via Interactions API.
         Saves the audio locally, registers an AudioTrack and MediaAsset in SQLite.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
@@ -114,57 +144,77 @@ class GoogleTTSAdapter:
                 db=db
             )
 
-        from google.genai import types
+        # Style annotation for speech synthesis
+        style_desc = f"{emotion} style, pace {speaking_pace}x" if emotion != "neutral" else f"natural dialogue cadence, pace {speaking_pace}x"
+        text_bytes_len = len(text.encode("utf-8"))
 
-        # Build clean speech configuration keeping voice metadata separate from transcript text
-        voice_config = types.VoiceConfig(
-            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=chosen_voice)
-        )
-        speech_config = types.SpeechConfig(
-            voice_config=voice_config,
-            language_code=language_code
-        )
-
-        sys_instruction = None
-        if emotion and emotion.lower() != "neutral":
-            sys_instruction = (
-                f"Perform the spoken dialogue with a {emotion} emotional style. "
-                f"Speaking pace modifier: {speaking_pace}x. Maintain natural cinematic cadence."
-            )
-
-        config_kwargs: Dict[str, Any] = {
-            "response_modalities": ["AUDIO"],
-            "speech_config": speech_config,
+        input_payload: Dict[str, Any] = {
+            "type": "text",
+            "text": text,
+            "annotations": [
+                {
+                    "type": "speech_metadata",
+                    "speaker": speaker_label,
+                    "style": style_desc,
+                    "start_index": 0,
+                    "end_index": text_bytes_len,
+                }
+            ],
         }
-        if sys_instruction:
-            config_kwargs["system_instruction"] = sys_instruction
 
-        config = types.GenerateContentConfig(**config_kwargs)
+        generation_config = {
+            "speech_config": {
+                "voice": chosen_voice,
+                "language": language_code,
+                "speaker": speaker_label,
+            }
+        }
+
+        response_format = {
+            "type": "audio",
+            "mime_type": "audio/wav",
+        }
 
         audio_bytes = None
+        provider_op_id = None
         try:
             logger.info(
                 f"Generating Gemini TTS audio for {speaker_label} ({chosen_voice}, {emotion}) "
-                f"using {target_model}..."
+                f"using {target_model} via Interactions API..."
             )
-            response = self._client.models.generate_content(
+            interaction = self.client.interactions.create(
                 model=target_model,
-                contents=text,
-                config=config
+                input=input_payload,
+                generation_config=generation_config,
+                response_format=response_format
             )
+            provider_op_id = getattr(interaction, "id", None)
 
-            # Extract audio from response candidates
-            if hasattr(response, "candidates") and response.candidates:
-                candidate = response.candidates[0]
+            # Extract output audio from Interaction response
+            output_audio = getattr(interaction, "output_audio", None)
+            if output_audio:
+                raw_data = getattr(output_audio, "data", None)
+                if raw_data:
+                    if isinstance(raw_data, str):
+                        try:
+                            audio_bytes = base64.b64decode(raw_data)
+                        except Exception:
+                            audio_bytes = raw_data.encode("utf-8")
+                    else:
+                        audio_bytes = raw_data
+                elif getattr(output_audio, "uri", None):
+                    import urllib.request
+                    audio_bytes = urllib.request.urlopen(output_audio.uri).read()
+
+            # Fallback extraction from candidates if SDK wraps response differently
+            if not audio_bytes and hasattr(interaction, "candidates") and interaction.candidates:
+                candidate = interaction.candidates[0]
                 if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
                     for part in candidate.content.parts:
                         inline = getattr(part, "inline_data", None)
                         if inline and hasattr(inline, "data"):
-                            raw_data = inline.data
-                            if isinstance(raw_data, str):
-                                audio_bytes = base64.b64decode(raw_data)
-                            else:
-                                audio_bytes = raw_data
+                            raw_inline = inline.data
+                            audio_bytes = base64.b64decode(raw_inline) if isinstance(raw_inline, str) else raw_inline
                             break
         except Exception as e:
             err_msg = str(e)
@@ -183,7 +233,7 @@ class GoogleTTSAdapter:
         file_path = dest_dir / filename
         file_path.write_bytes(audio_bytes)
 
-        # Inspect duration via FFmpeg
+        # Inspect duration via FFmpeg / FFprobe
         try:
             meta = ffmpeg_service.inspect_media(file_path)
             duration = float(meta.get("duration", max(1.0, len(text.split()) / 2.5)))
@@ -224,7 +274,8 @@ class GoogleTTSAdapter:
         )
         db.add(media_asset)
 
-        # Charge cost via CostController (~$0.01 per dialogue turn)
+        # Charge cost via CostController (~$0.01 per dialogue turn; estimated, not verified fact)
+        est_cost = 0.005 if "lite" in target_model.lower() else 0.01
         cost_controller.authorize_and_charge(
             db=db,
             project_id=project_id,
@@ -235,9 +286,9 @@ class GoogleTTSAdapter:
             model=target_model,
             operation="tts_generation",
             details=f"Gemini TTS voiceover for {speaker_label} ({chosen_voice})",
-            estimated_cost=0.01,
-            actual_cost=0.01,
-            actual_cost_known=True,
+            estimated_cost=est_cost,
+            actual_cost=None,
+            actual_cost_known=False,
             allow_duplicate=True
         )
         db.commit()
@@ -254,6 +305,8 @@ class GoogleTTSAdapter:
             "duration_seconds": duration,
             "voice_name": chosen_voice,
             "character_name": speaker_label,
+            "provider_operation_id": provider_op_id,
+            "interaction_id": provider_op_id,
             "is_fallback": False
         }
 

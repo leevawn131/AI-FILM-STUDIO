@@ -175,7 +175,8 @@ def main():
                 model=settings.google_video_model,
                 input="Slow cinematic pan across a futuristic cityscape at dusk, 4k photoreal.",
                 background=True,
-                generation_config={"video_config": {"task": "text_to_video"}}
+                generation_config={"video_config": {"task": "text_to_video"}},
+                response_format={"type": "video", "aspect_ratio": "16:9", "resolution": "720p"}
             )
             op_id = getattr(interaction, "id", None)
             latency = time.time() - t0
@@ -196,34 +197,38 @@ def main():
                 "error": str(e)
             })
 
-    # 4. Gemini TTS (Speech Generation)
-    print(f"\n[4/5] Testing Gemini TTS speech generation ({settings.google_tts_model})...")
+    # 4. Gemini TTS (Speech Generation via Interactions API)
+    print(f"\n[4/5] Testing Gemini TTS speech generation ({settings.google_tts_model}) via Interactions API...")
     t0 = time.time()
     try:
-        voice_cfg = types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck"))
-        sp_cfg = types.SpeechConfig(voice_config=voice_cfg, language_code="en-US")
-        cfg = types.GenerateContentConfig(response_modalities=["AUDIO"], speech_config=sp_cfg)
-        tts_resp = client.models.generate_content(
+        tts_text = "AI Film Studio system operational. Ready for scene production."
+        tts_interaction = client.interactions.create(
             model=settings.google_tts_model,
-            contents="AI Film Studio system operational. Ready for scene production.",
-            config=cfg
+            input={
+                "type": "text",
+                "text": tts_text,
+                "annotations": [
+                    {
+                        "type": "speech_metadata",
+                        "speaker": "Puck",
+                        "style": "natural, articulate",
+                        "start_index": 0,
+                        "end_index": len(tts_text.encode("utf-8"))
+                    }
+                ]
+            },
+            generation_config={"speech_config": {"voice": "Puck", "language": "en-US"}},
+            response_format={"type": "audio", "mime_type": "audio/wav"}
         )
         latency = time.time() - t0
-        audio_bytes_len = 0
-        if hasattr(tts_resp, "candidates") and tts_resp.candidates:
-            for part in tts_resp.candidates[0].content.parts:
-                inline = getattr(part, "inline_data", None)
-                if inline and hasattr(inline, "data"):
-                    raw = inline.data
-                    audio_bytes_len = len(raw)
-                    break
-        print(f"  -> SUCCESS ({latency:.2f}s, audio_bytes={audio_bytes_len})")
+        tts_op_id = getattr(tts_interaction, "id", None)
+        print(f"  -> SUCCESS: Created TTS interaction ID {tts_op_id} ({latency:.2f}s)")
         results.append({
             "service": "TTS (Gemini TTS)",
             "model": settings.google_tts_model,
             "status": "PASS",
-            "latency_seconds": round(latency, 2),
-            "bytes_received": audio_bytes_len
+            "interaction_id": tts_op_id,
+            "latency_seconds": round(latency, 2)
         })
     except Exception as e:
         print(f"  -> FAILED: {e}")
@@ -251,7 +256,7 @@ def main():
                 model=settings.google_music_model,
                 input="Cinematic ambient synthwave score, 110 BPM, instrumental.",
                 background=True,
-                response_modalities=["AUDIO"]
+                response_format={"type": "audio", "mime_type": "audio/mp3"}
             )
             op_id = getattr(interaction, "id", None)
             latency = time.time() - t0

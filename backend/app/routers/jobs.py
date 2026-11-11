@@ -9,7 +9,9 @@ from backend.app.schemas.entities import (
     StudioJobResponse,
     GenerationJobResponse,
     GenerateImageRequest,
-    GenerateVideoRequest
+    GenerateVideoRequest,
+    GenerateTTSRequest,
+    GenerateMusicRequest
 )
 from backend.app.services.generation_job_manager import generation_job_manager
 from backend.app.config import settings
@@ -89,6 +91,49 @@ def submit_video_generation_job(req: GenerateVideoRequest, db: Session = Depends
         input_parameters=req.model_dump(),
         provider="google_veo",
         model=settings.google_video_model,
+        supports_cancellation=False
+    )
+    generation_job_manager.launch_job_async(job.id)
+    return job
+
+
+@router.post("/generation/tts", response_model=GenerationJobResponse)
+def submit_tts_generation_job(req: GenerateTTSRequest, db: Session = Depends(get_db)):
+    """Submits an asynchronous dialogue speech generation request (Google Gemini TTS)."""
+    project = db.query(Project).filter(Project.id == req.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    job = generation_job_manager.create_job(
+        db=db,
+        project_id=req.project_id,
+        scene_id=req.scene_id,
+        shot_id=req.shot_id,
+        generation_type="tts_generation",
+        input_parameters=req.model_dump(),
+        provider="google_tts",
+        model=req.model or settings.google_tts_model,
+        supports_cancellation=False
+    )
+    generation_job_manager.launch_job_async(job.id)
+    return job
+
+
+@router.post("/generation/music", response_model=GenerationJobResponse)
+def submit_music_generation_job(req: GenerateMusicRequest, db: Session = Depends(get_db)):
+    """Submits an asynchronous music score generation request (Google Lyria 3.5)."""
+    project = db.query(Project).filter(Project.id == req.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    job = generation_job_manager.create_job(
+        db=db,
+        project_id=req.project_id,
+        scene_id=req.scene_id,
+        generation_type="music_generation",
+        input_parameters=req.model_dump(),
+        provider="google_lyria",
+        model=req.model or settings.google_music_model,
         supports_cancellation=False
     )
     generation_job_manager.launch_job_async(job.id)

@@ -165,6 +165,7 @@ class GenerationJobManager:
 
         job.status = "completed"
         job.result_asset_id = result.get("asset_id")
+        job.provider_operation_id = result.get("provider_operation_id") or result.get("interaction_id")
         job.result_metadata = json.dumps(result)
         job.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.commit()
@@ -281,6 +282,7 @@ class GenerationJobManager:
 
         job.status = "completed"
         job.result_asset_id = result.get("asset_id")
+        job.provider_operation_id = result.get("provider_operation_id") or result.get("interaction_id")
         job.result_metadata = json.dumps(result)
         job.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.commit()
@@ -312,6 +314,7 @@ class GenerationJobManager:
 
         job.status = "completed"
         job.result_asset_id = result.get("asset_id")
+        job.provider_operation_id = result.get("provider_operation_id") or result.get("interaction_id")
         job.result_metadata = json.dumps(result)
         job.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.commit()
@@ -444,6 +447,32 @@ class GenerationJobManager:
         if generation_type:
             query = query.filter(GenerationJob.generation_type == generation_type)
         return query.order_by(GenerationJob.created_at.desc()).limit(limit).all()
+
+    def recover_interrupted_jobs(self, db: Session) -> int:
+        """
+        Scans for generation jobs left in 'processing' or 'pending' state upon local server restart.
+        If a provider_operation_id exists, it resumes polling via background executor.
+        Otherwise, marks orphaned in-memory jobs as failed so the user can cleanly retry them.
+        """
+        interrupted = db.query(GenerationJob).filter(
+            GenerationJob.status.in_(["pending", "processing"])
+        ).all()
+        recovered_count = 0
+        for job in interrupted:
+            if job.provider_operation_id:
+                self.launch_job_async(job.id)
+                recovered_count += 1
+            else:
+                job.status = "failed"
+                job.error_details = "Job interrupted by local backend restart. Click retry to resume."
+                if job.shot_id and job.generation_type == "video_generation":
+                    shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
+                    if shot and shot.generation_status == "generating":
+                        shot.generation_status = "pending"
+                recovered_count += 1
+        if recovered_count > 0:
+            db.commit()
+        return recovered_count
 
 
 generation_job_manager = GenerationJobManager()

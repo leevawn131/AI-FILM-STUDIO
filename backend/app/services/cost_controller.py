@@ -483,6 +483,55 @@ class CostController:
                 return refund_record
 
     @staticmethod
+    def reserve_budget(
+        db: Session,
+        project_id: str,
+        estimated_cost: float,
+        operation: str,
+        scene_id: Optional[str] = None,
+        shot_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        details: str = "Pre-flight budget reservation"
+    ) -> CostRecord:
+        """
+        Reserves estimated cost against project/scene budget prior to initiating an external cloud AI call.
+        """
+        return CostController.authorize_and_charge(
+            db=db,
+            project_id=project_id,
+            scene_id=scene_id,
+            shot_id=shot_id,
+            action_type="budget_reservation",
+            provider=provider,
+            model=model,
+            operation=operation,
+            details=details,
+            estimated_cost=estimated_cost,
+            actual_cost=None,
+            actual_cost_known=False,
+            allow_duplicate=True
+        )
+
+    @staticmethod
+    def release_reservation(
+        db: Session,
+        project_id: str,
+        reservation_record: CostRecord,
+        reason: str = "operation_failed_or_cancelled"
+    ) -> Optional[CostRecord]:
+        """
+        Releases reserved budget if the operation failed, timed out, or was cancelled.
+        Decreases Project.budget_spent by the reserved amount and records a compensation entry.
+        """
+        return CostController.record_compensation(
+            db=db,
+            project_id=project_id,
+            original_record=reservation_record,
+            reason=reason
+        )
+
+    @staticmethod
     def record_flow_credit_usage(
         db: Session,
         project_id: str,

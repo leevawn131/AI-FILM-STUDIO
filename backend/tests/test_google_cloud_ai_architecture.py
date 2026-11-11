@@ -216,14 +216,20 @@ def test_google_image_adapter_nano_banana_fallback(test_db, sample_project):
 
 
 def test_google_image_adapter_nano_banana_with_mock_client(test_db, sample_project):
-    """Verifies Nano Banana 2 image generation with mock client saving real bytes and charging budget."""
+    """Verifies Nano Banana 2 image generation with mock client saving real bytes and inspecting true PIL dimensions."""
+    import io
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (640, 480), color="blue").save(buf, format="JPEG")
+    valid_jpeg = buf.getvalue()
+
     adapter = GoogleImageAdapter(api_key="mock-api-key")
     mock_client = MagicMock()
-    mock_resp = MagicMock()
-    mock_img = MagicMock()
-    mock_img.image.image_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01FAKE_JPEG_BYTES"
-    mock_resp.generated_images = [mock_img]
-    mock_client.models.generate_images.return_value = mock_resp
+    mock_interaction = MagicMock()
+    mock_interaction.id = "interactions/img-456"
+    mock_interaction.output_image.data = base64.b64encode(valid_jpeg).decode("utf-8")
+    mock_client.interactions.create.return_value = mock_interaction
     adapter._client = mock_client
 
     res = adapter.generate_image(
@@ -232,12 +238,16 @@ def test_google_image_adapter_nano_banana_with_mock_client(test_db, sample_proje
         db=test_db,
         entity_type="character",
         aspect_ratio="16:9",
+        image_size="1K",
         tier="default"
     )
 
     assert res["status"] == "completed"
     assert res["provider"] == "google_nano_banana"
     assert res["model"] == "gemini-3.1-flash-image"
+    assert res["width"] == 640
+    assert res["height"] == 480
+    assert res["filename"].endswith(".jpg")
     assert res["is_fallback"] is False
     assert Path(res["file_path"]).exists()
 
@@ -324,7 +334,7 @@ def test_google_video_adapter_interactions_api_lifecycle(test_db, sample_project
 
 
 def test_google_tts_adapter_dialogue_generation(test_db, sample_project):
-    """Verifies Google Gemini TTS generates audio and registers AudioTrack and MediaAsset."""
+    """Verifies Google Gemini TTS generates audio via Interactions API with speech_metadata."""
     # Verify voices catalog
     voices = GoogleTTSAdapter.get_available_voices()
     assert "Puck" in voices
@@ -335,13 +345,12 @@ def test_google_tts_adapter_dialogue_generation(test_db, sample_project):
 
     adapter = GoogleTTSAdapter(api_key="mock-key")
     mock_client = MagicMock()
-    mock_resp = MagicMock()
-    mock_cand = MagicMock()
-    mock_part = MagicMock()
-    mock_part.inline_data.data = base64.b64encode(b"FAKE_AUDIO_WAV_BYTES_FOR_TTS").decode("utf-8")
-    mock_cand.content.parts = [mock_part]
-    mock_resp.candidates = [mock_cand]
-    mock_client.models.generate_content.return_value = mock_resp
+    mock_interaction = MagicMock()
+    mock_interaction.id = "interactions/tts-turn-987"
+    # Valid RIFF WAV header (mono, 44.1kHz, 16-bit)
+    wav_bytes = b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00D\xac\x00\x00\x88X\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    mock_interaction.output_audio.data = base64.b64encode(wav_bytes).decode("utf-8")
+    mock_client.interactions.create.return_value = mock_interaction
     adapter._client = mock_client
 
     res = adapter.generate_dialogue_speech(
@@ -357,7 +366,14 @@ def test_google_tts_adapter_dialogue_generation(test_db, sample_project):
     assert res["provider"] == "google_tts"
     assert res["model"] == "gemini-3.8-flash-tts"
     assert res["voice_name"] == "Charon"
+    assert res["interaction_id"] == "interactions/tts-turn-987"
     assert Path(res["file_path"]).exists()
+
+    # Verify Interactions API call payload schema
+    call_kwargs = mock_client.interactions.create.call_args[1]
+    assert call_kwargs["response_format"] == {"type": "audio", "mime_type": "audio/wav"}
+    assert call_kwargs["generation_config"]["speech_config"]["voice"] == "Charon"
+    assert call_kwargs["input"]["annotations"][0]["type"] == "speech_metadata"
 
     # Verify AudioTrack in DB
     track = test_db.query(AudioTrack).filter(AudioTrack.id == res["track_id"]).first()
@@ -372,13 +388,13 @@ def test_google_tts_adapter_dialogue_generation(test_db, sample_project):
 
 
 def test_google_music_adapter_score_generation(test_db, sample_project):
-    """Verifies Google Lyria 3.5 generates music score via Interactions API."""
+    """Verifies Google Lyria 3.5 generates real MP3 music score via Interactions API."""
     adapter = GoogleMusicAdapter(api_key="mock-key")
     mock_client = MagicMock()
     mock_interaction = MagicMock()
     mock_interaction.id = "interactions/lyria-score-11223"
     mock_interaction.status = "completed"
-    mock_interaction.output_audio.data = base64.b64encode(b"FAKE_LYRIA_SCORE_AUDIO_BYTES").decode("utf-8")
+    mock_interaction.output_audio.data = base64.b64encode(b"FAKE_LYRIA_SCORE_MP3_BYTES").decode("utf-8")
     mock_client.interactions.create.return_value = mock_interaction
     adapter._client = mock_client
 
@@ -395,6 +411,8 @@ def test_google_music_adapter_score_generation(test_db, sample_project):
     assert res["provider"] == "google_lyria"
     assert res["model"] == "lyria-3.5"
     assert res["mood"] == "dark cyberpunk"
+    assert res["filename"].endswith(".mp3")
+    assert res["interaction_id"] == "interactions/lyria-score-11223"
     assert Path(res["file_path"]).exists()
 
     # Verify AudioTrack
@@ -456,6 +474,24 @@ def test_asynchronous_generation_job_lifecycle(test_db, sample_project):
     test_db.commit()
     retried_job = generation_job_manager.retry_job(test_db, job.id)
     assert retried_job.status == "completed"
+
+    # 5. Recovery upon local server restart: orphaned jobs safely marked as failed with clear message
+    orphaned_job = generation_job_manager.create_job(
+        db=test_db,
+        project_id=sample_project.id,
+        generation_type="image_generation",
+        input_parameters={"prompt": "orphaned render"},
+        provider="google_nano_banana",
+        model="gemini-3.1-flash-image"
+    )
+    orphaned_job.status = "processing"
+    test_db.commit()
+
+    recovered_count = generation_job_manager.recover_interrupted_jobs(test_db)
+    assert recovered_count >= 1
+    test_db.refresh(orphaned_job)
+    assert orphaned_job.status == "failed"
+    assert "interrupted by local backend restart" in orphaned_job.error_details
 
 
 def test_honest_cancellation_semantics_for_remote_processing(test_db, sample_project):
@@ -564,3 +600,191 @@ def test_audio_endpoints_tts_and_music(client, sample_project):
     music_data = res_music.json()
     assert music_data["project_id"] == sample_project.id
     assert music_data["track_type"] == "music"
+
+
+def test_google_video_adapter_multimodal_and_task_filtering(test_db, sample_project, tmp_path):
+    """Verifies Omni Flash multimodal attachments, removal of upscale task, and response format."""
+    scene = Scene(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_number=1,
+        slugline="INT. LAB - DAY",
+        script_content="Scanning brain scan."
+    )
+    test_db.add(scene)
+    test_db.commit()
+
+    shot = Shot(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_id=scene.id,
+        shot_code="SC01_SH05",
+        video_prompt="Close up of cybernetic eye scanning"
+    )
+    test_db.add(shot)
+    test_db.commit()
+
+    # Create dummy reference image
+    ref_img = tmp_path / "reference.png"
+    ref_img.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRFAKEPNG")
+
+    adapter = GoogleVideoAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    mock_interaction = MagicMock()
+    mock_interaction.id = "interactions/omni-multi-1122"
+    mock_interaction.status = "processing"
+    mock_client.interactions.create.return_value = mock_interaction
+    adapter._client = mock_client
+
+    # Submit with image attachment and upscale task (which must map to text_to_video or image_to_video)
+    res = adapter.submit_video_generation(
+        prompt="Scan neural pathway",
+        project_id=sample_project.id,
+        shot_id=shot.id,
+        db=test_db,
+        task="upscale", # should be sanitized away from upscale
+        input_image_path=str(ref_img)
+    )
+
+    assert res["status"] == "processing"
+    # upscale should be filtered out
+    assert res["task"] != "upscale"
+    assert res["task"] == "image_to_video"
+
+    # Check call arguments to interactions.create
+    call_kwargs = mock_client.interactions.create.call_args[1]
+    assert isinstance(call_kwargs["input"], list)
+    assert call_kwargs["input"][0]["type"] == "text"
+    assert call_kwargs["input"][1]["type"] == "image"
+    assert call_kwargs["input"][1]["mime_type"] == "image/png"
+    assert call_kwargs["response_format"] == {"type": "video", "aspect_ratio": "16:9", "resolution": "720p"}
+
+
+def test_google_music_adapter_clip_vs_full_model_and_fallback_honesty(test_db, sample_project):
+    """Verifies duration handling for lyria-3-clip-preview and honest 2.0s duration in offline fallback."""
+    adapter = GoogleMusicAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    mock_interaction = MagicMock()
+    mock_interaction.id = "interactions/lyria-clip-30s"
+    mock_interaction.output_audio.data = base64.b64encode(b"FAKE_LYRIA_MP3_CLIP").decode("utf-8")
+    mock_client.interactions.create.return_value = mock_interaction
+    adapter._client = mock_client
+
+    # Model lyria-3-clip-preview enforces 30 seconds
+    res = adapter.generate_music_score(
+        project_id=sample_project.id,
+        db=test_db,
+        mood="tense",
+        genre="synth",
+        duration_seconds=60, # Requesting 60s
+        model="lyria-3-clip-preview"
+    )
+    assert res["duration_seconds"] == 30.0
+    assert res["filename"].endswith(".mp3")
+
+    # Offline fallback honesty check
+    fallback_adapter = GoogleMusicAdapter(api_key="")
+    fb_res = fallback_adapter.generate_music_score(
+        project_id=sample_project.id,
+        db=test_db,
+        mood="ambient",
+        genre="drone",
+        duration_seconds=60
+    )
+    assert fb_res["is_fallback"] is True
+    # Never fake 60 seconds for a 2-second silent reference header
+    assert fb_res["duration_seconds"] == 2.0
+
+
+def test_cost_controller_reservation_and_compensation(test_db, sample_project):
+    """Verifies pre-flight budget reservation and compensation refund via CostController."""
+    from backend.app.services.cost_controller import CostController
+
+    initial_spent = sample_project.budget_spent
+
+    # 1. Pre-flight reservation
+    res_rec = CostController.reserve_budget(
+        db=test_db,
+        project_id=sample_project.id,
+        estimated_cost=0.15,
+        operation="video_generation",
+        details="Pre-flight Omni Flash reservation"
+    )
+    assert res_rec is not None
+    assert res_rec.action_type == "budget_reservation"
+    assert res_rec.actual_cost_known is False
+
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - initial_spent, 2) == 0.15
+
+    # 2. Release reservation upon operation failure
+    refund_rec = CostController.release_reservation(
+        db=test_db,
+        project_id=sample_project.id,
+        reservation_record=res_rec,
+        reason="remote_provider_timeout"
+    )
+    assert refund_rec is not None
+    assert refund_rec.action_type == "refund"
+    assert refund_rec.cost_usd == -0.15
+
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent, 2) == round(initial_spent, 2)
+
+
+def test_async_jobs_tts_and_music_endpoints(client, sample_project):
+    """Verifies /api/jobs/generation/tts and /api/jobs/generation/music asynchronous endpoints."""
+    # 1. Submit TTS job
+    res_tts = client.post(
+        "/api/jobs/generation/tts",
+        json={
+            "project_id": sample_project.id,
+            "text": "Initiating override sequence.",
+            "voice_name": "Puck",
+            "character_name": "OPERATOR"
+        }
+    )
+    assert res_tts.status_code == 200
+    tts_job = res_tts.json()
+    assert tts_job["generation_type"] == "tts_generation"
+    assert tts_job["status"] in ("pending", "processing", "completed")
+
+    # 2. Submit Music job
+    res_music = client.post(
+        "/api/jobs/generation/music",
+        json={
+            "project_id": sample_project.id,
+            "mood": "dramatic",
+            "genre": "orchestral",
+            "duration_seconds": 30
+        }
+    )
+    assert res_music.status_code == 200
+    music_job = res_music.json()
+    assert music_job["generation_type"] == "music_generation"
+    assert music_job["status"] in ("pending", "processing", "completed")
+
+
+def test_dynamic_ai_config_runtime_updates(client):
+    """Verifies runtime AI config update affects adapters immediately and masks secrets."""
+    res = client.post(
+        "/api/system/ai-config",
+        json={
+            "gemini_api_key": "AIzaSyNEWKEYFORTESTING1234567890",
+            "google_video_model": "gemini-omni-1.1-flash-custom",
+            "google_tts_model": "gemini-3.8-flash-lite-tts",
+            "google_music_model": "lyria-3-clip-preview",
+            "google_image_model": "gemini-3-pro-image"
+        }
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "success"
+    assert data["masked_key"] == "AIza...7890"
+
+    # Verify adapters reflect runtime updates without server restart
+    assert google_video_adapter.model == "gemini-omni-1.1-flash-custom"
+    assert google_tts_adapter.model == "gemini-3.8-flash-lite-tts"
+    assert google_music_adapter.model == "lyria-3-clip-preview"
+    assert google_image_adapter.model == "gemini-3-pro-image"
+    assert google_video_adapter.api_key == "AIzaSyNEWKEYFORTESTING1234567890"

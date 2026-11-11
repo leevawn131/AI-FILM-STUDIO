@@ -194,18 +194,20 @@ FADE TO BLACK.
 from backend.app.services.job_manager import job_manager
 from backend.app.services.upload_manager import upload_manager
 from backend.app.services.export_manager import export_manager
+from backend.app.services.generation_job_manager import generation_job_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize database tables via migrations and scaffold folders
     init_db()
     
-    # Reconcile any interrupted background jobs, staged uploads, and export jobs from prior runs
+    # Reconcile any interrupted background jobs, staged uploads, export jobs, and generation jobs from prior runs
     db = SessionLocal()
     try:
         recovered = job_manager.reconcile_interrupted_jobs(db)
         upload_stats = upload_manager.recover_staged_uploads(db)
         export_recovered = export_manager.recover_interrupted_jobs(db)
+        gen_recovered = generation_job_manager.recover_interrupted_jobs(db)
     finally:
         db.close()
 

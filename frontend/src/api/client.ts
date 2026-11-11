@@ -1108,6 +1108,80 @@ export async function cancelGenerationJob(jobId: string): Promise<any> {
   return parseApiResponse(res, 'Failed to cancel generation job');
 }
 
+export async function fetchGenerationJobDetail(jobId: string): Promise<GenerationJob> {
+  const res = await fetch(`${API_BASE}/jobs/generation/detail/${jobId}`);
+  return parseApiResponse<GenerationJob>(res, 'Failed to fetch generation job details');
+}
+
+export async function submitTTSGenerationJob(payload: {
+  project_id: string;
+  text: string;
+  voice_name?: string;
+  character_name?: string;
+  character_id?: string;
+  emotion?: string;
+  speaking_pace?: number;
+  language_code?: string;
+  scene_id?: string;
+  shot_id?: string;
+  track_type?: string;
+  model?: string;
+}): Promise<GenerationJob> {
+  const res = await fetch(`${API_BASE}/jobs/generation/tts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiResponse<GenerationJob>(res, 'Failed to submit TTS generation job');
+}
+
+export async function submitMusicGenerationJob(payload: {
+  project_id: string;
+  mood?: string;
+  genre?: string;
+  bpm?: number;
+  instruments?: string[];
+  energy?: string;
+  duration_seconds?: number;
+  instrumental?: boolean;
+  scene_id?: string;
+  prompt?: string;
+  model?: string;
+}): Promise<GenerationJob> {
+  const res = await fetch(`${API_BASE}/jobs/generation/music`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiResponse<GenerationJob>(res, 'Failed to submit music generation job');
+}
+
+export async function pollGenerationJob(
+  jobId: string,
+  onProgress?: (job: GenerationJob) => void,
+  intervalMs = 1500,
+  maxWaitMs = 120000
+): Promise<GenerationJob> {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const job = await fetchGenerationJobDetail(jobId);
+    if (onProgress) {
+      onProgress(job);
+    }
+    if (job.status === 'completed') {
+      return job;
+    }
+    if (job.status === 'failed') {
+      throw new Error(job.error_details || 'Generation job failed');
+    }
+    if (job.status === 'cancelled') {
+      throw new Error('Generation job was cancelled');
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error('Generation job timed out while waiting for completion');
+}
+
 export async function retryGenerationJob(jobId: string): Promise<GenerationJob> {
   const res = await fetch(`${API_BASE}/jobs/generation/${jobId}/retry`, {
     method: 'POST',

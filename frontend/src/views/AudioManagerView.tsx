@@ -6,6 +6,10 @@ import {
   uploadAudio,
   generateGoogleTTSDialogue,
   generateGoogleLyriaMusic,
+  submitTTSGenerationJob,
+  submitMusicGenerationJob,
+  pollGenerationJob,
+  GenerationJob,
   fetchTTSVoices,
   updateAudioTrack,
   deleteAudioTrack,
@@ -25,7 +29,8 @@ import {
   Radio,
   Disc,
   Headphones,
-  SlidersHorizontal
+  SlidersHorizontal,
+  Loader2
 } from 'lucide-react';
 
 interface AudioManagerViewProps {
@@ -50,6 +55,7 @@ export const AudioManagerView: React.FC<AudioManagerViewProps> = ({
   const [generatingBgm, setGeneratingBgm] = useState(false);
   const [generatingVo, setGeneratingVo] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [jobStatusText, setJobStatusText] = useState<string>('');
 
   // Audio playback state
   const [playingTrackId, setPlayingTrackId] = useState<string | null>(null);
@@ -149,14 +155,20 @@ export const AudioManagerView: React.FC<AudioManagerViewProps> = ({
     e.preventDefault();
     if (!activeProject) return;
     setGeneratingBgm(true);
+    setJobStatusText('Submitting Lyria 3.5 score generation job...');
     try {
-      await generateGoogleLyriaMusic(activeProject.id, {
+      const job = await submitMusicGenerationJob({
+        project_id: activeProject.id,
         prompt: bgmTitle,
         mood: bgmMood,
         genre: bgmGenre,
         bpm: bgmBpm,
         duration_seconds: bgmDuration,
         instrumental: true
+      });
+      setJobStatusText(`Job started (${job.status}). Composing music via Google Lyria...`);
+      await pollGenerationJob(job.id, (inFlight) => {
+        setJobStatusText(`Score composition: ${inFlight.status}...`);
       });
       setShowBgmModal(false);
       await loadTracks();
@@ -165,6 +177,7 @@ export const AudioManagerView: React.FC<AudioManagerViewProps> = ({
       alert('Lyria score generation error: ' + (err.message || err));
     } finally {
       setGeneratingBgm(false);
+      setJobStatusText('');
     }
   };
 
@@ -172,14 +185,20 @@ export const AudioManagerView: React.FC<AudioManagerViewProps> = ({
     e.preventDefault();
     if (!activeProject || !voText.trim()) return;
     setGeneratingVo(true);
+    setJobStatusText('Submitting Gemini TTS dialogue job...');
     try {
-      await generateGoogleTTSDialogue(activeProject.id, {
+      const job = await submitTTSGenerationJob({
+        project_id: activeProject.id,
         character_name: voChar,
         text: voText,
         voice_name: voVoice,
         emotion: voEmotion,
         speaking_pace: voPace,
         track_type: 'dialogue'
+      });
+      setJobStatusText(`Job started (${job.status}). Synthesizing voice via Gemini TTS...`);
+      await pollGenerationJob(job.id, (inFlight) => {
+        setJobStatusText(`Voice synthesis: ${inFlight.status}...`);
       });
       setShowVoModal(false);
       await loadTracks();
@@ -188,6 +207,7 @@ export const AudioManagerView: React.FC<AudioManagerViewProps> = ({
       alert('Gemini TTS generation error: ' + (err.message || err));
     } finally {
       setGeneratingVo(false);
+      setJobStatusText('');
     }
   };
 
@@ -348,9 +368,10 @@ export const AudioManagerView: React.FC<AudioManagerViewProps> = ({
                 <button
                   type="submit"
                   disabled={generatingBgm}
-                  className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-1.5 rounded text-xs font-bold transition-all shadow"
+                  className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-1.5 rounded text-xs font-bold transition-all shadow flex items-center space-x-1.5"
                 >
-                  {generatingBgm ? 'Synthesizing...' : 'Generate with Lyria (~$0.05)'}
+                  {generatingBgm && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{generatingBgm ? (jobStatusText || 'Composing with Lyria...') : 'Generate with Lyria (~$0.05)'}</span>
                 </button>
               </div>
             </form>
@@ -450,9 +471,10 @@ export const AudioManagerView: React.FC<AudioManagerViewProps> = ({
                 <button
                   type="submit"
                   disabled={generatingVo}
-                  className="bg-cyan-600 hover:bg-cyan-500 text-white px-4 py-1.5 rounded text-xs font-bold transition-all shadow"
+                  className="bg-cyan-600 hover:bg-cyan-500 text-white px-4 py-1.5 rounded text-xs font-bold transition-all shadow flex items-center space-x-1.5"
                 >
-                  {generatingVo ? 'Generating...' : 'Generate with Gemini TTS (~$0.01)'}
+                  {generatingVo && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{generatingVo ? (jobStatusText || 'Synthesizing voice...') : 'Generate with Gemini TTS (~$0.01)'}</span>
                 </button>
               </div>
             </form>

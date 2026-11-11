@@ -35,19 +35,49 @@ class GoogleImageAdapterError(Exception):
 
 class GoogleImageAdapter:
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
-        self.api_key = api_key or settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-        self.model = model or settings.google_image_model
+        self._api_key = api_key
+        self._model = model
         self._client = None
-        if self.api_key:
+        self._cached_api_key = None
+
+    @property
+    def api_key(self) -> str:
+        return self._api_key or settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+
+    @property
+    def model(self) -> str:
+        return self._model or settings.google_image_model
+
+    @property
+    def client(self):
+        if self._client is not None and getattr(self, "_injected_client", False):
+            return self._client
+        curr_key = self.api_key
+        if not curr_key:
+            return None
+        if self._client is not None and self._cached_api_key is None:
+            self._cached_api_key = curr_key
+            return self._client
+        if self._client is None or self._cached_api_key != curr_key:
             try:
                 from google import genai
-                self._client = genai.Client(api_key=self.api_key)
+                self._client = genai.Client(api_key=curr_key)
+                self._cached_api_key = curr_key
+                self._injected_client = False
             except Exception as e:
                 logger.warning(f"Could not initialize google-genai client for Nano Banana: {e}")
+                self._client = None
+        return self._client
+
+    @client.setter
+    def client(self, value):
+        self._client = value
+        self._cached_api_key = self.api_key
+        self._injected_client = True
 
     @property
     def is_available(self) -> bool:
-        return bool(self._client and self.api_key)
+        return bool(self.client and self.api_key)
 
     def _resolve_model(self, model: Optional[str] = None, tier: str = "default") -> Tuple[str, float]:
         """Resolves target Nano Banana model and corresponding estimated cost."""
@@ -74,6 +104,7 @@ class GoogleImageAdapter:
         project_id: str,
         db: Session,
         aspect_ratio: str = "16:9", # "1:1", "3:4", "4:3", "9:16", "16:9"
+        image_size: str = "1K",     # "512", "1K", "2K", "4K"
         entity_type: Optional[str] = None, # "character", "location", "storyboard"
         entity_id: Optional[str] = None,
         negative_prompt: Optional[str] = None,
@@ -83,6 +114,7 @@ class GoogleImageAdapter:
         """
         Generates an image via official Google Nano Banana 2 API,
         saves the output locally in the project assets folder,
+        inspects true image dimensions via Pillow,
         and registers a local MediaAsset record in SQLite.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
@@ -108,76 +140,133 @@ class GoogleImageAdapter:
                 db=db
             )
 
-        from google.genai import types
-
-        # Normalize aspect ratio for Nano Banana
+        # Normalize aspect ratio and image size for Nano Banana
         valid_ratios = ["1:1", "3:4", "4:3", "9:16", "16:9"]
         clean_ratio = aspect_ratio if aspect_ratio in valid_ratios else "16:9"
-
-        config_kwargs: Dict[str, Any] = {
-            "number_of_images": 1,
-            "output_mime_type": "image/jpeg",
-            "aspect_ratio": clean_ratio,
-            "person_generation": "allow_adult",
-        }
-        if negative_prompt:
-            config_kwargs["negative_prompt"] = negative_prompt
-
-        config = types.GenerateImagesConfig(**config_kwargs)
+        valid_sizes = ["512", "1K", "2K", "4K"]
+        clean_size = image_size if image_size in valid_sizes else "1K"
 
         img_bytes = None
+        provider_op_id = None
+
+        # 1. Try official Interactions API first
         try:
-            logger.info(f"Submitting image generation to Google Nano Banana 2 ({target_model})...")
-            # Try official generate_images first
-            response = self._client.models.generate_images(
+            logger.info(f"Submitting image generation to Google Nano Banana ({target_model}) via Interactions API...")
+            response_format = {
+                "type": "image",
+                "aspect_ratio": clean_ratio,
+                "image_size": clean_size
+            }
+            interaction = self.client.interactions.create(
                 model=target_model,
-                prompt=prompt,
-                config=config
+                input=prompt,
+                response_format=response_format
             )
-            if hasattr(response, "generated_images") and response.generated_images:
-                img_obj = response.generated_images[0]
-                if hasattr(img_obj, "image") and hasattr(img_obj.image, "image_bytes"):
-                    img_bytes = img_obj.image.image_bytes
-                elif hasattr(img_obj, "image_bytes"):
-                    img_bytes = img_obj.image_bytes
-        except Exception as e:
-            # If generate_images is unsupported or model requires generate_content
-            logger.info(f"generate_images attempt ({e}); trying generate_content multimodal route...")
+            provider_op_id = getattr(interaction, "id", None)
+            output_image = getattr(interaction, "output_image", None)
+            if output_image:
+                raw_data = getattr(output_image, "data", None)
+                if raw_data:
+                    if isinstance(raw_data, str):
+                        try:
+                            img_bytes = base64.b64decode(raw_data)
+                        except Exception:
+                            img_bytes = raw_data.encode("utf-8")
+                    else:
+                        img_bytes = raw_data
+                elif getattr(output_image, "uri", None):
+                    import urllib.request
+                    img_bytes = urllib.request.urlopen(output_image.uri).read()
+        except Exception as e_inter:
+            logger.info(f"Interactions API route ({e_inter}); attempting models.generate_images fallback...")
+
+        # 2. Try generate_images fallback if needed
+        if not img_bytes:
+            from google.genai import types
+            config_kwargs: Dict[str, Any] = {
+                "number_of_images": 1,
+                "output_mime_type": "image/jpeg",
+                "aspect_ratio": clean_ratio,
+                "person_generation": "allow_adult",
+            }
+            if negative_prompt:
+                config_kwargs["negative_prompt"] = negative_prompt
+
+            config = types.GenerateImagesConfig(**config_kwargs)
             try:
-                gc_config = types.GenerateContentConfig(
-                    response_modalities=["IMAGE"]
-                )
-                gc_resp = self._client.models.generate_content(
+                response = self.client.models.generate_images(
                     model=target_model,
-                    contents=prompt,
-                    config=gc_config
+                    prompt=prompt,
+                    config=config
                 )
-                if hasattr(gc_resp, "candidates") and gc_resp.candidates:
-                    parts = gc_resp.candidates[0].content.parts
-                    for part in parts:
-                        inline = getattr(part, "inline_data", None)
-                        if inline and hasattr(inline, "data"):
-                            raw_data = inline.data
-                            if isinstance(raw_data, str):
-                                img_bytes = base64.b64decode(raw_data)
-                            else:
-                                img_bytes = raw_data
-                            break
-            except Exception as e2:
-                err_msg = f"Nano Banana generation failed: {e}; multimodal route failed: {e2}"
-                logger.error(err_msg)
-                raise GoogleImageAdapterError(err_msg)
+                if hasattr(response, "generated_images") and response.generated_images:
+                    img_obj = response.generated_images[0]
+                    if hasattr(img_obj, "image") and hasattr(img_obj.image, "image_bytes"):
+                        img_bytes = img_obj.image.image_bytes
+                    elif hasattr(img_obj, "image_bytes"):
+                        img_bytes = img_obj.image_bytes
+            except Exception as e:
+                # 3. Try generate_content multimodal route
+                logger.info(f"generate_images attempt ({e}); trying generate_content multimodal route...")
+                try:
+                    gc_config = types.GenerateContentConfig(
+                        response_modalities=["IMAGE"]
+                    )
+                    gc_resp = self.client.models.generate_content(
+                        model=target_model,
+                        contents=prompt,
+                        config=gc_config
+                    )
+                    if hasattr(gc_resp, "candidates") and gc_resp.candidates:
+                        parts = gc_resp.candidates[0].content.parts
+                        for part in parts:
+                            inline = getattr(part, "inline_data", None)
+                            if inline and hasattr(inline, "data"):
+                                raw_data = inline.data
+                                if isinstance(raw_data, str):
+                                    img_bytes = base64.b64decode(raw_data)
+                                else:
+                                    img_bytes = raw_data
+                                break
+                except Exception as e2:
+                    err_msg = f"Nano Banana generation failed: {e}; multimodal route failed: {e2}"
+                    logger.error(err_msg)
+                    raise GoogleImageAdapterError(err_msg)
 
         if not img_bytes:
             raise GoogleImageAdapterError(f"Google Nano Banana ({target_model}) returned no image bytes in response.")
 
+        # Inspect real dimensions and image format using Pillow
+        import io
+        from PIL import Image
+
+        real_width = 1920 if clean_ratio == "16:9" else (1080 if clean_ratio == "1:1" else 1280)
+        real_height = 1080 if clean_ratio == "16:9" else (1080 if clean_ratio == "1:1" else 720)
+        ext = ".jpg"
+        mime_type = "image/jpeg"
+        try:
+            with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                real_width, real_height = pil_img.size
+                fmt = (pil_img.format or "").lower()
+                if fmt == "png":
+                    ext = ".png"
+                    mime_type = "image/png"
+                elif fmt == "webp":
+                    ext = ".webp"
+                    mime_type = "image/webp"
+                else:
+                    ext = ".jpg"
+                    mime_type = "image/jpeg"
+        except Exception as img_err:
+            logger.warning(f"Could not inspect generated image with Pillow: {img_err}")
+
         # Save to local project directory
         asset_id = str(uuid.uuid4())
-        filename = f"{entity_type or 'concept'}_{entity_id or asset_id[:8]}_{asset_id[:6]}.jpg"
+        filename = f"{entity_type or 'concept'}_{entity_id or asset_id[:8]}_{asset_id[:6]}{ext}"
         file_path = dest_dir / filename
         file_path.write_bytes(img_bytes)
 
-        # Register local MediaAsset in SQLite
+        # Register local MediaAsset in SQLite with true dimensions
         media_asset = MediaAsset(
             id=asset_id,
             project_id=project_id,
@@ -186,8 +275,8 @@ class GoogleImageAdapter:
             media_type="image",
             status="ready",
             file_size_bytes=len(img_bytes),
-            width=1920 if clean_ratio == "16:9" else (1080 if clean_ratio == "1:1" else 1280),
-            height=1080 if clean_ratio == "16:9" else (1080 if clean_ratio == "1:1" else 720)
+            width=real_width,
+            height=real_height
         )
         db.add(media_asset)
 
@@ -205,7 +294,7 @@ class GoogleImageAdapter:
             if shot:
                 shot.thumbnail_path = str(file_path)
 
-        # Record accounting entry
+        # Record accounting entry (estimated, not verified invoice)
         cost_controller.authorize_and_charge(
             db=db,
             project_id=project_id,
@@ -213,10 +302,10 @@ class GoogleImageAdapter:
             provider="google_nano_banana",
             model=target_model,
             operation="image_generation",
-            details=f"Google Nano Banana 2 generation for {entity_type or 'concept'} ({entity_id or 'general'})",
+            details=f"Google Nano Banana generation for {entity_type or 'concept'} ({entity_id or 'general'})",
             estimated_cost=est_cost,
-            actual_cost=est_cost,
-            actual_cost_known=True,
+            actual_cost=None,
+            actual_cost_known=False,
             allow_duplicate=True
         )
         db.commit()
@@ -229,8 +318,14 @@ class GoogleImageAdapter:
             "file_path": str(file_path),
             "filename": filename,
             "file_size_bytes": len(img_bytes),
+            "width": real_width,
+            "height": real_height,
+            "mime_type": mime_type,
             "is_fallback": False,
-            "aspect_ratio": clean_ratio
+            "aspect_ratio": clean_ratio,
+            "image_size": clean_size,
+            "provider_operation_id": provider_op_id,
+            "interaction_id": provider_op_id
         }
 
     def _generate_fallback_reference(

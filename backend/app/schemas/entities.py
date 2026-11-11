@@ -355,6 +355,35 @@ class GenerateVideoRequest(BaseModel):
     negative_prompt: Optional[str] = None
 
 
+class GenerateTTSRequest(BaseModel):
+    project_id: str
+    text: str
+    voice_name: Optional[str] = "Puck"
+    character_name: Optional[str] = "Character"
+    character_id: Optional[str] = None
+    emotion: Optional[str] = "neutral"
+    speaking_pace: Optional[float] = 1.0
+    language_code: Optional[str] = "en-US"
+    scene_id: Optional[str] = None
+    shot_id: Optional[str] = None
+    track_type: Optional[str] = "dialogue"
+    model: Optional[str] = None
+
+
+class GenerateMusicRequest(BaseModel):
+    project_id: str
+    mood: Optional[str] = "atmospheric"
+    genre: Optional[str] = "cinematic synthwave"
+    bpm: Optional[int] = 110
+    instruments: Optional[List[str]] = None
+    energy: Optional[str] = "medium"
+    duration_seconds: Optional[int] = 30
+    instrumental: Optional[bool] = True
+    scene_id: Optional[str] = None
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+
+
 class UploadOperationResponse(BaseModel):
     id: str
     project_id: Optional[str] = None
