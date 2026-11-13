@@ -486,6 +486,41 @@ class CostController:
                 return refund_record
 
     @staticmethod
+    def get_active_job_reservation(
+        db: Session,
+        job_id: str,
+        project_id: Optional[str] = None
+    ) -> Optional[CostRecord]:
+        """
+        Finds the active (unrefunded) reservation or in-flight/unknown reservation
+        associated with a GenerationJob so retries and recovery never double-reserve.
+        """
+        if not job_id:
+            return None
+        query = db.query(CostRecord).filter(
+            CostRecord.action_type != "refund",
+            CostRecord.details.like(f"%job:{job_id}%")
+        )
+        if project_id:
+            query = query.filter(CostRecord.project_id == project_id)
+        candidates = query.order_by(CostRecord.created_at.desc(), CostRecord.id.desc()).all()
+        marker = f"job:{job_id}"
+        for rec in candidates:
+            details_str = rec.details or ""
+            idx = details_str.find(marker)
+            if idx == -1:
+                continue
+            after_idx = idx + len(marker)
+            if after_idx < len(details_str) and not details_str[after_idx].isspace():
+                continue
+            refund = db.query(CostRecord).filter(
+                CostRecord.operation_identity == f"refund_{rec.id}"
+            ).first()
+            if not refund:
+                return rec
+        return None
+
+    @staticmethod
     def reserve_budget(
         db: Session,
         project_id: str,
@@ -500,8 +535,19 @@ class CostController:
     ) -> CostRecord:
         """
         Reserves estimated cost against project/scene budget prior to initiating an external cloud AI call.
+        When `job_id` is provided, reservation creation is idempotent for active/unrefunded attempts
+        so crash recovery or polling timeout retries cannot create duplicate reservations.
         """
-        full_details = f"{details} job:{job_id}" if job_id else details
+        full_details = details
+        if job_id and f"job:{job_id}" not in (details or ""):
+            full_details = f"{details} job:{job_id}"
+
+        idempotency_payload = (
+            {"reservation_job_id": str(job_id), "operation": operation}
+            if job_id
+            else None
+        )
+
         return CostController.authorize_and_charge(
             db=db,
             project_id=project_id,
@@ -511,11 +557,12 @@ class CostController:
             provider=provider,
             model=model,
             operation=operation,
+            payload=idempotency_payload,
             details=full_details,
             estimated_cost=estimated_cost,
             actual_cost=None,
             actual_cost_known=False,
-            allow_duplicate=True
+            allow_duplicate=(job_id is None)
         )
 
     @staticmethod
@@ -529,56 +576,142 @@ class CostController:
         error_details: Optional[str] = None
     ) -> CostRecord:
         """
-        Finalizes an outstanding budget reservation when provider generation has succeeded.
-        - If actual_cost is known and differs from estimated_cost, adjusts Project.budget_spent.
-        - If actual_cost is not provided, maintains the reserved estimated cost as spent budget.
-        - Sets action_type to the operational action (e.g. video_generation).
-        - If local media processing failed, explicitly preserves the incurred provider expense,
-          recording the provider outcome and local processing failure separately so that
-          incurred cloud AI expenses are NEVER silently erased due to local downstream errors.
+        Idempotently finalizes an outstanding budget reservation when provider outcome is known or timed out.
+        - When `local_processing_status` is 'provider_outcome_unknown' / 'outcome_unknown', transitions the
+          record to 'provider_outcome_unknown' and keeps the reserved charge intact (never refunded on timeout).
+        - When `local_processing_status` is 'completed' or 'failed' (provider succeeded, local work failed),
+          idempotently transitions to operational `action_type` and adjusts Project.budget_spent ONLY ONCE if
+          actual_cost differs from what has already been charged.
+        - Never double-charges if called repeatedly, and never re-charges an already-refunded record.
         """
-        with _budget_lock:
-            project = db.query(Project).filter(Project.id == project_id).first()
-            if actual_cost_known and actual_cost is not None:
-                diff = actual_cost - (reservation_record.estimated_cost or 0.0)
-                if diff != 0.0 and project:
-                    project.budget_spent = max(0.0, (project.budget_spent or 0.0) + diff)
-                reservation_record.actual_cost = actual_cost
-                reservation_record.actual_cost_known = True
+        if reservation_record is None:
+            raise ValueError("reservation_record is required for finalize_reservation")
 
-            op_name = reservation_record.operation or "video_generation"
-            reservation_record.action_type = op_name
+        bind = db.get_bind()
+        is_pg = bind.dialect.name == "postgresql" if bind else False
+
+        with _budget_lock:
+            q = db.query(CostRecord).filter(CostRecord.id == reservation_record.id)
+            if is_pg:
+                q = q.with_for_update()
+            rec = q.first() or reservation_record
+
+            # Never finalize a reservation that has already been refunded
+            existing_refund = db.query(CostRecord).filter(
+                CostRecord.operation_identity == f"refund_{rec.id}"
+            ).first()
+            if existing_refund:
+                logger.warning(f"Skipping finalize_reservation for already-refunded record {rec.id}")
+                return rec
+
+            op_name = rec.operation or "video_generation"
+            existing_job_tags = [
+                tok.lstrip("(").rstrip(".,;:)")
+                for tok in (rec.details or "").split()
+                if tok.lstrip("(").startswith("job:")
+            ]
+            job_suffix = f" {' '.join(existing_job_tags)}" if existing_job_tags else ""
+
+            # Ambiguous / polling timeout state: preserve reserved budget without refunding
+            if local_processing_status in ("provider_outcome_unknown", "outcome_unknown"):
+                if rec.action_type == op_name:
+                    return rec
+                rec.action_type = "provider_outcome_unknown"
+                rec.details = (
+                    f"Provider outcome unknown ({rec.provider} {rec.model} {op_name}); "
+                    f"reservation preserved: {error_details or 'timeout / interrupted response'}"
+                    f"{job_suffix}"
+                )
+                db.flush()
+                return rec
+
+            # Idempotency guard: if already finalized with op_name and no new actual cost reconciliation needed
+            if rec.action_type == op_name and (not actual_cost_known or rec.actual_cost_known):
+                return rec
+
+            if actual_cost_known and actual_cost is not None and not rec.actual_cost_known:
+                new_cost = max(0.0, float(actual_cost))
+                already_charged = float(rec.cost_usd or 0.0)
+                diff = new_cost - already_charged
+                if abs(diff) > 1e-12:
+                    stmt = (
+                        update(Project)
+                        .where(Project.id == project_id)
+                        .values(
+                            budget_spent=case(
+                                (Project.budget_spent + diff < 0.0, 0.0),
+                                else_=Project.budget_spent + diff
+                            )
+                        )
+                    )
+                    db.execute(stmt)
+                rec.actual_cost = new_cost
+                rec.actual_cost_known = True
+                rec.cost_usd = new_cost
+
+            rec.action_type = op_name
 
             if local_processing_status == "failed":
-                reservation_record.details = (
-                    f"Provider generation succeeded ({reservation_record.provider} {reservation_record.model}); "
+                rec.details = (
+                    f"Provider generation succeeded ({rec.provider} {rec.model}); "
                     f"local media processing failed: {error_details or 'Unknown error'}"
+                    f"{job_suffix}"
                 )
             else:
-                reservation_record.details = (
-                    f"Completed {reservation_record.provider} {reservation_record.model} {op_name}"
+                rec.details = (
+                    f"Completed {rec.provider} {rec.model} {op_name}{job_suffix}"
                 )
             db.flush()
-            return reservation_record
+            return rec
 
     @staticmethod
     def release_reservation(
         db: Session,
         project_id: str,
         reservation_record: CostRecord,
-        reason: str = "operation_failed_or_cancelled"
+        reason: str = "operation_failed_or_cancelled",
+        allow_unknown_release: bool = False
     ) -> Optional[CostRecord]:
         """
-        Releases reserved budget if the operation failed at the provider or was cancelled prior to generation.
-        Decreases Project.budget_spent by the reserved amount and records a compensation entry.
-        Never call this if provider generation has completed.
+        Idempotently releases reserved budget ONLY if the operation is confirmed failed/cancelled
+        at the provider or failed pre-flight before provider generation.
+        Never refunds already-finalized charges (e.g. local processing failures),
+        and never refunds 'provider_outcome_unknown' reservations unless explicitly
+        confirmed non-billable remotely (`allow_unknown_release=True`).
         """
-        return CostController.record_compensation(
-            db=db,
-            project_id=project_id,
-            original_record=reservation_record,
-            reason=reason
-        )
+        if not reservation_record:
+            return None
+
+        with _budget_lock:
+            rec = db.query(CostRecord).filter(CostRecord.id == reservation_record.id).first() or reservation_record
+
+            # If already refunded, return existing refund idempotently via record_compensation
+            existing_refund = db.query(CostRecord).filter(
+                CostRecord.operation_identity == f"refund_{rec.id}"
+            ).first()
+            if existing_refund:
+                return existing_refund
+
+            if rec.action_type == "provider_outcome_unknown" and not allow_unknown_release:
+                logger.warning(
+                    f"Refusing to release reservation {rec.id} with provider_outcome_unknown "
+                    f"(reason='{reason}')"
+                )
+                return None
+
+            if rec.action_type not in ("budget_reservation", "provider_outcome_unknown"):
+                logger.warning(
+                    f"Refusing to release already-finalized reservation {rec.id} "
+                    f"(action_type={rec.action_type}, reason='{reason}')"
+                )
+                return None
+
+            return CostController.record_compensation(
+                db=db,
+                project_id=project_id,
+                original_record=rec,
+                reason=reason
+            )
 
     @staticmethod
     def recover_orphaned_job_reservation(

@@ -19,7 +19,9 @@ Capabilities:
 """
 
 import os
+import time
 import uuid
+import socket
 import base64
 import logging
 from pathlib import Path
@@ -42,6 +44,18 @@ class GoogleVideoAdapterError(Exception):
 class LocalMediaProcessingError(GoogleVideoAdapterError):
     """Raised when provider video generation succeeded, but local media processing/muxing failed."""
     pass
+
+
+def is_ambiguous_provider_error(err: Exception) -> bool:
+    """Returns True when a provider call error leaves remote creation/execution outcome ambiguous."""
+    if isinstance(err, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    msg = str(err).lower()
+    rejection_markers = ("400", "401", "403", "404", "422", "429", "invalid_argument", "permission_denied", "unauthenticated", "api key")
+    if any(m in msg for m in rejection_markers):
+        return False
+    ambiguous_markers = ("timeout", "timed out", "504", "gateway", "connection reset", "broken pipe", "remote end closed", "incomplete read")
+    return any(m in msg for m in ambiguous_markers)
 
 
 class GoogleVideoAdapter:
@@ -90,6 +104,22 @@ class GoogleVideoAdapter:
     def is_available(self) -> bool:
         return bool(self.client and self.api_key)
 
+    def _download_uri_bytes(self, uri: str) -> bytes:
+        """Downloads video/audio output bytes preferring authenticated Google Files API download."""
+        if self.client and hasattr(self.client, "files") and hasattr(self.client.files, "download"):
+            try:
+                downloaded = self.client.files.download(file=uri)
+                if isinstance(downloaded, (bytes, bytearray)):
+                    return bytes(downloaded)
+            except Exception as dl_err:
+                logger.warning(f"Google Files API download failed for '{uri}': {dl_err}")
+                if not str(uri).startswith(("http://", "https://")):
+                    raise LocalMediaProcessingError(
+                        f"Google Files API download failed for '{uri}': {dl_err}"
+                    ) from dl_err
+        import urllib.request
+        return urllib.request.urlopen(uri).read()
+
     def submit_video_generation(
         self,
         prompt: str,
@@ -109,8 +139,9 @@ class GoogleVideoAdapter:
         Uses documented tasks: text_to_video, image_to_video, reference_to_video, edit, extend.
         Uses documented aspect ratios: 16:9, 9:16.
         Uses documented resolutions: 720p, 1080p.
-        For video input, prefers the official Google Files API upload workflow, waits for active state, and passes URI.
-        Returns initial job information including provider interaction ID.
+        For video input, uploads via Google Files API and requires state to reach ACTIVE before submission.
+        Target duration is kept separate as `target_duration_seconds` and natural-language guidance;
+        actual duration is measured after download via FFprobe.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
@@ -157,10 +188,10 @@ class GoogleVideoAdapter:
             "resolution": clean_resolution
         }
 
-        # Format input prompt (and references if applicable)
-        full_text = prompt
+        # Format input prompt with natural-language target duration guidance
+        full_text = f"{prompt.strip()}\n[Target duration: approximately {clean_duration}s]"
         if negative_prompt:
-            full_text = f"{prompt}\n[Avoid: {negative_prompt}]"
+            full_text = f"{full_text}\n[Avoid: {negative_prompt}]"
 
         # Build multimodal input parts if reference files are attached
         input_payload: Any = full_text
@@ -175,44 +206,56 @@ class GoogleVideoAdapter:
                 ]
         elif input_video_path:
             vid_p = Path(input_video_path)
-            if vid_p.exists():
-                file_uri = None
-                # Prefer official Google Files API upload workflow for video input
-                if hasattr(self.client, "files") and hasattr(self.client.files, "upload"):
-                    try:
-                        logger.info(f"Uploading input video '{input_video_path}' via Google Files API...")
-                        uploaded_file = self.client.files.upload(file=str(vid_p))
-                        # Wait for the file to become ACTIVE
-                        import time
-                        for _ in range(30):
-                            state = getattr(uploaded_file, "state", None)
-                            state_name = getattr(state, "name", str(state)).upper()
-                            if "PROCESSING" in state_name:
-                                time.sleep(1)
-                                if hasattr(self.client.files, "get") and getattr(uploaded_file, "name", None):
-                                    uploaded_file = self.client.files.get(name=uploaded_file.name)
-                            elif "FAILED" in state_name or "ERROR" in state_name:
-                                raise GoogleVideoAdapterError(f"Files API video processing failed: {state_name}")
-                            else:
-                                break
-                        file_uri = getattr(uploaded_file, "uri", None)
-                    except GoogleVideoAdapterError:
-                        raise
-                    except Exception as e_files:
-                        logger.warning(f"Google Files API upload encountered issue: {e_files}; falling back to base64 attachment.")
-                        file_uri = None
+            if not vid_p.exists():
+                raise GoogleVideoAdapterError(f"Input video file not found: '{input_video_path}'")
 
-                if file_uri:
-                    input_payload = [
-                        {"type": "text", "text": full_text},
-                        {"type": "video", "uri": file_uri, "mime_type": "video/mp4"}
-                    ]
-                else:
-                    vid_data = base64.b64encode(vid_p.read_bytes()).decode("utf-8")
-                    input_payload = [
-                        {"type": "text", "text": full_text},
-                        {"type": "video", "data": vid_data, "mime_type": "video/mp4"}
-                    ]
+            if hasattr(self.client, "files") and hasattr(self.client.files, "upload"):
+                logger.info(f"Uploading input video '{input_video_path}' via Google Files API...")
+                try:
+                    uploaded_file = self.client.files.upload(file=str(vid_p))
+                except Exception as upload_err:
+                    raise GoogleVideoAdapterError(f"Files API upload failed: {upload_err}") from upload_err
+
+                max_upload_polls = 30
+                is_active = False
+                for poll_idx in range(max_upload_polls):
+                    state = getattr(uploaded_file, "state", None)
+                    state_name = str(getattr(state, "name", getattr(state, "value", state))).upper()
+                    if "ACTIVE" in state_name:
+                        is_active = True
+                        break
+                    if "FAILED" in state_name or "ERROR" in state_name:
+                        raise GoogleVideoAdapterError(f"Files API video processing failed: {state_name}")
+                    if "PROCESSING" in state_name or "STATE_UNSPECIFIED" in state_name:
+                        if poll_idx < max_upload_polls - 1:
+                            time.sleep(1)
+                            if hasattr(self.client.files, "get") and getattr(uploaded_file, "name", None):
+                                uploaded_file = self.client.files.get(name=uploaded_file.name)
+                    else:
+                        raise GoogleVideoAdapterError(
+                            f"Unexpected Files API file state '{state_name}' for '{input_video_path}'"
+                        )
+
+                if not is_active:
+                    raise GoogleVideoAdapterError(
+                        f"Google Files API upload for '{input_video_path}' remained in PROCESSING state "
+                        f"after {max_upload_polls} polls; aborting video generation request."
+                    )
+
+                file_uri = getattr(uploaded_file, "uri", None)
+                if not file_uri or not isinstance(file_uri, str):
+                    raise GoogleVideoAdapterError("Google Files API upload became ACTIVE but returned no file URI.")
+
+                input_payload = [
+                    {"type": "text", "text": full_text},
+                    {"type": "video", "uri": file_uri, "mime_type": "video/mp4"}
+                ]
+            else:
+                vid_data = base64.b64encode(vid_p.read_bytes()).decode("utf-8")
+                input_payload = [
+                    {"type": "text", "text": full_text},
+                    {"type": "video", "data": vid_data, "mime_type": "video/mp4"}
+                ]
 
         try:
             logger.info(
@@ -230,7 +273,7 @@ class GoogleVideoAdapter:
         except Exception as e:
             err_msg = str(e)
             logger.error(f"Gemini Omni Flash generation submission failed: {err_msg}")
-            raise GoogleVideoAdapterError(f"Gemini Omni Flash submission failed: {err_msg}")
+            raise GoogleVideoAdapterError(f"Gemini Omni Flash submission failed: {err_msg}") from e
 
         provider_op_id = getattr(interaction, "id", None) or str(uuid.uuid4())
         logger.info(f"Gemini Omni Flash interaction created successfully: id={provider_op_id}")
@@ -243,7 +286,6 @@ class GoogleVideoAdapter:
             "prompt": prompt,
             "task": resolved_task,
             "target_duration_seconds": clean_duration,
-            "duration_seconds": clean_duration,
             "aspect_ratio": clean_ratio,
             "supports_cancellation": True
         }
@@ -363,12 +405,11 @@ class GoogleVideoAdapter:
         raise_on_processing_error: bool = False
     ) -> MediaAsset:
         """
-        Saves the generated video to the local project media directory,
-        multiplexes native audio output via FFmpeg if present,
-        inspects true stream dimensions/duration with FFprobe,
-        creates a MediaAsset record with take versioning,
-        finalizes the budget reservation (or charges cost),
-        and links it to the Shot as the active take.
+        Saves the generated video to the local project media directory (preferring authenticated
+        Google Files API download for URI outputs), multiplexes native audio output via FFmpeg
+        if present, strictly inspects stream dimensions/duration/fps/codec with FFprobe (never
+        inventing metadata on failure), creates a MediaAsset record with take versioning,
+        finalizes the budget reservation (or charges cost), and links it to the Shot.
         """
         if db is None:
             raise ValueError("Database session is required.")
@@ -377,6 +418,9 @@ class GoogleVideoAdapter:
         shot = db.query(Shot).filter(Shot.id == shot_id, Shot.project_id == project_id).first()
         if not project or not shot:
             raise ValueError("Project or Shot not found.")
+
+        if not video_bytes and not video_uri:
+            raise ValueError("Neither video_bytes nor video_uri was provided.")
 
         # Determine next take version for this shot
         existing_versions = db.query(MediaAsset).filter(
@@ -391,107 +435,156 @@ class GoogleVideoAdapter:
         clean_code = shot.shot_code.replace(" ", "_")
         filename = f"{clean_code}_v{next_ver:03d}_{asset_id[:6]}.mp4"
         file_path = dest_dir / filename
+        temp_audio_path = dest_dir / f"{clean_code}_v{next_ver:03d}_{asset_id[:6]}_temp_audio.wav"
+        muxed_path = dest_dir / f"{clean_code}_v{next_ver:03d}_{asset_id[:6]}_muxed.mp4"
 
-        if video_bytes:
-            file_path.write_bytes(video_bytes)
-        elif video_uri:
-            # Download from URI
-            import urllib.request
-            urllib.request.urlretrieve(video_uri, str(file_path))
-        else:
-            raise ValueError("Neither video_bytes nor video_uri was provided.")
+        def _record_local_failure_if_reserved(err_msg: str) -> None:
+            if reservation_record is not None:
+                cost_controller.finalize_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    actual_cost=None,
+                    actual_cost_known=False,
+                    local_processing_status="failed",
+                    error_details=err_msg,
+                )
+                db.commit()
 
-        # Multiplex native audio output if returned by Gemini Omni Flash
-        raw_audio = audio_bytes
-        if not raw_audio and audio_uri:
-            try:
-                import urllib.request
-                raw_audio = urllib.request.urlopen(audio_uri).read()
-            except Exception as e:
-                logger.warning(f"Could not download Omni Flash native audio from {audio_uri}: {e}")
-
-        if raw_audio:
-            try:
-                temp_audio_path = dest_dir / f"{clean_code}_v{next_ver:03d}_{asset_id[:6]}_temp_audio.wav"
-                temp_audio_path.write_bytes(raw_audio)
-                muxed_path = dest_dir / f"{clean_code}_v{next_ver:03d}_{asset_id[:6]}_muxed.mp4"
-                ffmpeg_service.mux_video_and_audio(file_path, temp_audio_path, muxed_path)
-                # Replace file_path with muxed output
-                muxed_path.replace(file_path)
-                try:
-                    if temp_audio_path.exists():
-                        temp_audio_path.unlink()
-                except Exception:
-                    pass
-                logger.info(f"Successfully multiplexed Omni Flash native audio into {filename}")
-            except Exception as mux_err:
-                logger.warning(f"FFmpeg audio muxing failed: {mux_err}")
-                if raise_on_processing_error:
-                    raise LocalMediaProcessingError(f"Local FFmpeg audio muxing failed: {mux_err}") from mux_err
-
-        # Probe video metadata using local FFprobe / ffmpeg service
         try:
-            meta = ffmpeg_service.inspect_media(file_path)
-        except Exception:
-            meta = {}
+            if video_bytes:
+                file_path.write_bytes(video_bytes)
+            else:
+                downloaded_video = self._download_uri_bytes(video_uri)
+                if not downloaded_video:
+                    raise LocalMediaProcessingError(f"Downloaded video from '{video_uri}' is empty.")
+                file_path.write_bytes(downloaded_video)
 
-        # Register local MediaAsset
-        media_asset = MediaAsset(
-            id=asset_id,
-            project_id=project_id,
-            shot_id=shot_id,
-            version=next_ver,
-            status="ready",
-            filename=filename,
-            file_path=str(file_path),
-            media_type="video",
-            width=meta.get("width") or 1920,
-            height=meta.get("height") or 1080,
-            duration_seconds=float(meta.get("duration") or shot.duration_seconds or 4.0),
-            fps=float(meta.get("fps") or 24.0),
-            codec=meta.get("codec") or meta.get("video_codec", "h264"),
-            file_size_bytes=file_path.stat().st_size
-        )
-        db.add(media_asset)
-        db.flush()
+            # Multiplex native audio output if returned by Gemini Omni Flash
+            raw_audio = audio_bytes
+            if not raw_audio and audio_uri:
+                try:
+                    raw_audio = self._download_uri_bytes(audio_uri)
+                except Exception as audio_dl_err:
+                    logger.warning(f"Could not download Omni Flash native audio from {audio_uri}: {audio_dl_err}")
+                    if raise_on_processing_error:
+                        raise LocalMediaProcessingError(
+                            f"Failed downloading Omni Flash native audio '{audio_uri}': {audio_dl_err}"
+                        ) from audio_dl_err
 
-        # Update Shot take selection
-        shot.video_asset_id = media_asset.id
-        shot.video_path = str(file_path)
-        shot.generation_status = "ready"
-        shot.generation_attempts = (shot.generation_attempts or 0) + 1
+            if raw_audio:
+                try:
+                    temp_audio_path.write_bytes(raw_audio)
+                    ffmpeg_service.mux_video_and_audio(file_path, temp_audio_path, muxed_path)
+                    muxed_path.replace(file_path)
+                    logger.info(f"Successfully multiplexed Omni Flash native audio into {filename}")
+                except Exception as mux_err:
+                    logger.warning(f"FFmpeg audio muxing failed: {mux_err}")
+                    if raise_on_processing_error:
+                        raise LocalMediaProcessingError(f"Local FFmpeg audio muxing failed: {mux_err}") from mux_err
+                finally:
+                    for p in (temp_audio_path, muxed_path):
+                        if p.exists():
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
 
-        # Record or finalize Cloud AI cost in CostController
-        # Estimated cost for Omni Flash video generation (~$0.15); actual cost is not known a priori
-        if reservation_record is not None:
-            cost_controller.finalize_reservation(
-                db=db,
-                project_id=project_id,
-                reservation_record=reservation_record,
-                actual_cost=None,
-                actual_cost_known=False,
-                local_processing_status="completed"
-            )
-        else:
-            cost_controller.authorize_and_charge(
-                db=db,
+            # Strictly probe video metadata using local FFprobe (never invent metadata on failure)
+            try:
+                meta = ffmpeg_service.inspect_media(file_path)
+            except Exception as probe_err:
+                raise LocalMediaProcessingError(
+                    f"FFprobe could not inspect video file '{filename}': {probe_err}"
+                ) from probe_err
+
+            width = meta.get("width")
+            height = meta.get("height")
+            duration = meta.get("duration")
+            fps = meta.get("fps")
+            codec = meta.get("codec") or meta.get("video_codec")
+            if (
+                not width or int(width) <= 0
+                or not height or int(height) <= 0
+                or duration is None or float(duration) <= 0.0
+                or not fps or float(fps) <= 0.0
+                or not codec or codec == "unknown"
+            ):
+                raise LocalMediaProcessingError(
+                    f"FFprobe returned incomplete or invalid video stream metadata for '{filename}': {meta}"
+                )
+
+            media_asset = MediaAsset(
+                id=asset_id,
                 project_id=project_id,
                 shot_id=shot_id,
-                action_type="video_generation",
-                provider="google_omni",
-                model=self.model,
-                operation="video_generation",
-                details=f"Gemini Omni Flash 1.1 video generation take {next_ver} for shot {shot.shot_code}",
-                estimated_cost=0.15,
-                actual_cost=None,
-                actual_cost_known=False,
-                allow_duplicate=True
+                version=next_ver,
+                status="ready",
+                filename=filename,
+                file_path=str(file_path),
+                media_type="video",
+                width=int(width),
+                height=int(height),
+                duration_seconds=float(duration),
+                fps=float(fps),
+                codec=str(codec),
+                file_size_bytes=file_path.stat().st_size
             )
-        db.commit()
-        db.refresh(media_asset)
-        return media_asset
-        db.refresh(media_asset)
-        return media_asset
+            db.add(media_asset)
+            db.flush()
+
+            shot.video_asset_id = media_asset.id
+            shot.video_path = str(file_path)
+            shot.generation_status = "ready"
+            shot.generation_attempts = (shot.generation_attempts or 0) + 1
+
+            if reservation_record is not None:
+                cost_controller.finalize_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    actual_cost=None,
+                    actual_cost_known=False,
+                    local_processing_status="completed"
+                )
+            else:
+                cost_controller.authorize_and_charge(
+                    db=db,
+                    project_id=project_id,
+                    shot_id=shot_id,
+                    action_type="video_generation",
+                    provider="google_omni",
+                    model=self.model,
+                    operation="video_generation",
+                    details=f"Gemini Omni Flash 1.1 video generation take {next_ver} for shot {shot.shot_code}",
+                    estimated_cost=0.15,
+                    actual_cost=None,
+                    actual_cost_known=False,
+                    allow_duplicate=True
+                )
+            db.commit()
+            db.refresh(media_asset)
+            return media_asset
+        except LocalMediaProcessingError as local_err:
+            db.rollback()
+            for p in (file_path, temp_audio_path, muxed_path):
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+            _record_local_failure_if_reserved(str(local_err))
+            raise
+        except Exception as err:
+            db.rollback()
+            for p in (file_path, temp_audio_path, muxed_path):
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+            _record_local_failure_if_reserved(str(err))
+            raise LocalMediaProcessingError(f"Local video import processing failed: {err}") from err
 
 
 google_video_adapter = GoogleVideoAdapter()

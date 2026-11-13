@@ -360,6 +360,8 @@ def generate_dialogue_speech(project_id: str, req: GenerateTTSDialogueRequest, d
             "created_at": track.created_at,
             "url": f"/media/{track.file_path}"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
 
@@ -403,5 +405,7 @@ def generate_music_score(project_id: str, req: GenerateLyriaMusicRequest, db: Se
             "created_at": track.created_at,
             "url": f"/media/{track.file_path}"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Music generation failed: {str(e)}")

@@ -21,6 +21,7 @@ Capabilities:
 
 import os
 import uuid
+import socket
 import base64
 import logging
 from pathlib import Path
@@ -46,6 +47,29 @@ SUPPORTED_VOICES = {
 class GoogleTTSAdapterError(Exception):
     """Raised when Google Gemini TTS audio generation fails."""
     pass
+
+
+def _is_ambiguous_provider_error(err: Exception) -> bool:
+    """Returns True when an error leaves remote provider execution outcome ambiguous (e.g. network timeout)."""
+    if isinstance(err, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    msg = str(err).lower()
+    # Explicit HTTP client rejections or auth/validation errors are non-billable confirmed failures
+    rejection_markers = ("400", "401", "403", "404", "422", "429", "invalid_argument", "permission_denied", "unauthenticated", "api key")
+    if any(m in msg for m in rejection_markers):
+        return False
+    ambiguous_markers = ("timeout", "timed out", "504", "gateway", "connection reset", "broken pipe", "remote end closed", "incomplete read")
+    return any(m in msg for m in ambiguous_markers)
+
+
+def _get_interaction_status(interaction: Any) -> Optional[str]:
+    raw_status = getattr(interaction, "status", None)
+    if isinstance(raw_status, str):
+        return raw_status.lower()
+    val = getattr(raw_status, "value", None)
+    if isinstance(val, str):
+        return val.lower()
+    return None
 
 
 class GoogleTTSAdapter:
@@ -99,6 +123,45 @@ class GoogleTTSAdapter:
         """Returns the dictionary of documented Google Gemini TTS voices."""
         return SUPPORTED_VOICES
 
+    def _download_uri_bytes(self, uri: str) -> bytes:
+        """Downloads audio bytes from an authenticated Files API URI or HTTP URL."""
+        if self.client and hasattr(self.client, "files") and hasattr(self.client.files, "download"):
+            try:
+                downloaded = self.client.files.download(file=uri)
+                if isinstance(downloaded, (bytes, bytearray)):
+                    return bytes(downloaded)
+            except Exception as dl_err:
+                logger.warning(f"Files API download for '{uri}' encountered issue: {dl_err}")
+        import urllib.request
+        return urllib.request.urlopen(uri).read()
+
+    def _extract_interaction_audio_bytes(self, interaction: Any) -> Tuple[Optional[bytes], Optional[str]]:
+        """Extracts audio bytes or remote URI from an Interaction response."""
+        output_audio = getattr(interaction, "output_audio", None)
+        if output_audio:
+            raw_data = getattr(output_audio, "data", None)
+            if raw_data:
+                if isinstance(raw_data, str):
+                    try:
+                        return base64.b64decode(raw_data), None
+                    except Exception:
+                        return raw_data.encode("utf-8"), None
+                return raw_data, None
+            uri = getattr(output_audio, "uri", None)
+            if uri:
+                return None, uri
+
+        if hasattr(interaction, "candidates") and interaction.candidates:
+            candidate = interaction.candidates[0]
+            if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
+                for part in candidate.content.parts:
+                    inline = getattr(part, "inline_data", None)
+                    if inline and hasattr(inline, "data"):
+                        raw_inline = inline.data
+                        audio_bytes = base64.b64decode(raw_inline) if isinstance(raw_inline, str) else raw_inline
+                        return audio_bytes, None
+        return None, None
+
     def generate_dialogue_speech(
         self,
         text: str,
@@ -113,11 +176,14 @@ class GoogleTTSAdapter:
         scene_id: Optional[str] = None,
         shot_id: Optional[str] = None,
         track_type: str = "dialogue", # "dialogue" or "voiceover"
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        reservation_record: Optional[Any] = None,
+        job_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Generates expressive character speech from dialogue text using Gemini TTS via Interactions API.
-        Saves the audio locally, registers an AudioTrack and MediaAsset in SQLite.
+        Follows reserve -> call provider -> finalize/release contract, saves audio locally,
+        inspects with FFprobe, and registers AudioTrack and MediaAsset in SQLite.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
@@ -154,12 +220,6 @@ class GoogleTTSAdapter:
             style_parts.append(f"in {language_code}")
         style_desc = ", ".join(style_parts) if style_parts else "natural dialogue cadence"
 
-        # Documented single-speaker request structure:
-        # - input: list containing a user_input item
-        # - content: list containing a text item
-        # - annotations: list containing speech_metadata
-        # - response_format: {"type": "audio"}
-        # - generation_config.speech_config: list of voice configurations, e.g. [{"voice": "Puck"}]
         input_payload = [
             {
                 "type": "user_input",
@@ -189,8 +249,27 @@ class GoogleTTSAdapter:
             "type": "audio"
         }
 
+        # Pre-flight budget reservation BEFORE external Google API call
+        est_cost = 0.005 if "lite" in target_model.lower() else 0.01
+        if reservation_record is None:
+            reservation_record = cost_controller.reserve_budget(
+                db=db,
+                project_id=project_id,
+                estimated_cost=est_cost,
+                operation="tts_generation",
+                scene_id=scene_id,
+                shot_id=shot_id,
+                provider="google_tts",
+                model=target_model,
+                job_id=job_id,
+                details=f"Pre-flight Gemini TTS reservation for {speaker_label} ({chosen_voice})"
+            )
+            db.commit()
+
         audio_bytes = None
+        audio_uri = None
         provider_op_id = None
+        interaction = None
         try:
             logger.info(
                 f"Generating Gemini TTS audio for {speaker_label} ({chosen_voice}, {emotion}) "
@@ -203,110 +282,144 @@ class GoogleTTSAdapter:
                 response_format=response_format
             )
             provider_op_id = getattr(interaction, "id", None)
-
-            # Extract output audio from Interaction response
-            output_audio = getattr(interaction, "output_audio", None)
-            if output_audio:
-                raw_data = getattr(output_audio, "data", None)
-                if raw_data:
-                    if isinstance(raw_data, str):
-                        try:
-                            audio_bytes = base64.b64decode(raw_data)
-                        except Exception:
-                            audio_bytes = raw_data.encode("utf-8")
-                    else:
-                        audio_bytes = raw_data
-                elif getattr(output_audio, "uri", None):
-                    import urllib.request
-                    audio_bytes = urllib.request.urlopen(output_audio.uri).read()
-
-            # Fallback extraction from candidates if SDK wraps response differently
-            if not audio_bytes and hasattr(interaction, "candidates") and interaction.candidates:
-                candidate = interaction.candidates[0]
-                if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
-                    for part in candidate.content.parts:
-                        inline = getattr(part, "inline_data", None)
-                        if inline and hasattr(inline, "data"):
-                            raw_inline = inline.data
-                            audio_bytes = base64.b64decode(raw_inline) if isinstance(raw_inline, str) else raw_inline
-                            break
         except Exception as e:
             err_msg = str(e)
             logger.error(f"Gemini TTS generation call failed: {err_msg}")
-            raise GoogleTTSAdapterError(f"Google Gemini TTS generation failed: {err_msg}")
+            if _is_ambiguous_provider_error(e):
+                cost_controller.finalize_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    local_processing_status="provider_outcome_unknown",
+                    error_details=err_msg,
+                )
+            else:
+                cost_controller.release_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    reason=f"tts_provider_error: {err_msg}",
+                )
+            db.commit()
+            raise GoogleTTSAdapterError(f"Google Gemini TTS generation failed: {err_msg}") from e
 
-        if not audio_bytes:
+        status_str = _get_interaction_status(interaction)
+        if status_str in ("failed", "error", "cancelled", "canceled"):
+            cost_controller.release_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                reason=f"tts_provider_{status_str}",
+            )
+            db.commit()
+            raise GoogleTTSAdapterError(
+                f"Google Gemini TTS interaction '{provider_op_id}' finished with status '{status_str}'."
+            )
+        if status_str in ("processing", "queued", "pending", "in_progress", "requires_continuation"):
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                local_processing_status="provider_outcome_unknown",
+                error_details=f"TTS interaction '{provider_op_id}' returned non-completed status '{status_str}'",
+            )
+            db.commit()
+            raise GoogleTTSAdapterError(
+                f"Gemini TTS interaction '{provider_op_id}' returned non-completed status '{status_str}'."
+            )
+
+        audio_bytes, audio_uri = self._extract_interaction_audio_bytes(interaction)
+        if not audio_bytes and not audio_uri:
+            cost_controller.release_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                reason="tts_empty_response",
+            )
+            db.commit()
             raise GoogleTTSAdapterError(
                 f"Gemini TTS model '{target_model}' returned no audio candidates for dialogue."
             )
 
-        # Save audio file to project directory
+        # Provider outcome SUCCEEDED; perform local download, FFprobe inspection & DB persistence
         asset_id = str(uuid.uuid4())
         safe_speaker = "".join(c for c in speaker_label.lower().replace(" ", "_") if c.isalnum() or c == "_")
         filename = f"tts_{safe_speaker}_{asset_id[:8]}.wav"
         file_path = dest_dir / filename
-        file_path.write_bytes(audio_bytes)
-
-        # Inspect duration via FFmpeg / FFprobe
         try:
+            if not audio_bytes and audio_uri:
+                audio_bytes = self._download_uri_bytes(audio_uri)
+            if not audio_bytes:
+                raise GoogleTTSAdapterError("Downloaded TTS audio stream is empty.")
+
+            file_path.write_bytes(audio_bytes)
             meta = ffmpeg_service.inspect_media(file_path)
-            duration = float(meta.get("duration", max(1.0, len(text.split()) / 2.5)))
-        except Exception:
-            duration = max(1.0, len(text.split()) / 2.5)
+            if not meta.get("has_audio"):
+                raise GoogleTTSAdapterError(f"FFprobe validated file '{filename}' contains no audio stream.")
+            probed_dur = float(meta.get("duration") or 0.0)
+            duration = probed_dur if probed_dur > 0.0 else max(1.0, len(text.split()) / 2.5)
 
-        rel_path = f"projects/{project_id}/audio/{filename}"
+            rel_path = f"projects/{project_id}/audio/{filename}"
+            track_title = f"{speaker_label}: \"{text[:35]}...\"" if len(text) > 35 else f"{speaker_label}: \"{text}\""
+            audio_track = AudioTrack(
+                project_id=project_id,
+                track_type=track_type,
+                title=track_title,
+                file_path=rel_path,
+                duration_seconds=duration,
+                start_time_seconds=0.0,
+                volume_level=1.1,
+                ducking_enabled=False,
+                ducking_level=0.3,
+                scene_id=scene_id,
+                shot_id=shot_id
+            )
+            db.add(audio_track)
 
-        # Register AudioTrack in database
-        track_title = f"{speaker_label}: \"{text[:35]}...\"" if len(text) > 35 else f"{speaker_label}: \"{text}\""
-        audio_track = AudioTrack(
-            project_id=project_id,
-            track_type=track_type,
-            title=track_title,
-            file_path=rel_path,
-            duration_seconds=duration,
-            start_time_seconds=0.0,
-            volume_level=1.1,
-            ducking_enabled=False,
-            ducking_level=0.3,
-            scene_id=scene_id,
-            shot_id=shot_id
-        )
-        db.add(audio_track)
+            media_asset = MediaAsset(
+                id=asset_id,
+                project_id=project_id,
+                shot_id=shot_id,
+                version=1,
+                status="ready",
+                filename=filename,
+                file_path=str(file_path),
+                media_type="audio",
+                duration_seconds=duration,
+                file_size_bytes=len(audio_bytes)
+            )
+            db.add(media_asset)
 
-        # Register MediaAsset in database
-        media_asset = MediaAsset(
-            id=asset_id,
-            project_id=project_id,
-            shot_id=shot_id,
-            version=1,
-            status="ready",
-            filename=filename,
-            file_path=str(file_path),
-            media_type="audio",
-            duration_seconds=duration,
-            file_size_bytes=len(audio_bytes)
-        )
-        db.add(media_asset)
-
-        # Charge cost via CostController (~$0.01 per dialogue turn; estimated, not verified fact)
-        est_cost = 0.005 if "lite" in target_model.lower() else 0.01
-        cost_controller.authorize_and_charge(
-            db=db,
-            project_id=project_id,
-            scene_id=scene_id,
-            shot_id=shot_id,
-            action_type="tts_generation",
-            provider="google_tts",
-            model=target_model,
-            operation="tts_generation",
-            details=f"Gemini TTS voiceover for {speaker_label} ({chosen_voice})",
-            estimated_cost=est_cost,
-            actual_cost=None,
-            actual_cost_known=False,
-            allow_duplicate=True
-        )
-        db.commit()
-        db.refresh(audio_track)
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="completed",
+            )
+            db.commit()
+            db.refresh(audio_track)
+        except Exception as local_err:
+            db.rollback()
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="failed",
+                error_details=str(local_err),
+            )
+            db.commit()
+            if isinstance(local_err, GoogleTTSAdapterError):
+                raise
+            raise GoogleTTSAdapterError(f"Local TTS audio processing failed: {local_err}") from local_err
 
         return {
             "status": "completed",
@@ -321,6 +434,7 @@ class GoogleTTSAdapter:
             "character_name": speaker_label,
             "provider_operation_id": provider_op_id,
             "interaction_id": provider_op_id,
+            "reservation_id": reservation_record.id if reservation_record else None,
             "is_fallback": False
         }
 
@@ -332,14 +446,19 @@ class GoogleTTSAdapter:
         scene_id: Optional[str] = None,
         shot_id: Optional[str] = None,
         model: Optional[str] = None,
-        split_turns: bool = False
+        split_turns: bool = False,
+        reservation_record: Optional[Any] = None,
+        job_id: Optional[str] = None
     ) -> Any:
         """
         Generates dialogue speech for multi-speaker screenplay scenes.
-        Uses documented multi-speaker configuration when generating dialogue with multiple characters:
-        - generation_config.speech_config: list of voice configs with speaker mappings: [{"voice": "Puck", "speaker": "REN"}, ...]
-        - input: list of user_input items for each character turn with speech_metadata annotations
-        - response_format: {"type": "audio"}
+        Uses Google's documented multi-speaker configuration:
+        - One `user_input` object containing multiple text `content` items in dialogue order,
+          each with a `speech_metadata` annotation (`speaker`, `style`).
+        - When 2 speakers: `generation_config.speech_config = {"speakers": [{"speaker": ..., "voice": ...}, ...]}`.
+        - When 1 speaker: falls back to documented single-speaker list `[{"voice": ...}]`.
+        - Enforces Gemini TTS multi-speaker limit of at most 2 speakers per request.
+        - `response_format = {"type": "audio"}`.
         """
         valid_turns = [t for t in dialogue_turns if t.get("text", "").strip()]
         if not valid_turns:
@@ -364,6 +483,26 @@ class GoogleTTSAdapter:
                 results.append(res)
             return results
 
+        # Collect unique speakers in dialogue appearance order and enforce max 2 speakers
+        seen_speakers: List[str] = []
+        speaker_configs: List[Dict[str, str]] = []
+        seen_set = set()
+        for turn in valid_turns:
+            spk = str(turn.get("speaker") or "Speaker").strip() or "Speaker"
+            vc = turn.get("voice", "Puck")
+            if spk not in seen_set:
+                seen_set.add(spk)
+                seen_speakers.append(spk)
+                chosen_v = vc if vc in SUPPORTED_VOICES else "Puck"
+                speaker_configs.append({"speaker": spk, "voice": chosen_v})
+
+        if len(speaker_configs) > 2:
+            raise ValueError(
+                f"Google Gemini multi-speaker TTS supports at most 2 speakers per request "
+                f"(got {len(speaker_configs)}: {', '.join(seen_speakers)}). "
+                f"Set split_turns=True to synthesize dialogue turns individually."
+            )
+
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
             raise ValueError(f"Project '{project_id}' not found.")
@@ -379,29 +518,18 @@ class GoogleTTSAdapter:
                 text=combined_text,
                 project=project,
                 dest_dir=dest_dir,
-                speaker_label="MultiSpeaker",
-                voice_name="Puck",
+                speaker_label="MultiSpeaker" if len(speaker_configs) > 1 else speaker_configs[0]["speaker"],
+                voice_name=speaker_configs[0]["voice"],
                 scene_id=scene_id,
                 shot_id=shot_id,
                 track_type="dialogue",
                 db=db
             )
 
-        # Documented multi-speaker speech_config
-        seen_speakers = set()
-        speech_config = []
+        # Build ONE user_input object with ordered text content items and speech_metadata annotations
+        content_items: List[Dict[str, Any]] = []
         for turn in valid_turns:
-            spk = turn.get("speaker", "Speaker")
-            vc = turn.get("voice", "Puck")
-            if spk not in seen_speakers:
-                seen_speakers.add(spk)
-                chosen_v = vc if vc in SUPPORTED_VOICES else "Puck"
-                speech_config.append({"voice": chosen_v, "speaker": spk})
-
-        # Documented multi-turn input structure with speech_metadata annotations
-        input_payload = []
-        for turn in valid_turns:
-            spk = turn.get("speaker", "Speaker")
+            spk = str(turn.get("speaker") or "Speaker").strip() or "Speaker"
             emo = turn.get("emotion", "neutral")
             pace = float(turn.get("pace", 1.0))
             style_parts = []
@@ -411,36 +539,69 @@ class GoogleTTSAdapter:
                 style_parts.append(f"pace {pace}x")
             style_desc = ", ".join(style_parts) if style_parts else "natural dialogue cadence"
 
-            input_payload.append({
-                "type": "user_input",
-                "content": [
+            content_items.append({
+                "type": "text",
+                "text": turn["text"],
+                "annotations": [
                     {
-                        "type": "text",
-                        "text": turn["text"],
-                        "annotations": [
-                            {
-                                "type": "speech_metadata",
-                                "speaker": spk,
-                                "style": style_desc,
-                            }
-                        ],
+                        "type": "speech_metadata",
+                        "speaker": spk,
+                        "style": style_desc,
                     }
                 ],
             })
 
-        generation_config = {
-            "speech_config": speech_config
-        }
+        input_payload = [
+            {
+                "type": "user_input",
+                "content": content_items,
+            }
+        ]
+
+        is_multi_speaker = len(speaker_configs) > 1
+        if is_multi_speaker:
+            generation_config: Dict[str, Any] = {
+                "speech_config": {
+                    "speakers": speaker_configs
+                }
+            }
+        else:
+            generation_config = {
+                "speech_config": [
+                    {"voice": speaker_configs[0]["voice"]}
+                ]
+            }
+
         response_format = {
             "type": "audio"
         }
 
+        # Pre-flight budget reservation BEFORE external Google API call
+        per_speaker = 0.005 if "lite" in target_model.lower() else 0.01
+        est_cost = per_speaker * len(speaker_configs)
+        if reservation_record is None:
+            reservation_record = cost_controller.reserve_budget(
+                db=db,
+                project_id=project_id,
+                estimated_cost=est_cost,
+                operation="tts_generation",
+                scene_id=scene_id,
+                shot_id=shot_id,
+                provider="google_tts",
+                model=target_model,
+                job_id=job_id,
+                details=f"Pre-flight Gemini TTS reservation ({', '.join(seen_speakers)})"
+            )
+            db.commit()
+
         audio_bytes = None
+        audio_uri = None
         provider_op_id = None
+        interaction = None
         try:
             logger.info(
-                f"Generating multi-speaker Gemini TTS dialogue ({len(speech_config)} speakers, "
-                f"{len(input_payload)} turns) using {target_model} via Interactions API..."
+                f"Generating Gemini TTS dialogue ({len(speaker_configs)} speaker(s), "
+                f"{len(content_items)} turns) using {target_model} via Interactions API..."
             )
             interaction = self.client.interactions.create(
                 model=target_model,
@@ -449,37 +610,61 @@ class GoogleTTSAdapter:
                 response_format=response_format
             )
             provider_op_id = getattr(interaction, "id", None)
-
-            output_audio = getattr(interaction, "output_audio", None)
-            if output_audio:
-                raw_data = getattr(output_audio, "data", None)
-                if raw_data:
-                    if isinstance(raw_data, str):
-                        try:
-                            audio_bytes = base64.b64decode(raw_data)
-                        except Exception:
-                            audio_bytes = raw_data.encode("utf-8")
-                    else:
-                        audio_bytes = raw_data
-                elif getattr(output_audio, "uri", None):
-                    import urllib.request
-                    audio_bytes = urllib.request.urlopen(output_audio.uri).read()
-
-            if not audio_bytes and hasattr(interaction, "candidates") and interaction.candidates:
-                candidate = interaction.candidates[0]
-                if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
-                    for part in candidate.content.parts:
-                        inline = getattr(part, "inline_data", None)
-                        if inline and hasattr(inline, "data"):
-                            raw_inline = inline.data
-                            audio_bytes = base64.b64decode(raw_inline) if isinstance(raw_inline, str) else raw_inline
-                            break
         except Exception as e:
             err_msg = str(e)
             logger.error(f"Gemini multi-speaker TTS call failed: {err_msg}")
-            raise GoogleTTSAdapterError(f"Google Gemini multi-speaker TTS failed: {err_msg}")
+            if _is_ambiguous_provider_error(e):
+                cost_controller.finalize_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    local_processing_status="provider_outcome_unknown",
+                    error_details=err_msg,
+                )
+            else:
+                cost_controller.release_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    reason=f"tts_provider_error: {err_msg}",
+                )
+            db.commit()
+            raise GoogleTTSAdapterError(f"Google Gemini multi-speaker TTS failed: {err_msg}") from e
 
-        if not audio_bytes:
+        status_str = _get_interaction_status(interaction)
+        if status_str in ("failed", "error", "cancelled", "canceled"):
+            cost_controller.release_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                reason=f"tts_provider_{status_str}",
+            )
+            db.commit()
+            raise GoogleTTSAdapterError(
+                f"Gemini TTS interaction '{provider_op_id}' finished with status '{status_str}'."
+            )
+        if status_str in ("processing", "queued", "pending", "in_progress", "requires_continuation"):
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                local_processing_status="provider_outcome_unknown",
+                error_details=f"Multi-speaker TTS '{provider_op_id}' returned non-completed status '{status_str}'",
+            )
+            db.commit()
+            raise GoogleTTSAdapterError(
+                f"Gemini TTS interaction '{provider_op_id}' returned non-completed status '{status_str}'."
+            )
+
+        audio_bytes, audio_uri = self._extract_interaction_audio_bytes(interaction)
+        if not audio_bytes and not audio_uri:
+            cost_controller.release_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                reason="tts_empty_response",
+            )
+            db.commit()
             raise GoogleTTSAdapterError(
                 f"Gemini TTS model '{target_model}' returned no audio candidates for multi-speaker dialogue."
             )
@@ -487,63 +672,80 @@ class GoogleTTSAdapter:
         asset_id = str(uuid.uuid4())
         filename = f"tts_multispeaker_{scene_id or 'dialogue'}_{asset_id[:8]}.wav"
         file_path = dest_dir / filename
-        file_path.write_bytes(audio_bytes)
-
         try:
+            if not audio_bytes and audio_uri:
+                audio_bytes = self._download_uri_bytes(audio_uri)
+            if not audio_bytes:
+                raise GoogleTTSAdapterError("Downloaded multi-speaker TTS audio stream is empty.")
+
+            file_path.write_bytes(audio_bytes)
             meta = ffmpeg_service.inspect_media(file_path)
-            duration = float(meta.get("duration", 4.0))
-        except Exception:
-            duration = 4.0
+            if not meta.get("has_audio"):
+                raise GoogleTTSAdapterError(f"FFprobe validated file '{filename}' contains no audio stream.")
+            probed_dur = float(meta.get("duration") or 0.0)
+            duration = probed_dur if probed_dur > 0.0 else 4.0
 
-        rel_path = f"projects/{project_id}/audio/{filename}"
-        track_title = f"Dialogue: {', '.join(list(seen_speakers)[:3])} Scene Exchange"
+            rel_path = f"projects/{project_id}/audio/{filename}"
+            track_title = f"Dialogue: {', '.join(seen_speakers[:3])} Scene Exchange"
 
-        audio_track = AudioTrack(
-            project_id=project_id,
-            track_type="dialogue",
-            title=track_title,
-            file_path=rel_path,
-            duration_seconds=duration,
-            start_time_seconds=0.0,
-            volume_level=1.1,
-            ducking_enabled=False,
-            scene_id=scene_id,
-            shot_id=shot_id
-        )
-        db.add(audio_track)
+            audio_track = AudioTrack(
+                project_id=project_id,
+                track_type="dialogue",
+                title=track_title,
+                file_path=rel_path,
+                duration_seconds=duration,
+                start_time_seconds=0.0,
+                volume_level=1.1,
+                ducking_enabled=False,
+                scene_id=scene_id,
+                shot_id=shot_id
+            )
+            db.add(audio_track)
 
-        media_asset = MediaAsset(
-            id=asset_id,
-            project_id=project_id,
-            shot_id=shot_id,
-            version=1,
-            status="ready",
-            filename=filename,
-            file_path=str(file_path),
-            media_type="audio",
-            duration_seconds=duration,
-            file_size_bytes=len(audio_bytes)
-        )
-        db.add(media_asset)
+            media_asset = MediaAsset(
+                id=asset_id,
+                project_id=project_id,
+                shot_id=shot_id,
+                version=1,
+                status="ready",
+                filename=filename,
+                file_path=str(file_path),
+                media_type="audio",
+                duration_seconds=duration,
+                file_size_bytes=len(audio_bytes)
+            )
+            db.add(media_asset)
 
-        est_cost = 0.01 * len(speech_config)
-        cost_controller.authorize_and_charge(
-            db=db,
-            project_id=project_id,
-            scene_id=scene_id,
-            shot_id=shot_id,
-            action_type="tts_generation",
-            provider="google_tts",
-            model=target_model,
-            operation="tts_generation",
-            details=f"Gemini multi-speaker dialogue ({', '.join(seen_speakers)})",
-            estimated_cost=est_cost,
-            actual_cost=None,
-            actual_cost_known=False,
-            allow_duplicate=True
-        )
-        db.commit()
-        db.refresh(audio_track)
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="completed",
+            )
+            db.commit()
+            db.refresh(audio_track)
+        except Exception as local_err:
+            db.rollback()
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="failed",
+                error_details=str(local_err),
+            )
+            db.commit()
+            if isinstance(local_err, GoogleTTSAdapterError):
+                raise
+            raise GoogleTTSAdapterError(f"Local multi-speaker TTS processing failed: {local_err}") from local_err
 
         return {
             "status": "completed",
@@ -554,10 +756,11 @@ class GoogleTTSAdapter:
             "file_path": str(file_path),
             "filename": filename,
             "duration_seconds": duration,
-            "speakers": list(seen_speakers),
-            "is_multi_speaker": True,
+            "speakers": seen_speakers,
+            "is_multi_speaker": is_multi_speaker,
             "provider_operation_id": provider_op_id,
             "interaction_id": provider_op_id,
+            "reservation_id": reservation_record.id if reservation_record else None,
             "is_fallback": False
         }
 

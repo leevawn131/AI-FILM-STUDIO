@@ -23,10 +23,11 @@ Capabilities:
 
 import os
 import uuid
+import socket
 import base64
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
@@ -40,6 +41,28 @@ logger = logging.getLogger("google_music_adapter")
 class GoogleMusicAdapterError(Exception):
     """Raised when Google Lyria music generation fails."""
     pass
+
+
+def _is_ambiguous_provider_error(err: Exception) -> bool:
+    """Returns True when an error leaves remote Lyria execution outcome ambiguous."""
+    if isinstance(err, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    msg = str(err).lower()
+    rejection_markers = ("400", "401", "403", "404", "422", "429", "invalid_argument", "permission_denied", "unauthenticated", "api key")
+    if any(m in msg for m in rejection_markers):
+        return False
+    ambiguous_markers = ("timeout", "timed out", "504", "gateway", "connection reset", "broken pipe", "remote end closed", "incomplete read")
+    return any(m in msg for m in ambiguous_markers)
+
+
+def _get_interaction_status(interaction: Any) -> Optional[str]:
+    raw_status = getattr(interaction, "status", None)
+    if isinstance(raw_status, str):
+        return raw_status.lower()
+    val = getattr(raw_status, "value", None)
+    if isinstance(val, str):
+        return val.lower()
+    return None
 
 
 class GoogleMusicAdapter:
@@ -88,6 +111,46 @@ class GoogleMusicAdapter:
     def is_available(self) -> bool:
         return bool(self.client and self.api_key)
 
+    def _download_uri_bytes(self, uri: str) -> bytes:
+        """Downloads audio bytes via authenticated Files API when available, falling back to HTTP."""
+        if self.client and hasattr(self.client, "files") and hasattr(self.client.files, "download"):
+            try:
+                downloaded = self.client.files.download(file=uri)
+                if isinstance(downloaded, (bytes, bytearray)):
+                    return bytes(downloaded)
+            except Exception as dl_err:
+                logger.warning(f"Files API download for '{uri}' encountered issue: {dl_err}")
+        import urllib.request
+        return urllib.request.urlopen(uri).read()
+
+    @staticmethod
+    def _extract_interaction_audio(interaction: Any) -> Tuple[Optional[bytes], Optional[str]]:
+        """Extracts audio bytes or URI from a Lyria Interaction response."""
+        output_audio = getattr(interaction, "output_audio", None)
+        if output_audio:
+            raw_data = getattr(output_audio, "data", None)
+            if raw_data:
+                if isinstance(raw_data, str):
+                    try:
+                        return base64.b64decode(raw_data), None
+                    except Exception:
+                        return raw_data.encode("utf-8"), None
+                return raw_data, None
+            uri = getattr(output_audio, "uri", None)
+            if uri:
+                return None, uri
+
+        if hasattr(interaction, "candidates") and interaction.candidates:
+            candidate = interaction.candidates[0]
+            if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
+                for part in candidate.content.parts:
+                    inline = getattr(part, "inline_data", None)
+                    if inline and hasattr(inline, "data"):
+                        raw_inline = inline.data
+                        audio_bytes = base64.b64decode(raw_inline) if isinstance(raw_inline, str) else raw_inline
+                        return audio_bytes, None
+        return None, None
+
     def generate_music_score(
         self,
         project_id: str,
@@ -102,11 +165,14 @@ class GoogleMusicAdapter:
         scene_id: Optional[str] = None,
         reference_image_path: Optional[str] = None,
         prompt: Optional[str] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        reservation_record: Optional[Any] = None,
+        job_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Generates an AI background music score using Google Lyria via Interactions API.
-        Saves the audio file locally as a real MP3, and registers it in SQLite.
+        Follows reserve -> single submit -> FFprobe validation -> finalize/release contract.
+        Never blindly submits a second paid interaction if the first call fails or is ambiguous.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
@@ -136,7 +202,7 @@ class GoogleMusicAdapter:
         # Do not use unsupported audio_config dictionary parameters.
         inst_list = ", ".join(instruments) if instruments else "analog synthesizers, cinematic sub-bass, orchestral strings"
         pref = "Instrumental only, no vocals." if instrumental else "Atmospheric vocal chops and pads."
-        
+
         if is_clip_model:
             # Lyria 3 Clip Preview is a fixed 30-second model; do not promise exact arbitrary duration
             duration_instruction = "30-second musical clip preview / scene cue."
@@ -160,13 +226,29 @@ class GoogleMusicAdapter:
 
         response_format = {"type": "audio", "mime_type": "audio/mp3"}
 
+        # Pre-flight budget reservation BEFORE external Google API call
+        est_cost = 0.05
+        if reservation_record is None:
+            reservation_record = cost_controller.reserve_budget(
+                db=db,
+                project_id=project_id,
+                estimated_cost=est_cost,
+                operation="music_generation",
+                scene_id=scene_id,
+                provider="google_lyria",
+                model=target_model,
+                job_id=job_id,
+                details=f"Pre-flight Lyria score reservation: {mood} ({genre})"
+            )
+            db.commit()
+
         interaction = None
         try:
             logger.info(
                 f"Submitting Lyria music generation ({target_model}) for project '{project.name}': "
                 f"mood='{mood}', genre='{genre}', bpm={bpm}..."
             )
-            # Submit to Interactions API
+            # Single submission only — never blindly retry with a second interactions.create()
             interaction = self.client.interactions.create(
                 model=target_model,
                 input=full_prompt,
@@ -174,128 +256,154 @@ class GoogleMusicAdapter:
                 response_format=response_format
             )
         except Exception as e:
-            # If background=False unsupported, try standard background=True and poll
-            try:
-                interaction = self.client.interactions.create(
-                    model=target_model,
-                    input=full_prompt,
-                    background=True,
-                    response_format=response_format
+            err_msg = str(e)
+            logger.error(f"Lyria music generation submission failed: {err_msg}")
+            if _is_ambiguous_provider_error(e):
+                cost_controller.finalize_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    local_processing_status="provider_outcome_unknown",
+                    error_details=err_msg,
                 )
-                import time
-                op_id = getattr(interaction, "id", None)
-                if op_id:
-                    for _ in range(30):
-                        time.sleep(2)
-                        interaction = self.client.interactions.get(id=op_id)
-                        status = str(getattr(interaction, "status", "")).lower()
-                        if status in ("completed", "failed", "cancelled"):
-                            break
-            except Exception as e2:
-                err_msg = f"Lyria music generation call failed: {e}; retry failed: {e2}"
-                logger.error(err_msg)
-                raise GoogleMusicAdapterError(err_msg)
+                db.commit()
+                raise GoogleMusicAdapterError(
+                    f"Lyria music generation encountered an ambiguous transport error "
+                    f"(not automatically retried to prevent duplicate billing): {err_msg}"
+                ) from e
+            else:
+                cost_controller.release_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    reason=f"lyria_request_rejected: {err_msg}",
+                )
+                db.commit()
+                raise GoogleMusicAdapterError(f"Lyria music generation rejected: {err_msg}") from e
 
-        provider_op_id = getattr(interaction, "id", None) or str(uuid.uuid4())
+        raw_id = getattr(interaction, "id", None)
+        provider_op_id = raw_id if isinstance(raw_id, str) and raw_id else None
 
-        # Extract output audio from Interaction response
-        output_audio = getattr(interaction, "output_audio", None)
-        audio_bytes = None
-        if output_audio:
-            raw_data = getattr(output_audio, "data", None)
-            if raw_data:
-                if isinstance(raw_data, str):
-                    try:
-                        audio_bytes = base64.b64decode(raw_data)
-                    except Exception:
-                        audio_bytes = raw_data.encode("utf-8")
-                else:
-                    audio_bytes = raw_data
-            elif getattr(output_audio, "uri", None):
-                import urllib.request
-                audio_bytes = urllib.request.urlopen(output_audio.uri).read()
+        status_str = _get_interaction_status(interaction)
+        if status_str in ("failed", "error", "cancelled", "canceled"):
+            cost_controller.release_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                reason=f"lyria_provider_{status_str}",
+            )
+            db.commit()
+            raise GoogleMusicAdapterError(
+                f"Lyria interaction '{provider_op_id or 'unknown'}' finished with status '{status_str}'."
+            )
+        if status_str in ("processing", "queued", "pending", "in_progress", "requires_continuation"):
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                local_processing_status="provider_outcome_unknown",
+                error_details=f"Lyria interaction '{provider_op_id}' returned non-completed status '{status_str}'",
+            )
+            db.commit()
+            raise GoogleMusicAdapterError(
+                f"Lyria interaction '{provider_op_id}' returned non-completed status '{status_str}' "
+                f"(outcome pending remotely; reservation preserved)."
+            )
 
-        # Fallback candidate inspection
-        if not audio_bytes and hasattr(interaction, "candidates") and interaction.candidates:
-            candidate = interaction.candidates[0]
-            if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
-                for part in candidate.content.parts:
-                    inline = getattr(part, "inline_data", None)
-                    if inline and hasattr(inline, "data"):
-                        raw_inline = inline.data
-                        audio_bytes = base64.b64decode(raw_inline) if isinstance(raw_inline, str) else raw_inline
-                        break
-
-        if not audio_bytes:
+        audio_bytes, audio_uri = self._extract_interaction_audio(interaction)
+        if not audio_bytes and not audio_uri:
+            cost_controller.release_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                reason="lyria_empty_response",
+            )
+            db.commit()
             raise GoogleMusicAdapterError(
                 f"Lyria model '{target_model}' returned no audio content in interaction response."
             )
 
-        # Save audio locally as real MP3 file
+        # Provider succeeded; download if needed, save locally, and validate MP3 strictly via FFprobe
         asset_id = str(uuid.uuid4())
         safe_mood = "".join(c for c in mood.lower().replace(" ", "_") if c.isalnum() or c == "_")
         filename = f"score_{safe_mood}_{asset_id[:8]}.mp3"
         file_path = dest_dir / filename
-        file_path.write_bytes(audio_bytes)
-
-        # Inspect duration and audio stream format via FFmpeg / FFprobe
         try:
+            if not audio_bytes and audio_uri:
+                audio_bytes = self._download_uri_bytes(audio_uri)
+            if not audio_bytes:
+                raise GoogleMusicAdapterError("Downloaded Lyria MP3 stream is empty.")
+
+            file_path.write_bytes(audio_bytes)
+
             meta = ffmpeg_service.inspect_media(file_path)
-            actual_duration = float(meta.get("duration") or effective_duration)
-            audio_codec = meta.get("audio_codec") or meta.get("codec") or "mp3"
-        except Exception:
-            actual_duration = float(effective_duration)
-            audio_codec = "mp3"
+            audio_codec = meta.get("audio_codec") or meta.get("codec")
+            actual_duration = float(meta.get("duration") or 0.0)
+            if not meta.get("has_audio") or not audio_codec or audio_codec == "unknown" or actual_duration <= 0.0:
+                raise GoogleMusicAdapterError(
+                    f"FFprobe validation failed on Lyria output '{filename}': invalid audio stream ({meta})"
+                )
 
-        rel_path = f"projects/{project_id}/audio/{filename}"
-        track_title = f"Score: {mood.capitalize()} ({genre.capitalize()})"
+            rel_path = f"projects/{project_id}/audio/{filename}"
+            track_title = f"Score: {mood.capitalize()} ({genre.capitalize()})"
 
-        # Register AudioTrack in SQLite
-        audio_track = AudioTrack(
-            project_id=project_id,
-            track_type="music",
-            title=track_title,
-            file_path=rel_path,
-            duration_seconds=actual_duration,
-            start_time_seconds=0.0,
-            volume_level=0.75,
-            ducking_enabled=True,
-            ducking_level=0.3,
-            scene_id=scene_id
-        )
-        db.add(audio_track)
+            audio_track = AudioTrack(
+                project_id=project_id,
+                track_type="music",
+                title=track_title,
+                file_path=rel_path,
+                duration_seconds=actual_duration,
+                start_time_seconds=0.0,
+                volume_level=0.75,
+                ducking_enabled=True,
+                ducking_level=0.3,
+                scene_id=scene_id
+            )
+            db.add(audio_track)
 
-        # Register MediaAsset in SQLite
-        media_asset = MediaAsset(
-            id=asset_id,
-            project_id=project_id,
-            version=1,
-            status="ready",
-            filename=filename,
-            file_path=str(file_path),
-            media_type="audio",
-            duration_seconds=actual_duration,
-            file_size_bytes=len(audio_bytes)
-        )
-        db.add(media_asset)
+            media_asset = MediaAsset(
+                id=asset_id,
+                project_id=project_id,
+                version=1,
+                status="ready",
+                filename=filename,
+                file_path=str(file_path),
+                media_type="audio",
+                duration_seconds=actual_duration,
+                file_size_bytes=len(audio_bytes)
+            )
+            db.add(media_asset)
 
-        # Charge cost via CostController (~$0.05 per music generation; estimated, not verified fact)
-        cost_controller.authorize_and_charge(
-            db=db,
-            project_id=project_id,
-            scene_id=scene_id,
-            action_type="music_generation",
-            provider="google_lyria",
-            model=target_model,
-            operation="music_generation",
-            details=f"Google Lyria score generation: {mood} ({genre})",
-            estimated_cost=0.05,
-            actual_cost=None,
-            actual_cost_known=False,
-            allow_duplicate=True
-        )
-        db.commit()
-        db.refresh(audio_track)
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="completed",
+            )
+            db.commit()
+            db.refresh(audio_track)
+        except Exception as local_err:
+            db.rollback()
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="failed",
+                error_details=f"Local MP3 validation/persistence failed: {local_err}",
+            )
+            db.commit()
+            if isinstance(local_err, GoogleMusicAdapterError):
+                raise
+            raise GoogleMusicAdapterError(f"Lyria MP3 output validation failed: {local_err}") from local_err
 
         return {
             "status": "completed",
@@ -306,12 +414,14 @@ class GoogleMusicAdapter:
             "file_path": str(file_path),
             "filename": filename,
             "duration_seconds": actual_duration,
+            "target_duration_seconds": effective_duration,
             "mood": mood,
             "genre": genre,
             "bpm": bpm,
             "audio_codec": audio_codec,
             "provider_operation_id": provider_op_id,
             "interaction_id": provider_op_id,
+            "reservation_id": reservation_record.id if reservation_record else None,
             "is_fallback": False
         }
 

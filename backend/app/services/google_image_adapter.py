@@ -14,11 +14,13 @@ Capabilities:
 """
 
 import os
+import io
 import uuid
+import socket
 import base64
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
@@ -49,6 +51,18 @@ def get_supported_image_sizes_for_model(model_name: str) -> List[str]:
 class GoogleImageAdapterError(Exception):
     """Raised when Google Nano Banana image generation fails."""
     pass
+
+
+def _is_ambiguous_provider_error(err: Exception) -> bool:
+    """Returns True when an API exception leaves remote execution outcome ambiguous."""
+    if isinstance(err, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    msg = str(err).lower()
+    rejection_markers = ("400", "401", "403", "404", "422", "429", "invalid_argument", "permission_denied", "unauthenticated", "api key")
+    if any(m in msg for m in rejection_markers):
+        return False
+    ambiguous_markers = ("timeout", "timed out", "504", "gateway", "connection reset", "broken pipe", "remote end closed", "incomplete read")
+    return any(m in msg for m in ambiguous_markers)
 
 
 class GoogleImageAdapter:
@@ -123,6 +137,29 @@ class GoogleImageAdapter:
             return get_supported_image_sizes_for_model(model_name)
         return SUPPORTED_IMAGE_SIZES
 
+    @staticmethod
+    def _extract_inline_image_bytes(gc_resp: Any) -> Optional[bytes]:
+        """Extracts inline image bytes from GenerateContentResponse parts or candidates."""
+        candidates = getattr(gc_resp, "candidates", None)
+        if isinstance(candidates, (list, tuple)) and candidates:
+            content = getattr(candidates[0], "content", None)
+            cand_parts = getattr(content, "parts", None) if content else None
+            if isinstance(cand_parts, (list, tuple)):
+                for part in cand_parts:
+                    inline = getattr(part, "inline_data", None)
+                    raw_data = getattr(inline, "data", None) if inline else None
+                    if raw_data:
+                        return base64.b64decode(raw_data) if isinstance(raw_data, str) else bytes(raw_data)
+
+        top_parts = getattr(gc_resp, "parts", None)
+        if isinstance(top_parts, (list, tuple)):
+            for part in top_parts:
+                inline = getattr(part, "inline_data", None)
+                raw_data = getattr(inline, "data", None) if inline else None
+                if raw_data:
+                    return base64.b64decode(raw_data) if isinstance(raw_data, str) else bytes(raw_data)
+        return None
+
     def generate_image(
         self,
         prompt: str,
@@ -134,12 +171,14 @@ class GoogleImageAdapter:
         entity_id: Optional[str] = None,
         negative_prompt: Optional[str] = None,
         model: Optional[str] = None,
-        tier: str = "default"
+        tier: str = "default",
+        reservation_record: Optional[Any] = None,
+        job_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Generates an image via official Google Nano Banana 2 API,
-        saves the output locally in the project assets folder,
-        inspects true image dimensions via Pillow,
+        Generates an image via Google Nano Banana 2 using `client.models.generate_content()`,
+        reserves budget pre-flight before the external API call, validates output bytes with Pillow
+        (failing clearly on corrupted/invalid payloads without fabricating dimensions),
         and registers a local MediaAsset record in SQLite.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
@@ -181,105 +220,84 @@ class GoogleImageAdapter:
                 db=db
             )
 
-        img_bytes = None
-        provider_op_id = None
-
-        # 1. Try official Interactions API first
-        try:
-            logger.info(f"Submitting image generation to Google Nano Banana ({target_model}) via Interactions API...")
-            response_format = {
-                "type": "image",
-                "aspect_ratio": clean_ratio,
-                "image_size": clean_size
-            }
-            interaction = self.client.interactions.create(
+        # Pre-flight budget reservation BEFORE external Google API call
+        if reservation_record is None:
+            reservation_record = cost_controller.reserve_budget(
+                db=db,
+                project_id=project_id,
+                estimated_cost=est_cost,
+                operation="image_generation",
+                provider="google_nano_banana",
                 model=target_model,
-                input=prompt,
-                response_format=response_format
+                job_id=job_id,
+                details=f"Pre-flight Nano Banana image reservation for {entity_type or 'concept'} ({entity_id or 'general'})"
             )
-            provider_op_id = getattr(interaction, "id", None)
-            output_image = getattr(interaction, "output_image", None)
-            if output_image:
-                raw_data = getattr(output_image, "data", None)
-                if raw_data:
-                    if isinstance(raw_data, str):
-                        try:
-                            img_bytes = base64.b64decode(raw_data)
-                        except Exception:
-                            img_bytes = raw_data.encode("utf-8")
-                    else:
-                        img_bytes = raw_data
-                elif getattr(output_image, "uri", None):
-                    import urllib.request
-                    img_bytes = urllib.request.urlopen(output_image.uri).read()
-        except Exception as e_inter:
-            logger.info(f"Interactions API route ({e_inter}); attempting models.generate_images fallback...")
+            db.commit()
 
-        # 2. Try generate_images fallback if needed
-        if not img_bytes:
-            from google.genai import types
-            config_kwargs: Dict[str, Any] = {
-                "number_of_images": 1,
-                "output_mime_type": "image/jpeg",
-                "aspect_ratio": clean_ratio,
-                "person_generation": "allow_adult",
-            }
-            if negative_prompt:
-                config_kwargs["negative_prompt"] = negative_prompt
+        from google.genai import types
+        gc_config = types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            image_config=types.ImageConfig(
+                aspect_ratio=clean_ratio,
+                image_size=clean_size,
+            ),
+        )
+        full_contents = f"{prompt}\n[Avoid: {negative_prompt}]" if negative_prompt else prompt
 
-            config = types.GenerateImagesConfig(**config_kwargs)
-            try:
-                response = self.client.models.generate_images(
-                    model=target_model,
-                    prompt=prompt,
-                    config=config
-                )
-                if hasattr(response, "generated_images") and response.generated_images:
-                    img_obj = response.generated_images[0]
-                    if hasattr(img_obj, "image") and hasattr(img_obj.image, "image_bytes"):
-                        img_bytes = img_obj.image.image_bytes
-                    elif hasattr(img_obj, "image_bytes"):
-                        img_bytes = img_obj.image_bytes
-            except Exception as e:
-                # 3. Try generate_content multimodal route
-                logger.info(f"generate_images attempt ({e}); trying generate_content multimodal route...")
-                try:
-                    gc_config = types.GenerateContentConfig(
-                        response_modalities=["IMAGE"]
-                    )
-                    gc_resp = self.client.models.generate_content(
-                        model=target_model,
-                        contents=prompt,
-                        config=gc_config
-                    )
-                    if hasattr(gc_resp, "candidates") and gc_resp.candidates:
-                        parts = gc_resp.candidates[0].content.parts
-                        for part in parts:
-                            inline = getattr(part, "inline_data", None)
-                            if inline and hasattr(inline, "data"):
-                                raw_data = inline.data
-                                if isinstance(raw_data, str):
-                                    img_bytes = base64.b64decode(raw_data)
-                                else:
-                                    img_bytes = raw_data
-                                break
-                except Exception as e2:
-                    err_msg = f"Nano Banana generation failed: {e}; multimodal route failed: {e2}"
-                    logger.error(err_msg)
-                    raise GoogleImageAdapterError(err_msg)
-
-        if not img_bytes:
-            raise GoogleImageAdapterError(f"Google Nano Banana ({target_model}) returned no image bytes in response.")
-
-        # Inspect real dimensions and image format using Pillow
-        import io
-        from PIL import Image
-
-        real_width = 1920 if clean_ratio == "16:9" else (1080 if clean_ratio == "1:1" else 1280)
-        real_height = 1080 if clean_ratio == "16:9" else (1080 if clean_ratio == "1:1" else 720)
-        ext = ".jpg"
-        mime_type = "image/jpeg"
+        gc_resp = None
         try:
+            logger.info(
+                f"Submitting Nano Banana image generation ({target_model}, {clean_ratio}, {clean_size}) "
+                f"via models.generate_content()..."
+            )
+            gc_resp = self.client.models.generate_content(
+                model=target_model,
+                contents=full_contents,
+                config=gc_config,
+            )
+        except Exception as api_err:
+            err_msg = str(api_err)
+            logger.error(f"Nano Banana models.generate_content failed: {err_msg}")
+            if _is_ambiguous_provider_error(api_err):
+                cost_controller.finalize_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    local_processing_status="provider_outcome_unknown",
+                    error_details=err_msg,
+                )
+            else:
+                cost_controller.release_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    reason=f"image_provider_error: {err_msg}",
+                )
+            db.commit()
+            raise GoogleImageAdapterError(f"Nano Banana generation failed: {err_msg}") from api_err
+
+        provider_op_id = getattr(gc_resp, "response_id", None) or getattr(gc_resp, "id", None)
+        if not isinstance(provider_op_id, str):
+            provider_op_id = None
+
+        img_bytes = self._extract_inline_image_bytes(gc_resp)
+        if not img_bytes:
+            cost_controller.release_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                reason="image_no_inline_bytes_returned",
+            )
+            db.commit()
+            raise GoogleImageAdapterError(
+                f"Google Nano Banana ({target_model}) returned no inline image bytes in response."
+            )
+
+        # Provider outcome SUCCEEDED; validate bytes strictly with Pillow (no fake dimensions)
+        from PIL import Image
+        try:
+            with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                pil_img.verify()
             with Image.open(io.BytesIO(img_bytes)) as pil_img:
                 real_width, real_height = pil_img.size
                 fmt = (pil_img.format or "").lower()
@@ -292,58 +310,81 @@ class GoogleImageAdapter:
                 else:
                     ext = ".jpg"
                     mime_type = "image/jpeg"
+                if real_width <= 0 or real_height <= 0:
+                    raise ValueError(f"Invalid image dimensions: {real_width}x{real_height}")
         except Exception as img_err:
-            logger.warning(f"Could not inspect generated image with Pillow: {img_err}")
+            logger.error(f"Returned bytes failed Pillow validation: {img_err}")
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="failed",
+                error_details=f"Invalid image bytes returned by provider: {img_err}",
+            )
+            db.commit()
+            raise GoogleImageAdapterError(f"Nano Banana returned invalid image bytes: {img_err}") from img_err
 
-        # Save to local project directory
         asset_id = str(uuid.uuid4())
         filename = f"{entity_type or 'concept'}_{entity_id or asset_id[:8]}_{asset_id[:6]}{ext}"
         file_path = dest_dir / filename
-        file_path.write_bytes(img_bytes)
+        try:
+            file_path.write_bytes(img_bytes)
 
-        # Register local MediaAsset in SQLite with true dimensions
-        media_asset = MediaAsset(
-            id=asset_id,
-            project_id=project_id,
-            filename=filename,
-            file_path=str(file_path),
-            media_type="image",
-            status="ready",
-            file_size_bytes=len(img_bytes),
-            width=real_width,
-            height=real_height
-        )
-        db.add(media_asset)
+            media_asset = MediaAsset(
+                id=asset_id,
+                project_id=project_id,
+                filename=filename,
+                file_path=str(file_path),
+                media_type="image",
+                status="ready",
+                file_size_bytes=len(img_bytes),
+                width=real_width,
+                height=real_height
+            )
+            db.add(media_asset)
 
-        # Link to target entity
-        if entity_type == "character" and entity_id:
-            char = db.query(Character).filter(Character.id == entity_id).first()
-            if char:
-                char.reference_image_path = str(file_path)
-        elif entity_type == "location" and entity_id:
-            loc = db.query(Location).filter(Location.id == entity_id).first()
-            if loc:
-                loc.reference_image_path = str(file_path)
-        elif entity_type == "storyboard" and entity_id:
-            shot = db.query(Shot).filter(Shot.id == entity_id).first()
-            if shot:
-                shot.thumbnail_path = str(file_path)
+            if entity_type == "character" and entity_id:
+                char = db.query(Character).filter(Character.id == entity_id).first()
+                if char:
+                    char.reference_image_path = str(file_path)
+            elif entity_type == "location" and entity_id:
+                loc = db.query(Location).filter(Location.id == entity_id).first()
+                if loc:
+                    loc.reference_image_path = str(file_path)
+            elif entity_type == "storyboard" and entity_id:
+                shot = db.query(Shot).filter(Shot.id == entity_id).first()
+                if shot:
+                    shot.thumbnail_path = str(file_path)
 
-        # Record accounting entry (estimated, not verified invoice)
-        cost_controller.authorize_and_charge(
-            db=db,
-            project_id=project_id,
-            action_type="image_generation",
-            provider="google_nano_banana",
-            model=target_model,
-            operation="image_generation",
-            details=f"Google Nano Banana generation for {entity_type or 'concept'} ({entity_id or 'general'})",
-            estimated_cost=est_cost,
-            actual_cost=None,
-            actual_cost_known=False,
-            allow_duplicate=True
-        )
-        db.commit()
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="completed",
+            )
+            db.commit()
+        except Exception as local_err:
+            db.rollback()
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="failed",
+                error_details=str(local_err),
+            )
+            db.commit()
+            raise GoogleImageAdapterError(f"Local image persistence failed after generation: {local_err}") from local_err
 
         return {
             "status": "completed",
@@ -360,7 +401,8 @@ class GoogleImageAdapter:
             "aspect_ratio": clean_ratio,
             "image_size": clean_size,
             "provider_operation_id": provider_op_id,
-            "interaction_id": provider_op_id
+            "interaction_id": provider_op_id,
+            "reservation_id": reservation_record.id if reservation_record else None,
         }
 
     def _generate_fallback_reference(

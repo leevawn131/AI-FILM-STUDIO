@@ -215,8 +215,37 @@ def test_google_image_adapter_nano_banana_fallback(test_db, sample_project):
     assert asset.project_id == sample_project.id
 
 
+def _make_valid_mp3_bytes(tmp_path: Path, duration: float = 1.0) -> bytes:
+    import subprocess
+    out = tmp_path / f"sample_{uuid.uuid4().hex[:6]}.mp3"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", str(duration),
+            "-c:a", "libmp3lame", "-b:a", "96k",
+            str(out),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+    return out.read_bytes()
+
+
+def _make_mock_image_response(img_bytes: bytes, resp_id: str = "resp-img-1"):
+    part = MagicMock()
+    part.inline_data.data = img_bytes
+    cand = MagicMock()
+    cand.content.parts = [part]
+    resp = MagicMock()
+    resp.response_id = resp_id
+    resp.candidates = [cand]
+    return resp
+
+
 def test_google_image_adapter_nano_banana_with_mock_client(test_db, sample_project):
-    """Verifies Nano Banana 2 image generation with mock client saving real bytes and inspecting true PIL dimensions."""
+    """Verifies Nano Banana 2 uses models.generate_content(), validates with Pillow, and records true dimensions."""
     import io
     from PIL import Image
 
@@ -226,10 +255,7 @@ def test_google_image_adapter_nano_banana_with_mock_client(test_db, sample_proje
 
     adapter = GoogleImageAdapter(api_key="mock-api-key")
     mock_client = MagicMock()
-    mock_interaction = MagicMock()
-    mock_interaction.id = "interactions/img-456"
-    mock_interaction.output_image.data = base64.b64encode(valid_jpeg).decode("utf-8")
-    mock_client.interactions.create.return_value = mock_interaction
+    mock_client.models.generate_content.return_value = _make_mock_image_response(valid_jpeg, "resp-img-456")
     adapter._client = mock_client
 
     res = adapter.generate_image(
@@ -251,9 +277,21 @@ def test_google_image_adapter_nano_banana_with_mock_client(test_db, sample_proje
     assert res["is_fallback"] is False
     assert Path(res["file_path"]).exists()
 
+    # Verify primary Nano Banana interface is models.generate_content (never interactions.create or generate_images)
+    assert mock_client.models.generate_content.call_count == 1
+    assert mock_client.interactions.create.call_count == 0
+    assert mock_client.models.generate_images.call_count == 0
+    gc_kwargs = mock_client.models.generate_content.call_args[1]
+    assert gc_kwargs["model"] == "gemini-3.1-flash-image"
+    assert gc_kwargs["config"].response_modalities == ["IMAGE"]
+    assert gc_kwargs["config"].image_config.aspect_ratio == "16:9"
+    assert gc_kwargs["config"].image_config.image_size == "1K"
 
-def test_google_video_adapter_interactions_api_lifecycle(test_db, sample_project):
-    """Verifies Gemini Omni Flash 1.1 video generation via Interactions API."""
+
+def test_google_video_adapter_interactions_api_lifecycle(test_db, sample_project, tmp_path):
+    """Verifies Gemini Omni Flash 1.1 video generation via Interactions API and FFprobe inspection."""
+    from backend.app.services.ffmpeg_service import ffmpeg_service
+
     scene = Scene(
         id=str(uuid.uuid4()),
         project_id=sample_project.id,
@@ -299,11 +337,17 @@ def test_google_video_adapter_interactions_api_lifecycle(test_db, sample_project
     assert sub["model"] == "gemini-omni-1.1-flash"
     assert sub["provider_operation_id"] == "interactions/omni-video-98765"
     assert sub["supports_cancellation"] is True
+    assert sub["target_duration_seconds"] == 5
+    assert "duration_seconds" not in sub
 
-    # 2. Poll completed status
+    # 2. Poll completed status with genuine FFmpeg-generated MP4 bytes
+    synth_clip = tmp_path / "omni_out.mp4"
+    ffmpeg_service.generate_synthetic_test_clip(synth_clip, duration=1.0, width=320, height=240)
+    real_mp4_bytes = synth_clip.read_bytes()
+
     mock_completed = MagicMock()
     mock_completed.status = "completed"
-    mock_completed.output_video.data = base64.b64encode(b"FAKE_OMNI_FLASH_MP4_BYTES").decode("utf-8")
+    mock_completed.output_video.data = base64.b64encode(real_mp4_bytes).decode("utf-8")
     mock_completed.output_video.mime_type = "video/mp4"
     mock_completed.output_video.uri = None
     mock_completed.output_audio = None
@@ -311,9 +355,9 @@ def test_google_video_adapter_interactions_api_lifecycle(test_db, sample_project
 
     poll_res = adapter.poll_operation_status("interactions/omni-video-98765")
     assert poll_res["status"] == "completed"
-    assert poll_res["video_bytes"] == b"FAKE_OMNI_FLASH_MP4_BYTES"
+    assert poll_res["video_bytes"] == real_mp4_bytes
 
-    # 3. Import completed video locally and update Shot take selection
+    # 3. Import completed video locally and update Shot take selection with real FFprobe metadata
     imported_asset = adapter.import_completed_video(
         project_id=sample_project.id,
         shot_id=shot.id,
@@ -323,6 +367,10 @@ def test_google_video_adapter_interactions_api_lifecycle(test_db, sample_project
 
     assert imported_asset.version == 1
     assert imported_asset.shot_id == shot.id
+    assert imported_asset.width == 320
+    assert imported_asset.height == 240
+    assert abs(imported_asset.duration_seconds - 1.0) <= 0.2
+    assert imported_asset.codec == "h264"
     test_db.refresh(shot)
     assert shot.video_asset_id == imported_asset.id
     assert shot.generation_status == "ready"
@@ -393,14 +441,16 @@ def test_google_tts_adapter_dialogue_generation(test_db, sample_project):
     assert asset.media_type == "audio"
 
 
-def test_google_music_adapter_score_generation(test_db, sample_project):
-    """Verifies Google Lyria 3.5 generates real MP3 music score via Interactions API."""
+def test_google_music_adapter_score_generation(test_db, sample_project, tmp_path):
+    """Verifies Google Lyria 3.5 generates real MP3 music score via Interactions API and validates via FFprobe."""
+    real_mp3_bytes = _make_valid_mp3_bytes(tmp_path, duration=1.0)
+
     adapter = GoogleMusicAdapter(api_key="mock-key")
     mock_client = MagicMock()
     mock_interaction = MagicMock()
     mock_interaction.id = "interactions/lyria-score-11223"
     mock_interaction.status = "completed"
-    mock_interaction.output_audio.data = base64.b64encode(b"FAKE_LYRIA_SCORE_MP3_BYTES").decode("utf-8")
+    mock_interaction.output_audio.data = base64.b64encode(real_mp3_bytes).decode("utf-8")
     mock_client.interactions.create.return_value = mock_interaction
     adapter._client = mock_client
 
@@ -418,6 +468,8 @@ def test_google_music_adapter_score_generation(test_db, sample_project):
     assert res["model"] == "lyria-3.5"
     assert res["mood"] == "dark cyberpunk"
     assert res["filename"].endswith(".mp3")
+    assert res["audio_codec"] == "mp3"
+    assert abs(res["duration_seconds"] - 1.0) <= 0.2
     assert res["interaction_id"] == "interactions/lyria-score-11223"
     assert Path(res["file_path"]).exists()
 
@@ -427,7 +479,8 @@ def test_google_music_adapter_score_generation(test_db, sample_project):
     assert track.track_type == "music"
     assert track.ducking_enabled is True
 
-    # Verify Interactions API arguments: no unsupported audio_config dictionary
+    # Verify Interactions API arguments: single submission, no unsupported audio_config dictionary
+    assert mock_client.interactions.create.call_count == 1
     call_kwargs = mock_client.interactions.create.call_args[1]
     assert call_kwargs["response_format"] == {"type": "audio", "mime_type": "audio/mp3"}
     assert "generation_config" not in call_kwargs or "audio_config" not in call_kwargs.get("generation_config", {})
@@ -675,27 +728,33 @@ def test_google_video_adapter_multimodal_and_task_filtering(test_db, sample_proj
     assert call_kwargs["response_format"] == {"type": "video", "aspect_ratio": "16:9", "resolution": "720p"}
 
 
-def test_google_music_adapter_clip_vs_full_model_and_fallback_honesty(test_db, sample_project):
+def test_google_music_adapter_clip_vs_full_model_and_fallback_honesty(test_db, sample_project, tmp_path):
     """Verifies duration handling for lyria-3-clip-preview and honest 2.0s duration in offline fallback."""
+    real_mp3_bytes = _make_valid_mp3_bytes(tmp_path, duration=1.5)
+
     adapter = GoogleMusicAdapter(api_key="mock-key")
     mock_client = MagicMock()
     mock_interaction = MagicMock()
     mock_interaction.id = "interactions/lyria-clip-30s"
-    mock_interaction.output_audio.data = base64.b64encode(b"FAKE_LYRIA_MP3_CLIP").decode("utf-8")
+    mock_interaction.status = "completed"
+    mock_interaction.output_audio.data = base64.b64encode(real_mp3_bytes).decode("utf-8")
     mock_client.interactions.create.return_value = mock_interaction
     adapter._client = mock_client
 
-    # Model lyria-3-clip-preview enforces 30 seconds
+    # Model lyria-3-clip-preview caps target duration to 30 seconds in prompt, while FFprobe inspects true output duration
     res = adapter.generate_music_score(
         project_id=sample_project.id,
         db=test_db,
         mood="tense",
         genre="synth",
-        duration_seconds=60, # Requesting 60s
+        duration_seconds=60,  # Requesting 60s
         model="lyria-3-clip-preview"
     )
-    assert res["duration_seconds"] == 30.0
+    assert res["target_duration_seconds"] == 30
+    assert abs(res["duration_seconds"] - 1.5) <= 0.25
+    assert res["audio_codec"] == "mp3"
     assert res["filename"].endswith(".mp3")
+    assert "30-second musical clip preview" in mock_client.interactions.create.call_args[1]["input"]
 
     # Offline fallback honesty check
     fallback_adapter = GoogleMusicAdapter(api_key="")
@@ -806,7 +865,14 @@ def test_dynamic_ai_config_runtime_updates(client):
 
 
 def test_google_tts_adapter_multispeaker_contract(test_db, sample_project):
-    """Verifies documented multi-speaker dialogue configuration with speaker mappings."""
+    """
+    Verifies Google's documented multi-speaker configuration:
+    - One user_input object with multiple ordered content items
+    - speech_metadata annotations carrying speaker + style (no undocumented fields)
+    - generation_config.speech_config == {"speakers": [{"speaker": ..., "voice": ...}, ...]}
+    - Max 2 speakers enforced
+    - Single unique speaker routes cleanly to documented single-speaker list structure
+    """
     adapter = GoogleTTSAdapter(api_key="mock-key")
     mock_client = MagicMock()
     mock_interaction = MagicMock()
@@ -818,7 +884,8 @@ def test_google_tts_adapter_multispeaker_contract(test_db, sample_project):
 
     turns = [
         {"speaker": "REN", "voice": "Puck", "text": "We need to evacuate now.", "emotion": "urgent"},
-        {"speaker": "ELENA", "voice": "Kore", "text": "The blast doors are already locked.", "emotion": "tense"}
+        {"speaker": "ELENA", "voice": "Kore", "text": "The blast doors are already locked.", "emotion": "tense"},
+        {"speaker": "REN", "voice": "Puck", "text": "Try the service conduit.", "emotion": "determined"}
     ]
 
     res = adapter.generate_multi_speaker_dialogue(
@@ -830,42 +897,87 @@ def test_google_tts_adapter_multispeaker_contract(test_db, sample_project):
 
     assert res["status"] == "completed"
     assert res["is_multi_speaker"] is True
-    assert set(res["speakers"]) == {"REN", "ELENA"}
+    assert res["speakers"] == ["REN", "ELENA"]
     assert Path(res["file_path"]).exists()
 
-    # Inspect call arguments
+    # Inspect exact Interactions API call arguments
     call_kwargs = mock_client.interactions.create.call_args[1]
     assert call_kwargs["response_format"] == {"type": "audio"}
-    speech_cfg = call_kwargs["generation_config"]["speech_config"]
-    assert len(speech_cfg) == 2
-    assert {"voice": "Puck", "speaker": "REN"} in speech_cfg
-    assert {"voice": "Kore", "speaker": "ELENA"} in speech_cfg
+    gen_cfg = call_kwargs["generation_config"]
+    assert "mode" not in gen_cfg
+    assert gen_cfg["speech_config"] == {
+        "speakers": [
+            {"speaker": "REN", "voice": "Puck"},
+            {"speaker": "ELENA", "voice": "Kore"}
+        ]
+    }
 
-    # Multi-turn user_input verification
+    # Verify ONE user_input object with ordered text content turns
     input_items = call_kwargs["input"]
-    assert len(input_items) == 2
+    assert isinstance(input_items, list)
+    assert len(input_items) == 1
     assert input_items[0]["type"] == "user_input"
-    assert input_items[0]["content"][0]["annotations"][0]["speaker"] == "REN"
-    assert "urgent" in input_items[0]["content"][0]["annotations"][0]["style"]
-    assert input_items[1]["type"] == "user_input"
-    assert input_items[1]["content"][0]["annotations"][0]["speaker"] == "ELENA"
-    assert "tense" in input_items[1]["content"][0]["annotations"][0]["style"]
+    content_turns = input_items[0]["content"]
+    assert len(content_turns) == 3
+
+    expected_speakers = ["REN", "ELENA", "REN"]
+    expected_emotions = ["urgent", "tense", "determined"]
+    for idx, c in enumerate(content_turns):
+        assert c["type"] == "text"
+        assert c["text"] == turns[idx]["text"]
+        assert len(c["annotations"]) == 1
+        ann = c["annotations"][0]
+        assert set(ann.keys()) == {"type", "speaker", "style"}
+        assert ann["type"] == "speech_metadata"
+        assert ann["speaker"] == expected_speakers[idx]
+        assert expected_emotions[idx] in ann["style"]
+
+    # Enforce max 2 speakers without calling Google API or charging budget
+    mock_client.interactions.create.reset_mock()
+    spent_before_invalid = sample_project.budget_spent
+    three_speaker_turns = [
+        {"speaker": "REN", "voice": "Puck", "text": "Go."},
+        {"speaker": "ELENA", "voice": "Kore", "text": "Locked."},
+        {"speaker": "MARCUS", "voice": "Fenrir", "text": "Follow me."}
+    ]
+    with pytest.raises(ValueError, match="at most 2 speakers"):
+        adapter.generate_multi_speaker_dialogue(
+            dialogue_turns=three_speaker_turns,
+            project_id=sample_project.id,
+            db=test_db
+        )
+    assert mock_client.interactions.create.call_count == 0
+    test_db.refresh(sample_project)
+    assert sample_project.budget_spent == spent_before_invalid
+
+    # Single speaker across multiple turns routes to single-speaker speech_config list structure
+    single_turns = [
+        {"speaker": "REN", "voice": "Charon", "text": "Log entry one."},
+        {"speaker": "REN", "voice": "Charon", "text": "End transmission."}
+    ]
+    res_single = adapter.generate_multi_speaker_dialogue(
+        dialogue_turns=single_turns,
+        project_id=sample_project.id,
+        db=test_db
+    )
+    assert res_single["is_multi_speaker"] is False
+    single_kwargs = mock_client.interactions.create.call_args[1]
+    assert single_kwargs["generation_config"] == {"speech_config": [{"voice": "Charon"}]}
+    assert len(single_kwargs["input"]) == 1
+    assert len(single_kwargs["input"][0]["content"]) == 2
 
 
 def test_google_image_adapter_model_size_limitations(test_db, sample_project):
-    """Verifies model-specific image-size limitations for Flash, Flash Lite, and Pro."""
-    import pytest
-    adapter = GoogleImageAdapter(api_key="mock-key")
-    mock_client = MagicMock()
-    mock_interaction = MagicMock()
-    mock_interaction.id = "interactions/img-limit-test"
-    # Small valid JPEG byte buffer
+    """Verifies model-specific image-size limitations for Flash, Flash Lite, and Pro via models.generate_content."""
     import io
     from PIL import Image
+
+    adapter = GoogleImageAdapter(api_key="mock-key")
+    mock_client = MagicMock()
     buf = io.BytesIO()
     Image.new("RGB", (320, 240), color="red").save(buf, format="JPEG")
-    mock_interaction.output_image.data = base64.b64encode(buf.getvalue()).decode("utf-8")
-    mock_client.interactions.create.return_value = mock_interaction
+    jpeg_bytes = buf.getvalue()
+    mock_client.models.generate_content.side_effect = lambda **kwargs: _make_mock_image_response(jpeg_bytes)
     adapter._client = mock_client
 
     # 1. Flash Lite Image accepts 512 and 1K, but rejects 2K and 4K
@@ -1071,3 +1183,385 @@ def test_interrupted_reservation_recovery_after_backend_shutdown(test_db, sample
     # Project budget should be fully restored
     test_db.refresh(sample_project)
     assert round(sample_project.budget_spent - initial_spent, 2) == 0.0
+
+
+def test_google_image_adapter_invalid_bytes_and_api_rejection_accounting(test_db, sample_project):
+    """
+    Verifies:
+    - Corrupted/non-image bytes returned by provider fail clearly without fabricated dimensions,
+      while preserving provider charge with local_processing_status='failed'.
+    - Confirmed API 400 rejection releases the pre-flight budget reservation cleanly.
+    """
+    from backend.app.services.google_image_adapter import GoogleImageAdapterError
+
+    adapter = GoogleImageAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    adapter._client = mock_client
+
+    # 1. Invalid bytes returned -> fail clearly without faking 1920x1080 or 1024x1024, keep charge
+    mock_client.models.generate_content.return_value = _make_mock_image_response(b"NOT_A_VALID_IMAGE_PAYLOAD")
+    spent_before = sample_project.budget_spent or 0.0
+
+    with pytest.raises(GoogleImageAdapterError, match="invalid image bytes"):
+        adapter.generate_image(
+            prompt="Broken image",
+            project_id=sample_project.id,
+            db=test_db,
+            model="gemini-3.1-flash-image",
+            image_size="1K"
+        )
+    test_db.refresh(sample_project)
+    assert round((sample_project.budget_spent or 0.0) - spent_before, 2) == 0.02
+    assert test_db.query(MediaAsset).filter(MediaAsset.project_id == sample_project.id, MediaAsset.media_type == "image").count() == 0
+
+    # 2. Confirmed API 400 rejection -> release reservation and restore budget
+    mock_client.models.generate_content.side_effect = RuntimeError("400 INVALID_ARGUMENT: bad prompt")
+    spent_before_reject = sample_project.budget_spent
+    with pytest.raises(GoogleImageAdapterError, match="Nano Banana generation failed"):
+        adapter.generate_image(
+            prompt="Rejected prompt",
+            project_id=sample_project.id,
+            db=test_db,
+            image_size="1K"
+        )
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - spent_before_reject, 2) == 0.0
+
+
+def test_google_video_adapter_files_api_timeout_aborts_before_submit(test_db, sample_project, tmp_path):
+    """Verifies submit_video_generation fails cleanly without calling interactions.create if Files API stays PROCESSING."""
+    from backend.app.services.google_video_adapter import GoogleVideoAdapterError
+
+    vid_file = tmp_path / "slow_upload.mp4"
+    vid_file.write_bytes(b"FAKE_VIDEO_DATA")
+
+    scene = Scene(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_number=1,
+        slugline="INT. HANGAR",
+        script_content="Shuttle prepares."
+    )
+    test_db.add(scene)
+    test_db.flush()
+    shot = Shot(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_id=scene.id,
+        shot_code="SC_STUCK_01",
+        video_prompt="Extend clip"
+    )
+    test_db.add(shot)
+    test_db.commit()
+
+    adapter = GoogleVideoAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    mock_file = MagicMock()
+    mock_file.name = "files/stuck-processing-1"
+    mock_file.uri = "https://generativelanguage.googleapis.com/v1beta/files/stuck-processing-1"
+    mock_file.state.name = "PROCESSING"
+    mock_client.files.upload.return_value = mock_file
+    mock_client.files.get.return_value = mock_file
+    adapter._client = mock_client
+
+    with patch("backend.app.services.google_video_adapter.time.sleep", return_value=None):
+        with pytest.raises(GoogleVideoAdapterError, match="PROCESSING"):
+            adapter.submit_video_generation(
+                prompt="Extend",
+                project_id=sample_project.id,
+                shot_id=shot.id,
+                db=test_db,
+                input_video_path=str(vid_file)
+            )
+    assert mock_client.interactions.create.call_count == 0
+
+
+def test_google_video_adapter_files_download_and_ffprobe_failure_honesty(test_db, sample_project, tmp_path):
+    """
+    Verifies:
+    - Authenticated video_uri/audio_uri downloads prefer client.files.download()
+    - Corrupted video bytes fail FFprobe inspection clearly with LocalMediaProcessingError
+      rather than inventing 1920x1080 / 24fps / 4.0s / h264 metadata.
+    """
+    from backend.app.services.ffmpeg_service import ffmpeg_service
+    from backend.app.services.google_video_adapter import LocalMediaProcessingError
+
+    scene = Scene(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_number=1,
+        slugline="EXT. BRIDGE",
+        script_content="Rain on steel."
+    )
+    test_db.add(scene)
+    test_db.flush()
+    shot = Shot(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_id=scene.id,
+        shot_code="SC_URI_01",
+        video_prompt="Bridge in storm"
+    )
+    test_db.add(shot)
+    test_db.commit()
+
+    synth_clip = tmp_path / "dl_clip.mp4"
+    ffmpeg_service.generate_synthetic_test_clip(synth_clip, duration=1.0, width=320, height=240)
+    real_mp4 = synth_clip.read_bytes()
+
+    adapter = GoogleVideoAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    mock_client.files.download.return_value = real_mp4
+    adapter._client = mock_client
+
+    asset = adapter.import_completed_video(
+        project_id=sample_project.id,
+        shot_id=shot.id,
+        video_uri="https://generativelanguage.googleapis.com/v1beta/files/video-dl-99",
+        db=test_db
+    )
+    assert mock_client.files.download.call_count == 1
+    assert asset.width == 320
+    assert asset.height == 240
+    assert asset.codec == "h264"
+
+    # Now fail clearly on corrupt bytes (do NOT invent 1920x1080 / 24fps / 4s / h264)
+    with pytest.raises(LocalMediaProcessingError, match="FFprobe"):
+        adapter.import_completed_video(
+            project_id=sample_project.id,
+            shot_id=shot.id,
+            video_bytes=b"NOT_A_VALID_MP4_CONTAINER",
+            db=test_db
+        )
+
+
+def test_google_music_adapter_no_blind_retry_and_ffprobe_validation(test_db, sample_project):
+    """
+    Verifies Lyria:
+    - Never issues a second interactions.create call on failure or ambiguous timeout
+    - Distinguishes clear 400 rejection (releases reservation) from ambiguous TimeoutError (preserves reservation)
+    - Rejects corrupted MP3 bytes cleanly via FFprobe instead of inventing duration/codec
+    """
+    from backend.app.services.google_music_adapter import GoogleMusicAdapterError
+
+    adapter = GoogleMusicAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    adapter._client = mock_client
+
+    # 1. Ambiguous timeout -> 1 call only, reservation preserved as provider_outcome_unknown
+    spent_0 = sample_project.budget_spent or 0.0
+    mock_client.interactions.create.side_effect = TimeoutError("Read timed out waiting for Lyria")
+    with pytest.raises(GoogleMusicAdapterError, match="ambiguous"):
+        adapter.generate_music_score(project_id=sample_project.id, db=test_db, mood="noir", genre="jazz")
+    assert mock_client.interactions.create.call_count == 1
+    test_db.refresh(sample_project)
+    assert round((sample_project.budget_spent or 0.0) - spent_0, 2) == 0.05
+
+    # 2. Clear 400 rejection -> 1 call only, reservation released
+    mock_client.interactions.create.reset_mock()
+    spent_1 = sample_project.budget_spent
+    mock_client.interactions.create.side_effect = RuntimeError("400 INVALID_ARGUMENT: unsupported parameter")
+    with pytest.raises(GoogleMusicAdapterError, match="rejected"):
+        adapter.generate_music_score(project_id=sample_project.id, db=test_db, mood="epic", genre="orchestral")
+    assert mock_client.interactions.create.call_count == 1
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - spent_1, 2) == 0.0
+
+    # 3. Corrupted MP3 output -> FFprobe fails clearly without fabricating duration, keeps charge
+    mock_client.interactions.create.side_effect = None
+    bad_inter = MagicMock()
+    bad_inter.id = "interactions/lyria-bad-mp3"
+    bad_inter.status = "completed"
+    bad_inter.output_audio.data = base64.b64encode(b"GARBAGE_NOT_MP3_BYTES").decode("utf-8")
+    mock_client.interactions.create.return_value = bad_inter
+
+    spent_2 = sample_project.budget_spent
+    with pytest.raises(GoogleMusicAdapterError, match="FFprobe"):
+        adapter.generate_music_score(project_id=sample_project.id, db=test_db, mood="tense", genre="ambient")
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - spent_2, 2) == 0.05
+
+
+def test_video_job_recovery_timeout_and_idempotent_reservations(test_db, sample_project, tmp_path):
+    """
+    Verifies GenerationJobManager & CostController lifecycle end-to-end:
+    - Polling timeout preserves budget reservation (`provider_outcome_unknown`) and keeps `provider_operation_id`
+    - Retrying / recovering a job with existing `provider_operation_id` resumes polling ONLY,
+      never submitting a second paid provider generation and never duplicating budget reservations
+    - Finalize & Release operations are strictly idempotent (never double-charge or double-refund)
+    """
+    from backend.app.services.cost_controller import CostController
+    from backend.app.services.ffmpeg_service import ffmpeg_service
+
+    scene = Scene(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_number=1,
+        slugline="EXT. ORBIT",
+        script_content="Station turns."
+    )
+    test_db.add(scene)
+    test_db.flush()
+    shot = Shot(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_id=scene.id,
+        shot_code="SC_REC_01",
+        video_prompt="Orbiting station"
+    )
+    test_db.add(shot)
+    test_db.commit()
+
+    # 1. CostController finalize/release strict idempotency checks
+    base_spent = sample_project.budget_spent or 0.0
+    r1 = CostController.reserve_budget(
+        db=test_db, project_id=sample_project.id, estimated_cost=0.15,
+        operation="video_generation", job_id="idem-job-1"
+    )
+    r1_dup = CostController.reserve_budget(
+        db=test_db, project_id=sample_project.id, estimated_cost=0.15,
+        operation="video_generation", job_id="idem-job-1"
+    )
+    test_db.commit()
+    assert r1.id == r1_dup.id
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - base_spent, 2) == 0.15
+
+    CostController.finalize_reservation(
+        db=test_db, project_id=sample_project.id, reservation_record=r1,
+        actual_cost=0.25, actual_cost_known=True, local_processing_status="completed"
+    )
+    # Second finalize with actual cost must be a no-op (never double-add +0.10 diff)
+    CostController.finalize_reservation(
+        db=test_db, project_id=sample_project.id, reservation_record=r1,
+        actual_cost=0.25, actual_cost_known=True, local_processing_status="completed"
+    )
+    # Release after finalization must refuse to refund
+    assert CostController.release_reservation(test_db, sample_project.id, r1, reason="should_not_refund") is None
+    test_db.commit()
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - base_spent, 2) == 0.25
+
+    # Double release on unfinalized reservation never double-refunds
+    r2 = CostController.reserve_budget(
+        db=test_db, project_id=sample_project.id, estimated_cost=0.10, operation="image_generation"
+    )
+    test_db.commit()
+    ref1 = CostController.release_reservation(test_db, sample_project.id, r2, reason="err")
+    ref2 = CostController.release_reservation(test_db, sample_project.id, r2, reason="err")
+    assert ref1.id == ref2.id
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - base_spent, 2) == 0.25
+
+    # 2. Video job polling timeout -> preserves reservation & provider_operation_id -> recovery completes cleanly
+    job = generation_job_manager.create_job(
+        db=test_db,
+        project_id=sample_project.id,
+        shot_id=shot.id,
+        generation_type="video_generation",
+        input_parameters={"prompt": shot.video_prompt},
+        provider="google_omni",
+        model="gemini-omni-1.1-flash"
+    )
+
+    synth_clip = tmp_path / "rec_clip.mp4"
+    ffmpeg_service.generate_synthetic_test_clip(synth_clip, duration=1.0, width=320, height=240)
+    valid_mp4 = synth_clip.read_bytes()
+
+    spent_before_video = sample_project.budget_spent
+    with patch.object(google_video_adapter, "submit_video_generation", return_value={
+        "status": "processing",
+        "provider": "google_omni",
+        "model": "gemini-omni-1.1-flash",
+        "provider_operation_id": "interactions/omni-timeout-op-1",
+    }) as mock_submit, patch.object(google_video_adapter, "poll_operation_status", return_value={
+        "status": "processing",
+        "provider_operation_id": "interactions/omni-timeout-op-1",
+    }) as mock_poll, patch("backend.app.services.generation_job_manager.time.sleep", return_value=None):
+        generation_job_manager._execute_video_job(job, {"prompt": shot.video_prompt}, test_db)
+
+    assert mock_submit.call_count == 1
+    assert mock_poll.call_count == 60
+    test_db.refresh(job)
+    test_db.refresh(sample_project)
+    assert job.status == "provider_outcome_unknown"
+    assert job.provider_operation_id == "interactions/omni-timeout-op-1"
+    # Budget reservation was NOT released on polling timeout
+    assert round(sample_project.budget_spent - spent_before_video, 2) == 0.15
+    res_rec = CostController.get_active_job_reservation(test_db, job.id, sample_project.id)
+    assert res_rec is not None
+    assert res_rec.action_type == "provider_outcome_unknown"
+    # Releasing provider_outcome_unknown accidentally without confirmed failure must refuse
+    assert CostController.release_reservation(test_db, sample_project.id, res_rec, reason="oops") is None
+
+    # Recovery run when provider completes -> NO second submit_video_generation, NO duplicate reservation
+    with patch.object(google_video_adapter, "submit_video_generation") as mock_submit_rec, \
+         patch.object(google_video_adapter, "poll_operation_status", return_value={
+             "status": "completed",
+             "provider_operation_id": "interactions/omni-timeout-op-1",
+             "video_bytes": valid_mp4,
+         }), patch("backend.app.services.generation_job_manager.time.sleep", return_value=None):
+        job.status = "processing"
+        test_db.commit()
+        generation_job_manager._execute_video_job(job, {"prompt": shot.video_prompt}, test_db)
+
+    assert mock_submit_rec.call_count == 0
+    test_db.refresh(job)
+    test_db.refresh(sample_project)
+    assert job.status == "completed"
+    assert job.result_asset_id is not None
+    # Still only charged once ($0.15)
+    assert round(sample_project.budget_spent - spent_before_video, 2) == 0.15
+    assert test_db.query(CostRecord).filter(
+        CostRecord.project_id == sample_project.id,
+        CostRecord.details.like(f"%job:{job.id}%"),
+        CostRecord.action_type != "refund"
+    ).count() == 1
+
+
+def test_preflight_budget_enforcement_all_media_types(test_db, sample_project):
+    """Verifies Image, Video, TTS, and Music all enforce pre-flight budget BEFORE calling Google APIs."""
+    from fastapi import HTTPException
+
+    sample_project.budget_total = 0.004
+    sample_project.budget_spent = 0.0
+    test_db.commit()
+
+    # 1. Image ($0.02)
+    img_adapter = GoogleImageAdapter(api_key="mock-key")
+    img_adapter._client = MagicMock()
+    with pytest.raises(HTTPException) as exc_img:
+        img_adapter.generate_image(prompt="Test", project_id=sample_project.id, db=test_db)
+    assert exc_img.value.status_code == 400
+    assert img_adapter._client.models.generate_content.call_count == 0
+
+    # 2. TTS ($0.01)
+    tts_adapter = GoogleTTSAdapter(api_key="mock-key")
+    tts_adapter._client = MagicMock()
+    with pytest.raises(HTTPException) as exc_tts:
+        tts_adapter.generate_dialogue_speech(text="Hello", project_id=sample_project.id, db=test_db)
+    assert exc_tts.value.status_code == 400
+    assert tts_adapter._client.interactions.create.call_count == 0
+
+    # 3. Music ($0.05)
+    music_adapter = GoogleMusicAdapter(api_key="mock-key")
+    music_adapter._client = MagicMock()
+    with pytest.raises(HTTPException) as exc_mus:
+        music_adapter.generate_music_score(project_id=sample_project.id, db=test_db)
+    assert exc_mus.value.status_code == 400
+    assert music_adapter._client.interactions.create.call_count == 0
+
+    # 4. Video job ($0.15)
+    vid_job = generation_job_manager.create_job(
+        db=test_db,
+        project_id=sample_project.id,
+        generation_type="video_generation",
+        input_parameters={"prompt": "Scene"},
+        provider="google_omni",
+        model="gemini-omni-1.1-flash"
+    )
+    with patch.object(google_video_adapter, "submit_video_generation") as mock_vsub:
+        with pytest.raises(HTTPException) as exc_vid:
+            generation_job_manager._execute_video_job(vid_job, {"prompt": "Scene"}, test_db)
+        assert exc_vid.value.status_code == 400
+        assert mock_vsub.call_count == 0
