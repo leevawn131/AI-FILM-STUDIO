@@ -112,7 +112,7 @@ export const Header: React.FC<HeaderProps> = ({
             <Cpu className="w-3.5 h-3.5 text-cinema-cyan" />
             <span className="capitalize">
               {aiStatus?.active_provider === 'gemini'
-                ? `Gemini (${aiStatus?.gemini?.configured_model || '2.5 Flash'})`
+                ? `Gemini (${aiStatus?.gemini?.configured_model || 'gemini-4-hydrogen'})`
                 : aiStatus?.active_provider === 'ollama'
                 ? `Ollama (${aiStatus?.ollama?.configured_model || 'local'})`
                 : 'Offline Engine'}

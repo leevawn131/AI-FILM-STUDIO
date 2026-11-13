@@ -33,10 +33,14 @@ from backend.app.services.google_image_adapter import (
 )
 from backend.app.services.google_video_adapter import (
     google_video_adapter,
-    is_ambiguous_provider_error as is_ambiguous_video_error,
 )
 from backend.app.services.google_tts_adapter import google_tts_adapter, SUPPORTED_VOICES
 from backend.app.services.google_music_adapter import google_music_adapter
+from backend.app.services.google_model_catalog import (
+    estimate_video_cost_usd,
+    estimate_music_cost_usd,
+)
+from backend.app.services.provider_error_classifier import classify_provider_exception
 from backend.app.services.cost_controller import cost_controller, CostController
 from backend.app.services.ai_provider import get_ai_provider
 
@@ -45,13 +49,18 @@ logger = logging.getLogger("generation_job_manager")
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gen_job_worker")
 
 
+class DuplicateGenerationRiskError(ValueError):
+    """Raised when retrying an unknown-outcome job without an operation ID requires explicit acknowledgement."""
+    pass
+
+
 class GenerationJobManager:
     """
-    Note on resumability across local restarts:
-    - `video_generation` submits asynchronous Interactions API (`background=True`) operations, persists
-      `provider_operation_id`, and supports mid-flight polling recovery without duplicate submissions.
-    - `image_generation`, `tts_generation`, and `music_generation` execute synchronous single-request calls
-      without remote mid-flight polling recovery across restarts.
+    Durable asynchronous generation job manager enforcing billing safety:
+    - Persists `dispatch_state='dispatch_started'` BEFORE calling remote Google endpoints.
+    - `video_generation` tracks `provider_operation_id` (`provider_operation_known`) for crash recovery.
+    - Missing operation IDs or mid-dispatch crashes transition to `provider_outcome_unknown` and
+      preserve budget reservations without automatic retries.
     """
 
     @staticmethod
@@ -66,7 +75,7 @@ class GenerationJobManager:
         shot_id: Optional[str] = None,
         supports_cancellation: Optional[bool] = None
     ) -> GenerationJob:
-        """Creates a new GenerationJob in pending status."""
+        """Creates a new GenerationJob in pending/not_dispatched status."""
         resolved_model = model
         if not resolved_model:
             if generation_type == "image_generation":
@@ -94,6 +103,7 @@ class GenerationJobManager:
             generation_type=generation_type,
             input_parameters=json.dumps(input_parameters),
             status="pending",
+            dispatch_state="not_dispatched",
             supports_cancellation=resolved_cancel,
             result_metadata="{}",
             error_details=""
@@ -149,8 +159,35 @@ class GenerationJobManager:
                     active_res = cost_controller.get_active_job_reservation(db, job.id, job.project_id)
                     if active_res and active_res.action_type == "provider_outcome_unknown":
                         job.status = "provider_outcome_unknown"
+                        job.dispatch_state = "provider_outcome_unknown"
+                    elif active_res and active_res.action_type not in ("budget_reservation", "refund"):
+                        # Reservation finalized operationally despite downstream exception -> local failure
+                        job.status = "failed"
+                        job.dispatch_state = "local_processing_failed"
                     elif job.status != "provider_outcome_unknown":
                         job.status = "failed"
+                        if job.dispatch_state == "dispatch_started":
+                            classified = classify_provider_exception(e)
+                            if classified.is_outcome_unknown:
+                                if active_res:
+                                    cost_controller.finalize_reservation(
+                                        db=db,
+                                        project_id=job.project_id,
+                                        reservation_record=active_res,
+                                        local_processing_status="provider_outcome_unknown",
+                                        error_details=classified.reason,
+                                    )
+                                job.status = "provider_outcome_unknown"
+                                job.dispatch_state = "provider_outcome_unknown"
+                            else:
+                                if active_res:
+                                    cost_controller.release_reservation(
+                                        db=db,
+                                        project_id=job.project_id,
+                                        reservation_record=active_res,
+                                        reason=f"provider_rejected: {classified.reason}",
+                                    )
+                                job.dispatch_state = "provider_failed"
                     job.error_details = str(e)
                     job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     if job.shot_id and job.generation_type == "video_generation":
@@ -173,7 +210,11 @@ class GenerationJobManager:
 
         reservation = None
         if google_image_adapter.is_available:
-            target_model, est_cost = google_image_adapter._resolve_model(model=job.model, tier=tier)
+            target_model, est_cost = google_image_adapter._resolve_model(
+                model=job.model,
+                tier=tier,
+                image_size=image_size,
+            )
             supported_sizes = get_supported_image_sizes_for_model(target_model)
             if image_size not in supported_sizes:
                 raise ValueError(
@@ -192,6 +233,7 @@ class GenerationJobManager:
                 job_id=job.id,
                 details="Pre-flight budget reservation for image generation"
             )
+            job.dispatch_state = "dispatch_started"
             db.commit()
 
         result = google_image_adapter.generate_image(
@@ -210,6 +252,7 @@ class GenerationJobManager:
         )
 
         job.status = "completed"
+        job.dispatch_state = "not_dispatched" if result.get("is_fallback") else "provider_completed"
         job.result_asset_id = result.get("asset_id")
         job.provider_operation_id = result.get("provider_operation_id") or result.get("interaction_id")
         job.result_metadata = json.dumps(result)
@@ -223,31 +266,40 @@ class GenerationJobManager:
            Reuses any existing reservation without duplicating it, skips `submit_video_generation`,
            and resumes polling the existing remote operation.
         2. New generation mode:
-           Reserves pre-flight budget, submits once to provider, persists `provider_operation_id`,
-           then polls and finalizes or releases strictly per provider outcome.
-        Polling timeouts mark `provider_outcome_unknown` and NEVER release the budget reservation.
+           Reserves pre-flight budget, durably persists `dispatch_state='dispatch_started'` BEFORE
+           calling Google, submits once to provider, persists `provider_operation_id` +
+           `provider_operation_known`, then polls and finalizes or releases strictly per provider outcome.
         """
         prompt = params.get("prompt", "")
         duration_seconds = params.get("duration_seconds", 5)
         aspect_ratio = params.get("aspect_ratio", "16:9")
         task = params.get("task", "text_to_video")
         resolution = params.get("resolution", "720p")
+        reference_image_paths = params.get("reference_image_paths")
 
         if job.provider_operation_id:
             # Recovery mode: do NOT submit a second paid request and do NOT create a duplicate reservation
             op_id = job.provider_operation_id
+            job.dispatch_state = "provider_operation_known"
             reservation = cost_controller.get_active_job_reservation(
                 db=db,
                 job_id=job.id,
                 project_id=job.project_id
             )
+            db.commit()
             logger.info(
                 f"Recovering video job {job.id} using existing provider_operation_id={op_id} "
                 f"(reservation={'found' if reservation else 'none'})"
             )
         else:
-            # New generation mode: reserve budget pre-flight BEFORE submitting to provider
-            est_cost = 0.15
+            if getattr(job, "dispatch_state", "not_dispatched") in ("dispatch_started", "provider_outcome_unknown"):
+                raise DuplicateGenerationRiskError(
+                    f"Refusing automatic remote video submission for job '{job.id}' in "
+                    f"dispatch_state='{job.dispatch_state}' without a provider_operation_id."
+                )
+
+            # New generation mode: reserve budget & commit dispatch_started BEFORE calling provider
+            est_cost = estimate_video_cost_usd(job.model, duration_seconds=duration_seconds, resolution=resolution)
             reservation = cost_controller.reserve_budget(
                 db=db,
                 project_id=job.project_id,
@@ -260,6 +312,8 @@ class GenerationJobManager:
                 job_id=job.id,
                 details="Pre-flight budget reservation for video generation"
             )
+            job.dispatch_state = "dispatch_started"
+            job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             db.commit()
 
             try:
@@ -274,33 +328,38 @@ class GenerationJobManager:
                     task=task,
                     input_image_path=params.get("input_image_path"),
                     input_video_path=params.get("input_video_path"),
+                    reference_image_paths=reference_image_paths,
+                    model=job.model,
                     negative_prompt=params.get("negative_prompt")
                 )
-                job.provider_operation_id = submission["provider_operation_id"]
+                op_id = submission["provider_operation_id"]
+                job.provider_operation_id = op_id
+                job.dispatch_state = "provider_operation_known"
                 job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 db.commit()
-                op_id = job.provider_operation_id
             except Exception as sub_err:
-                root_err = sub_err.__cause__ or sub_err
-                if is_ambiguous_video_error(sub_err) or is_ambiguous_video_error(root_err):
+                classified = classify_provider_exception(sub_err)
+                if classified.is_outcome_unknown:
                     cost_controller.finalize_reservation(
                         db=db,
                         project_id=job.project_id,
                         reservation_record=reservation,
                         local_processing_status="provider_outcome_unknown",
-                        error_details=f"Ambiguous submission error: {sub_err}"
+                        error_details=f"Dispatch outcome unknown: {classified.reason}"
                     )
                     job.status = "provider_outcome_unknown"
+                    job.dispatch_state = "provider_outcome_unknown"
                     job.error_details = f"Video submission outcome unknown (reservation preserved): {sub_err}"
                 else:
                     cost_controller.release_reservation(
                         db=db,
                         project_id=job.project_id,
                         reservation_record=reservation,
-                        reason=f"provider_submission_failed: {sub_err}"
+                        reason=f"provider_submission_rejected: {classified.reason}"
                     )
                     job.status = "failed"
-                    job.error_details = f"Video submission failed: {sub_err}"
+                    job.dispatch_state = "provider_failed"
+                    job.error_details = f"Video submission rejected: {sub_err}"
                 job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 if job.shot_id:
                     shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
@@ -352,6 +411,7 @@ class GenerationJobManager:
                     )
                     # Local media processing outcome: SUCCEEDED
                     job.status = "completed"
+                    job.dispatch_state = "provider_completed"
                     job.result_asset_id = media_asset.id
                     job.result_metadata = json.dumps({
                         "provider": "google_omni",
@@ -379,6 +439,7 @@ class GenerationJobManager:
                             error_details=str(local_err)
                         )
                     job.status = "failed"
+                    job.dispatch_state = "local_processing_failed"
                     job.error_details = f"Google Omni Flash generated video successfully, but local media processing failed: {local_err}"
                     job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     if job.shot_id:
@@ -387,6 +448,29 @@ class GenerationJobManager:
                             shot.generation_status = "pending"
                     db.commit()
                     return
+
+            elif poll_res["status"] == "output_missing":
+                # Provider marked operation completed without retrievable output: NEVER refund!
+                if reservation is not None:
+                    cost_controller.finalize_reservation(
+                        db=db,
+                        project_id=job.project_id,
+                        reservation_record=reservation,
+                        actual_cost=None,
+                        actual_cost_known=False,
+                        local_processing_status="output_unretrieved",
+                        error_details=poll_res.get("error", "Completed operation returned no output video")
+                    )
+                job.status = "failed"
+                job.dispatch_state = "local_processing_failed"
+                job.error_details = poll_res.get("error", "Completed operation returned no video bytes or URI.")
+                job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                if job.shot_id:
+                    shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
+                    if shot:
+                        shot.generation_status = "pending"
+                db.commit()
+                return
 
             elif poll_res["status"] == "failed":
                 if reservation is not None:
@@ -398,6 +482,7 @@ class GenerationJobManager:
                         allow_unknown_release=True
                     )
                 job.status = "failed"
+                job.dispatch_state = "provider_failed"
                 job.error_details = f"{poll_res.get('error', 'Omni Flash video generation failed remotely.')} [failed_op:{op_id}]"
                 # Clear terminal failed provider operation ID so manual retry creates a new generation
                 job.provider_operation_id = None
@@ -419,6 +504,7 @@ class GenerationJobManager:
                         allow_unknown_release=True
                     )
                 job.status = "cancelled"
+                job.dispatch_state = "provider_failed"
                 job.provider_operation_id = None
                 job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 if job.shot_id:
@@ -441,6 +527,7 @@ class GenerationJobManager:
                 error_details=f"Local polling timed out while operation '{op_id}' remained in-flight or unknown"
             )
         job.status = "provider_outcome_unknown"
+        job.dispatch_state = "provider_outcome_unknown"
         job.error_details = (
             f"Gemini Omni Flash polling timed out for operation '{op_id}'; provider outcome is unknown "
             f"and budget reservation is preserved. Retry to resume polling."
@@ -488,6 +575,7 @@ class GenerationJobManager:
                     job_id=job.id,
                     details="Pre-flight budget reservation for multi-speaker TTS generation"
                 )
+                job.dispatch_state = "dispatch_started"
                 db.commit()
 
             result = google_tts_adapter.generate_multi_speaker_dialogue(
@@ -525,6 +613,7 @@ class GenerationJobManager:
                     job_id=job.id,
                     details="Pre-flight budget reservation for TTS generation"
                 )
+                job.dispatch_state = "dispatch_started"
                 db.commit()
 
             result = google_tts_adapter.generate_dialogue_speech(
@@ -546,6 +635,7 @@ class GenerationJobManager:
             )
 
         job.status = "completed"
+        job.dispatch_state = "not_dispatched" if result.get("is_fallback") else "provider_completed"
         job.result_asset_id = result.get("asset_id")
         job.provider_operation_id = result.get("provider_operation_id") or result.get("interaction_id")
         job.result_metadata = json.dumps(result)
@@ -569,7 +659,7 @@ class GenerationJobManager:
             reservation = cost_controller.reserve_budget(
                 db=db,
                 project_id=job.project_id,
-                estimated_cost=0.05,
+                estimated_cost=estimate_music_cost_usd(target_model),
                 operation="music_generation",
                 provider="google_lyria",
                 model=target_model,
@@ -578,6 +668,7 @@ class GenerationJobManager:
                 job_id=job.id,
                 details="Pre-flight budget reservation for music generation"
             )
+            job.dispatch_state = "dispatch_started"
             db.commit()
 
         result = google_music_adapter.generate_music_score(
@@ -598,6 +689,7 @@ class GenerationJobManager:
         )
 
         job.status = "completed"
+        job.dispatch_state = "not_dispatched" if result.get("is_fallback") else "provider_completed"
         job.result_asset_id = result.get("asset_id")
         job.provider_operation_id = result.get("provider_operation_id") or result.get("interaction_id")
         job.result_metadata = json.dumps(result)
@@ -679,6 +771,7 @@ class GenerationJobManager:
             cancel_res = google_video_adapter.cancel_operation(job.provider_operation_id)
             if cancel_res.get("status") == "cancelled":
                 job.status = "cancelled"
+                job.dispatch_state = "provider_failed"
                 job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 if job.shot_id:
                     shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
@@ -710,13 +803,19 @@ class GenerationJobManager:
         db.commit()
         return {"status": "success", "message": "Job marked cancelled."}
 
-    def retry_job(self, db: Session, job_id: str) -> GenerationJob:
+    def retry_job(
+        self,
+        db: Session,
+        job_id: str,
+        acknowledge_new_generation: bool = False
+    ) -> GenerationJob:
         """
-        Retries a failed, timed-out (`provider_outcome_unknown`), or cancelled job.
-        - If already completed or currently in-flight (`pending` / `processing`), returns existing job
-          without creating duplicates.
-        - If `provider_operation_id` is still present (e.g. from polling timeout recovery),
-          `_execute_video_job` enters recovery mode and resumes polling without double-submitting.
+        Retries a failed, timed-out (`provider_outcome_unknown`), or cancelled job safely:
+        - If already completed or currently in-flight (`pending` / `processing`), returns existing job.
+        - If `provider_operation_id` IS known, resumes polling ONLY without creating duplicate remote calls.
+        - CRITICAL BILLING SAFETY: If `dispatch_state` / `status` indicates `provider_outcome_unknown` or
+          `dispatch_started` WITHOUT a `provider_operation_id`, automatic retry is BLOCKED
+          (`DuplicateGenerationRiskError`) unless `acknowledge_new_generation=True` is explicitly supplied!
         """
         job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
         if not job:
@@ -725,6 +824,23 @@ class GenerationJobManager:
         if job.status in ("completed", "pending", "processing"):
             return job
 
+        dispatch_state = getattr(job, "dispatch_state", "not_dispatched") or "not_dispatched"
+        unknown_without_op_id = (
+            (job.status == "provider_outcome_unknown" or dispatch_state in ("dispatch_started", "provider_outcome_unknown"))
+            and not job.provider_operation_id
+        )
+        if unknown_without_op_id and not acknowledge_new_generation:
+            raise DuplicateGenerationRiskError(
+                f"Job '{job.id}' is in '{job.status}' ({dispatch_state}) without a provider_operation_id. "
+                "Automatic retry is blocked to prevent duplicate paid generation. Reconcile outcome via "
+                "/api/jobs/generation/{job_id}/reconcile, or set acknowledge_new_generation=true."
+            )
+
+        if job.provider_operation_id:
+            job.dispatch_state = "provider_operation_known"
+        else:
+            job.dispatch_state = "not_dispatched"
+
         job.status = "pending"
         job.error_details = ""
         job.retry_count = (job.retry_count or 0) + 1
@@ -732,6 +848,155 @@ class GenerationJobManager:
         db.commit()
 
         self.launch_job_async(job.id)
+        return job
+
+    def reconcile_job(
+        self,
+        db: Session,
+        job_id: str,
+        remote_status: Optional[str] = None,
+        notes: Optional[str] = None
+    ) -> GenerationJob:
+        """
+        Explicit reconciliation workflow for jobs with known `provider_operation_id` or `provider_outcome_unknown`.
+        - When `provider_operation_id` exists (and no manual override is given), polls Google directly to settle state.
+        - When no `provider_operation_id` exists, accepts explicit operator confirmation
+          (`confirmed_not_billed`, `confirmed_failed`, `confirmed_cancelled`, `confirmed_completed`) before
+          releasing or settling a preserved budget reservation.
+        """
+        job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+        if not job:
+            raise ValueError(f"Generation job '{job_id}' not found.")
+
+        reservation = cost_controller.get_active_job_reservation(db, job.id, job.project_id)
+        normalized_override = (remote_status or "").strip().lower()
+
+        # 1. Manual/explicit operator reconciliation override
+        if normalized_override in ("confirmed_not_billed", "confirmed_failed", "confirmed_cancelled"):
+            if reservation is not None:
+                cost_controller.release_reservation(
+                    db=db,
+                    project_id=job.project_id,
+                    reservation_record=reservation,
+                    reason=f"reconciled_{normalized_override}: {notes or 'manual verification'}",
+                    allow_unknown_release=True,
+                )
+            job.dispatch_state = "provider_failed"
+            job.status = "cancelled" if normalized_override == "confirmed_cancelled" else "failed"
+            job.error_details = notes or f"Reconciled as {normalized_override}."
+            job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            db.commit()
+            return job
+
+        if normalized_override == "confirmed_completed":
+            if reservation is not None:
+                cost_controller.finalize_reservation(
+                    db=db,
+                    project_id=job.project_id,
+                    reservation_record=reservation,
+                    local_processing_status="output_unretrieved" if not job.result_asset_id else "completed",
+                    error_details=notes or "Reconciled as confirmed_completed remotely",
+                )
+            job.dispatch_state = "provider_completed" if job.result_asset_id else "local_processing_failed"
+            job.status = "completed" if job.result_asset_id else "failed"
+            if notes:
+                job.error_details = notes
+            job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            db.commit()
+            return job
+
+        # 2. Automatic remote reconciliation when `provider_operation_id` exists for video jobs
+        if job.generation_type == "video_generation" and job.provider_operation_id:
+            poll_res = google_video_adapter.poll_operation_status(job.provider_operation_id)
+            p_status = poll_res.get("status")
+            if p_status == "completed":
+                try:
+                    asset = google_video_adapter.import_completed_video(
+                        project_id=job.project_id,
+                        shot_id=job.shot_id,
+                        video_bytes=poll_res.get("video_bytes"),
+                        video_uri=poll_res.get("video_uri"),
+                        db=db,
+                        audio_bytes=poll_res.get("audio_bytes"),
+                        audio_uri=poll_res.get("audio_uri"),
+                        reservation_record=reservation,
+                        raise_on_processing_error=True,
+                    )
+                    job.status = "completed"
+                    job.dispatch_state = "provider_completed"
+                    job.result_asset_id = asset.id
+                    job.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    job.error_details = ""
+                    db.commit()
+                    return job
+                except Exception as import_err:
+                    if reservation is not None:
+                        cost_controller.finalize_reservation(
+                            db=db,
+                            project_id=job.project_id,
+                            reservation_record=reservation,
+                            local_processing_status="failed",
+                            error_details=str(import_err),
+                        )
+                    job.status = "failed"
+                    job.dispatch_state = "local_processing_failed"
+                    job.error_details = f"Reconciliation found remote video complete, but local import failed: {import_err}"
+                    db.commit()
+                    return job
+            elif p_status == "output_missing":
+                if reservation is not None:
+                    cost_controller.finalize_reservation(
+                        db=db,
+                        project_id=job.project_id,
+                        reservation_record=reservation,
+                        local_processing_status="output_unretrieved",
+                        error_details=poll_res.get("error", "Remote completed with no output"),
+                    )
+                job.status = "failed"
+                job.dispatch_state = "local_processing_failed"
+                job.error_details = poll_res.get("error", "Remote completed with no output")
+                db.commit()
+                return job
+            elif p_status in ("failed", "cancelled"):
+                if reservation is not None:
+                    cost_controller.release_reservation(
+                        db=db,
+                        project_id=job.project_id,
+                        reservation_record=reservation,
+                        reason=f"reconciled_remote_{p_status}",
+                        allow_unknown_release=True,
+                    )
+                job.dispatch_state = "provider_failed"
+                job.status = "cancelled" if p_status == "cancelled" else "failed"
+                job.provider_operation_id = None
+                job.error_details = poll_res.get("error", f"Remote operation {p_status}.")
+                db.commit()
+                return job
+            else:
+                job.dispatch_state = "provider_operation_known"
+                job.status = "processing"
+                job.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                db.commit()
+                self.launch_job_async(job.id)
+                return job
+
+        # No operation ID & no confirmed override -> preserve unknown outcome & budget reservation
+        if reservation is not None and reservation.action_type == "budget_reservation":
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=job.project_id,
+                reservation_record=reservation,
+                local_processing_status="provider_outcome_unknown",
+                error_details=notes or "Awaiting confirmed remote reconciliation outcome",
+            )
+        job.dispatch_state = "provider_outcome_unknown"
+        job.status = "provider_outcome_unknown"
+        job.error_details = (
+            notes
+            or "No provider_operation_id exists to auto-reconcile. Verify Google AI usage/billing, "
+               "then submit remote_status='confirmed_not_billed' or retry with acknowledge_new_generation=true."
+        )
+        db.commit()
         return job
 
     @staticmethod
@@ -756,19 +1021,37 @@ class GenerationJobManager:
     def recover_interrupted_jobs(self, db: Session) -> int:
         """
         Scans for generation jobs left in 'processing' or 'pending' state upon local server restart.
-        - For background video generation jobs with a persisted `provider_operation_id`, resumes polling
-          via background executor without creating duplicate submissions or duplicate reservations.
-        - Synchronous single-request jobs (image, TTS, music) and pre-submission jobs without a
-          `provider_operation_id` do not support mid-flight restart resumability; they are marked failed
-          with clear diagnostics and any unincurred pre-dispatch reservations are released.
+        - Video jobs with persisted `provider_operation_id`: resumes polling ONLY (no duplicate dispatch).
+        - Jobs with `dispatch_state in ('dispatch_started', 'provider_outcome_unknown')` and NO
+          `provider_operation_id`: crash happened during/after remote dispatch! Marks `provider_outcome_unknown`,
+          preserves budget reservation without releasing/refunding, and blocks automatic retry.
+        - Pre-dispatch interrupted jobs (`dispatch_state == 'not_dispatched'`): marked `failed` and
+          their pre-flight budget reservations are safely released.
         """
         interrupted = db.query(GenerationJob).filter(
             GenerationJob.status.in_(["pending", "processing"])
         ).all()
         recovered_count = 0
         for job in interrupted:
+            dispatch_state = getattr(job, "dispatch_state", "not_dispatched") or "not_dispatched"
             if job.generation_type == "video_generation" and job.provider_operation_id:
+                job.dispatch_state = "provider_operation_known"
                 self.launch_job_async(job.id)
+                recovered_count += 1
+            elif dispatch_state in ("dispatch_started", "provider_outcome_unknown"):
+                # CRITICAL BILLING SAFETY: Crash occurred after dispatch started without saved op ID!
+                job.status = "provider_outcome_unknown"
+                job.dispatch_state = "provider_outcome_unknown"
+                job.error_details = (
+                    "Local backend interrupted during remote dispatch before provider_operation_id was recorded; "
+                    "provider outcome is unknown and budget reservation is preserved. Reconcile or acknowledge "
+                    "new generation explicitly before retrying."
+                )
+                if job.shot_id and job.generation_type == "video_generation":
+                    shot = db.query(Shot).filter(Shot.id == job.shot_id).first()
+                    if shot and shot.generation_status == "generating":
+                        shot.generation_status = "pending"
+                cost_controller.recover_orphaned_job_reservation(db=db, job_id=job.id, project_id=job.project_id)
                 recovered_count += 1
             else:
                 job.status = "failed"

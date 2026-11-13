@@ -102,9 +102,11 @@ def sample_project(test_db):
 
 
 def test_gemini_is_primary_provider():
-    """Verifies that Gemini 3.8 Flash is the primary AI provider and Ollama is disabled by default."""
+    """Verifies that Gemini 4 Hydrogen is primary default with Carbon deep-reasoning and 3.8 Flash fallback."""
     assert settings.ai_provider == "gemini"
-    assert settings.gemini_model == "gemini-3.8-flash"
+    assert settings.gemini_model == "gemini-4-hydrogen"
+    assert settings.gemini_reasoning_model == "gemini-4-carbon"
+    assert settings.gemini_fallback_model == "gemini-3.8-flash"
     assert getattr(settings, "ollama_enabled", False) is False
 
     provider = get_ai_provider()
@@ -233,19 +235,20 @@ def _make_valid_mp3_bytes(tmp_path: Path, duration: float = 1.0) -> bytes:
     return out.read_bytes()
 
 
-def _make_mock_image_response(img_bytes: bytes, resp_id: str = "resp-img-1"):
-    part = MagicMock()
-    part.inline_data.data = img_bytes
-    cand = MagicMock()
-    cand.content.parts = [part]
-    resp = MagicMock()
-    resp.response_id = resp_id
-    resp.candidates = [cand]
-    return resp
+def _make_mock_image_response(img_bytes: bytes, resp_id: str = "interactions/nano-img-1", status: str = "completed"):
+    inter = MagicMock()
+    inter.id = resp_id
+    inter.status = status
+    inter.output_image = MagicMock()
+    inter.output_image.data = base64.b64encode(img_bytes).decode("ascii")
+    inter.output_image.uri = None
+    inter.outputs = None
+    inter.steps = None
+    return inter
 
 
 def test_google_image_adapter_nano_banana_with_mock_client(test_db, sample_project):
-    """Verifies Nano Banana 2 uses models.generate_content(), validates with Pillow, and records true dimensions."""
+    """Verifies Nano Banana 2.1 uses client.interactions.create(), validates with Pillow, and records true dimensions."""
     import io
     from PIL import Image
 
@@ -255,7 +258,7 @@ def test_google_image_adapter_nano_banana_with_mock_client(test_db, sample_proje
 
     adapter = GoogleImageAdapter(api_key="mock-api-key")
     mock_client = MagicMock()
-    mock_client.models.generate_content.return_value = _make_mock_image_response(valid_jpeg, "resp-img-456")
+    mock_client.interactions.create.return_value = _make_mock_image_response(valid_jpeg, "interactions/nano-456")
     adapter._client = mock_client
 
     res = adapter.generate_image(
@@ -270,22 +273,24 @@ def test_google_image_adapter_nano_banana_with_mock_client(test_db, sample_proje
 
     assert res["status"] == "completed"
     assert res["provider"] == "google_nano_banana"
-    assert res["model"] == "gemini-3.1-flash-image"
+    assert res["model"] == "gemini-nano-banana-2.1"
     assert res["width"] == 640
     assert res["height"] == 480
     assert res["filename"].endswith(".jpg")
     assert res["is_fallback"] is False
     assert Path(res["file_path"]).exists()
 
-    # Verify primary Nano Banana interface is models.generate_content (never interactions.create or generate_images)
-    assert mock_client.models.generate_content.call_count == 1
-    assert mock_client.interactions.create.call_count == 0
+    # Verify primary Nano Banana 2.1 interface is Interactions API (never legacy generate_content/generate_images)
+    assert mock_client.interactions.create.call_count == 1
+    assert mock_client.models.generate_content.call_count == 0
     assert mock_client.models.generate_images.call_count == 0
-    gc_kwargs = mock_client.models.generate_content.call_args[1]
-    assert gc_kwargs["model"] == "gemini-3.1-flash-image"
-    assert gc_kwargs["config"].response_modalities == ["IMAGE"]
-    assert gc_kwargs["config"].image_config.aspect_ratio == "16:9"
-    assert gc_kwargs["config"].image_config.image_size == "1K"
+    ic_kwargs = mock_client.interactions.create.call_args[1]
+    assert ic_kwargs["model"] == "gemini-nano-banana-2.1"
+    assert ic_kwargs["response_format"] == {
+        "type": "image",
+        "aspect_ratio": "16:9",
+        "image_size": "1K",
+    }
 
 
 def test_google_video_adapter_interactions_api_lifecycle(test_db, sample_project, tmp_path):
@@ -334,7 +339,7 @@ def test_google_video_adapter_interactions_api_lifecycle(test_db, sample_project
 
     assert sub["status"] == "processing"
     assert sub["provider"] == "google_omni"
-    assert sub["model"] == "gemini-omni-1.1-flash"
+    assert sub["model"] == "gemini-omni-1.2-flash"
     assert sub["provider_operation_id"] == "interactions/omni-video-98765"
     assert sub["supports_cancellation"] is True
     assert sub["target_duration_seconds"] == 5
@@ -621,7 +626,7 @@ def test_google_drive_status_endpoint(client):
 
 
 def test_studio_system_ai_status_endpoint(client):
-    """Verifies the unified system AI status endpoint exposes Google Cloud AI details and masks secrets."""
+    """Verifies the unified system AI status endpoint exposes verified model catalog, honesty flags, and masks secrets."""
     res = client.get("/api/system/ai-status")
     assert res.status_code == 200
     data = res.json()
@@ -630,11 +635,18 @@ def test_studio_system_ai_status_endpoint(client):
     assert "ollama" in data
     assert "offline_template" in data
     assert "google_models" in data
-    assert data["google_models"]["text"] == "gemini-3.8-flash"
-    assert data["google_models"]["image"] == "gemini-3.1-flash-image"
-    assert data["google_models"]["video"] == "gemini-omni-1.1-flash"
+    assert data["google_models"]["text"] == "gemini-4-hydrogen"
+    assert data["google_models"]["text_reasoning"] == "gemini-4-carbon"
+    assert data["google_models"]["text_fallback"] == "gemini-3.8-flash"
+    assert data["google_models"]["image"] == "gemini-nano-banana-2.1"
+    assert data["google_models"]["video"] == "gemini-omni-1.2-flash"
     assert data["google_models"]["tts"] == "gemini-3.8-flash-tts"
     assert data["google_models"]["music"] == "lyria-3.5"
+    assert "model_catalog" in data
+    assert data["model_catalog"]["gemini-3.1-flash-image"]["status"] == "deprecated"
+    assert data["model_catalog"]["gemini-nano-banana-2.1"]["status"] == "stable"
+    assert data["model_catalog"]["gemini-omni-1.2-flash"]["status"] == "stable"
+    assert data["live_api_tested"] is False
     # Verify no raw API key leak
     assert data["gemini"].get("api_key") is None
     assert "masked_key" in data["gemini"]
@@ -725,7 +737,12 @@ def test_google_video_adapter_multimodal_and_task_filtering(test_db, sample_proj
     assert call_kwargs["input"][0]["type"] == "text"
     assert call_kwargs["input"][1]["type"] == "image"
     assert call_kwargs["input"][1]["mime_type"] == "image/png"
-    assert call_kwargs["response_format"] == {"type": "video", "aspect_ratio": "16:9", "resolution": "720p"}
+    assert call_kwargs["response_format"] == {
+        "type": "video",
+        "aspect_ratio": "16:9",
+        "resolution": "720p",
+        "duration": "5s",
+    }
 
 
 def test_google_music_adapter_clip_vs_full_model_and_fallback_honesty(test_db, sample_project, tmp_path):
@@ -840,28 +857,54 @@ def test_async_jobs_tts_and_music_endpoints(client, sample_project):
 
 
 def test_dynamic_ai_config_runtime_updates(client):
-    """Verifies runtime AI config update affects adapters immediately and masks secrets."""
-    res = client.post(
-        "/api/system/ai-config",
-        json={
-            "gemini_api_key": "AIzaSyNEWKEYFORTESTING1234567890",
-            "google_video_model": "gemini-omni-1.1-flash-custom",
-            "google_tts_model": "gemini-3.8-flash-lite-tts",
-            "google_music_model": "lyria-3-clip-preview",
-            "google_image_model": "gemini-3-pro-image"
-        }
-    )
-    assert res.status_code == 200
-    data = res.json()
-    assert data["status"] == "success"
-    assert data["masked_key"] == "AIza...7890"
+    """Verifies runtime AI config update switches verified models cleanly, rejects deprecated image models, and masks secrets."""
+    from backend.app.config import settings
+    saved_settings = {
+        "gemini_api_key": settings.gemini_api_key,
+        "gemini_model": settings.gemini_model,
+        "google_video_model": settings.google_video_model,
+        "google_tts_model": settings.google_tts_model,
+        "google_music_model": settings.google_music_model,
+        "google_image_model": settings.google_image_model,
+    }
+    saved_env_key = os.environ.get("GEMINI_API_KEY")
+    try:
+        bad_res = client.post(
+            "/api/system/ai-config",
+            json={"google_image_model": "gemini-3.1-flash-image"}
+        )
+        assert bad_res.status_code == 400
 
-    # Verify adapters reflect runtime updates without server restart
-    assert google_video_adapter.model == "gemini-omni-1.1-flash-custom"
-    assert google_tts_adapter.model == "gemini-3.8-flash-lite-tts"
-    assert google_music_adapter.model == "lyria-3-clip-preview"
-    assert google_image_adapter.model == "gemini-3-pro-image"
-    assert google_video_adapter.api_key == "AIzaSyNEWKEYFORTESTING1234567890"
+        res = client.post(
+            "/api/system/ai-config",
+            json={
+                "gemini_api_key": "AIzaSyNEWKEYFORTESTING1234567890",
+                "gemini_model": "gemini-4-carbon",
+                "google_video_model": "gemini-omni-1.1-flash",
+                "google_tts_model": "gemini-3.8-flash-lite-tts",
+                "google_music_model": "lyria-3-clip-preview",
+                "google_image_model": "gemini-3-pro-image"
+            }
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "success"
+        assert data["masked_key"] == "AIza...7890"
+        assert data["gemini_model"] == "gemini-4-carbon"
+
+        # Verify adapters reflect runtime updates without server restart
+        assert google_video_adapter.model == "gemini-omni-1.1-flash"
+        assert google_tts_adapter.model == "gemini-3.8-flash-lite-tts"
+        assert google_music_adapter.model == "lyria-3-clip-preview"
+        assert google_image_adapter.model == "gemini-3-pro-image"
+        assert google_video_adapter.api_key == "AIzaSyNEWKEYFORTESTING1234567890"
+    finally:
+        for k, v in saved_settings.items():
+            setattr(settings, k, v)
+        if saved_env_key is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = saved_env_key
 
 
 def test_google_tts_adapter_multispeaker_contract(test_db, sample_project):
@@ -968,7 +1011,7 @@ def test_google_tts_adapter_multispeaker_contract(test_db, sample_project):
 
 
 def test_google_image_adapter_model_size_limitations(test_db, sample_project):
-    """Verifies model-specific image-size limitations for Flash, Flash Lite, and Pro via models.generate_content."""
+    """Verifies model-specific image-size limitations and rejection of deprecated/unknown models via Interactions API."""
     import io
     from PIL import Image
 
@@ -977,10 +1020,29 @@ def test_google_image_adapter_model_size_limitations(test_db, sample_project):
     buf = io.BytesIO()
     Image.new("RGB", (320, 240), color="red").save(buf, format="JPEG")
     jpeg_bytes = buf.getvalue()
-    mock_client.models.generate_content.side_effect = lambda **kwargs: _make_mock_image_response(jpeg_bytes)
+    mock_client.interactions.create.side_effect = lambda **kwargs: _make_mock_image_response(jpeg_bytes)
     adapter._client = mock_client
 
-    # 1. Flash Lite Image accepts 512 and 1K, but rejects 2K and 4K
+    # 1. Nano Banana 2.1 accepts 1K, 2K, 4K and rejects 512
+    res_nb21_2k = adapter.generate_image(
+        prompt="Wide cityscape",
+        project_id=sample_project.id,
+        db=test_db,
+        model="gemini-nano-banana-2.1",
+        image_size="2K",
+        aspect_ratio="4:1",
+    )
+    assert res_nb21_2k["status"] == "completed"
+    with pytest.raises(ValueError, match="not supported"):
+        adapter.generate_image(
+            prompt="Wide cityscape",
+            project_id=sample_project.id,
+            db=test_db,
+            model="gemini-nano-banana-2.1",
+            image_size="512",
+        )
+
+    # 2. Flash Lite Image accepts 512 and 1K, but rejects 2K and 4K
     res_lite_1k = adapter.generate_image(
         prompt="Cyberpunk drone",
         project_id=sample_project.id,
@@ -1008,7 +1070,7 @@ def test_google_image_adapter_model_size_limitations(test_db, sample_project):
             image_size="4K"
         )
 
-    # 2. Pro Image accepts 1K, 2K, 4K, but rejects 512
+    # 3. Pro Image accepts 1K, 2K, 4K, but rejects 512
     res_pro_2k = adapter.generate_image(
         prompt="Masterpiece painting",
         project_id=sample_project.id,
@@ -1025,6 +1087,24 @@ def test_google_image_adapter_model_size_limitations(test_db, sample_project):
             db=test_db,
             model="gemini-3-pro-image",
             image_size="512"
+        )
+
+    # 4. Deprecated and unknown models are explicitly rejected (never silently falling back)
+    with pytest.raises(ValueError, match="deprecated"):
+        adapter.generate_image(
+            prompt="Deprecated test",
+            project_id=sample_project.id,
+            db=test_db,
+            model="gemini-3.1-flash-image",
+            image_size="1K",
+        )
+    with pytest.raises(ValueError, match="Unknown or unsupported"):
+        adapter.generate_image(
+            prompt="Unknown model test",
+            project_id=sample_project.id,
+            db=test_db,
+            model="gemini-nonexistent-image",
+            image_size="1K",
         )
 
 
@@ -1088,7 +1168,13 @@ def test_google_video_adapter_files_api_upload_workflow(test_db, sample_project,
     video_input = [item for item in call_kwargs["input"] if item.get("type") == "video"][0]
     assert video_input["uri"] == mock_file.uri
     assert video_input["mime_type"] == "video/mp4"
-    assert call_kwargs["response_format"] == {"type": "video", "aspect_ratio": "9:16", "resolution": "1080p"}
+    assert call_kwargs["response_format"] == {
+        "type": "video",
+        "aspect_ratio": "9:16",
+        "resolution": "1080p",
+        "duration": "5s",
+        "delivery": "uri",
+    }
 
 
 def test_cost_accounting_edge_case_provider_succeeded_local_processing_failed(test_db, sample_project):
@@ -1198,8 +1284,8 @@ def test_google_image_adapter_invalid_bytes_and_api_rejection_accounting(test_db
     mock_client = MagicMock()
     adapter._client = mock_client
 
-    # 1. Invalid bytes returned -> fail clearly without faking 1920x1080 or 1024x1024, keep charge
-    mock_client.models.generate_content.return_value = _make_mock_image_response(b"NOT_A_VALID_IMAGE_PAYLOAD")
+    # 1. Invalid bytes returned -> fail clearly without faking dimensions, keep charge (~$0.0336)
+    mock_client.interactions.create.return_value = _make_mock_image_response(b"NOT_A_VALID_IMAGE_PAYLOAD")
     spent_before = sample_project.budget_spent or 0.0
 
     with pytest.raises(GoogleImageAdapterError, match="invalid image bytes"):
@@ -1207,15 +1293,15 @@ def test_google_image_adapter_invalid_bytes_and_api_rejection_accounting(test_db
             prompt="Broken image",
             project_id=sample_project.id,
             db=test_db,
-            model="gemini-3.1-flash-image",
+            model="gemini-nano-banana-2.1",
             image_size="1K"
         )
     test_db.refresh(sample_project)
-    assert round((sample_project.budget_spent or 0.0) - spent_before, 2) == 0.02
+    assert round((sample_project.budget_spent or 0.0) - spent_before, 4) == 0.0336
     assert test_db.query(MediaAsset).filter(MediaAsset.project_id == sample_project.id, MediaAsset.media_type == "image").count() == 0
 
     # 2. Confirmed API 400 rejection -> release reservation and restore budget
-    mock_client.models.generate_content.side_effect = RuntimeError("400 INVALID_ARGUMENT: bad prompt")
+    mock_client.interactions.create.side_effect = RuntimeError("400 INVALID_ARGUMENT: bad prompt")
     spent_before_reject = sample_project.budget_spent
     with pytest.raises(GoogleImageAdapterError, match="Nano Banana generation failed"):
         adapter.generate_image(
@@ -1225,7 +1311,7 @@ def test_google_image_adapter_invalid_bytes_and_api_rejection_accounting(test_db
             image_size="1K"
         )
     test_db.refresh(sample_project)
-    assert round(sample_project.budget_spent - spent_before_reject, 2) == 0.0
+    assert round(sample_project.budget_spent - spent_before_reject, 4) == 0.0
 
 
 def test_google_video_adapter_files_api_timeout_aborts_before_submit(test_db, sample_project, tmp_path):
@@ -1355,7 +1441,7 @@ def test_google_music_adapter_no_blind_retry_and_ffprobe_validation(test_db, sam
         adapter.generate_music_score(project_id=sample_project.id, db=test_db, mood="noir", genre="jazz")
     assert mock_client.interactions.create.call_count == 1
     test_db.refresh(sample_project)
-    assert round((sample_project.budget_spent or 0.0) - spent_0, 2) == 0.05
+    assert round((sample_project.budget_spent or 0.0) - spent_0, 2) == 0.08
 
     # 2. Clear 400 rejection -> 1 call only, reservation released
     mock_client.interactions.create.reset_mock()
@@ -1379,7 +1465,7 @@ def test_google_music_adapter_no_blind_retry_and_ffprobe_validation(test_db, sam
     with pytest.raises(GoogleMusicAdapterError, match="FFprobe"):
         adapter.generate_music_score(project_id=sample_project.id, db=test_db, mood="tense", genre="ambient")
     test_db.refresh(sample_project)
-    assert round(sample_project.budget_spent - spent_2, 2) == 0.05
+    assert round(sample_project.budget_spent - spent_2, 2) == 0.08
 
 
 def test_video_job_recovery_timeout_and_idempotent_reservations(test_db, sample_project, tmp_path):
@@ -1486,8 +1572,8 @@ def test_video_job_recovery_timeout_and_idempotent_reservations(test_db, sample_
     test_db.refresh(sample_project)
     assert job.status == "provider_outcome_unknown"
     assert job.provider_operation_id == "interactions/omni-timeout-op-1"
-    # Budget reservation was NOT released on polling timeout
-    assert round(sample_project.budget_spent - spent_before_video, 2) == 0.15
+    # Budget reservation was NOT released on polling timeout (Omni 1.1 5s rate = $0.50 est)
+    assert round(sample_project.budget_spent - spent_before_video, 2) == 0.50
     res_rec = CostController.get_active_job_reservation(test_db, job.id, sample_project.id)
     assert res_rec is not None
     assert res_rec.action_type == "provider_outcome_unknown"
@@ -1510,8 +1596,8 @@ def test_video_job_recovery_timeout_and_idempotent_reservations(test_db, sample_
     test_db.refresh(sample_project)
     assert job.status == "completed"
     assert job.result_asset_id is not None
-    # Still only charged once ($0.15)
-    assert round(sample_project.budget_spent - spent_before_video, 2) == 0.15
+    # Still only charged once ($0.50)
+    assert round(sample_project.budget_spent - spent_before_video, 2) == 0.50
     assert test_db.query(CostRecord).filter(
         CostRecord.project_id == sample_project.id,
         CostRecord.details.like(f"%job:{job.id}%"),
@@ -1527,12 +1613,13 @@ def test_preflight_budget_enforcement_all_media_types(test_db, sample_project):
     sample_project.budget_spent = 0.0
     test_db.commit()
 
-    # 1. Image ($0.02)
+    # 1. Image (~$0.0336)
     img_adapter = GoogleImageAdapter(api_key="mock-key")
     img_adapter._client = MagicMock()
     with pytest.raises(HTTPException) as exc_img:
         img_adapter.generate_image(prompt="Test", project_id=sample_project.id, db=test_db)
     assert exc_img.value.status_code == 400
+    assert img_adapter._client.interactions.create.call_count == 0
     assert img_adapter._client.models.generate_content.call_count == 0
 
     # 2. TTS ($0.01)
@@ -1543,7 +1630,7 @@ def test_preflight_budget_enforcement_all_media_types(test_db, sample_project):
     assert exc_tts.value.status_code == 400
     assert tts_adapter._client.interactions.create.call_count == 0
 
-    # 3. Music ($0.05)
+    # 3. Music ($0.08)
     music_adapter = GoogleMusicAdapter(api_key="mock-key")
     music_adapter._client = MagicMock()
     with pytest.raises(HTTPException) as exc_mus:
@@ -1551,17 +1638,386 @@ def test_preflight_budget_enforcement_all_media_types(test_db, sample_project):
     assert exc_mus.value.status_code == 400
     assert music_adapter._client.interactions.create.call_count == 0
 
-    # 4. Video job ($0.15)
+    # 4. Video job ($0.35 for 5s 720p Omni 1.2)
     vid_job = generation_job_manager.create_job(
         db=test_db,
         project_id=sample_project.id,
         generation_type="video_generation",
         input_parameters={"prompt": "Scene"},
         provider="google_omni",
-        model="gemini-omni-1.1-flash"
+        model="gemini-omni-1.2-flash"
     )
     with patch.object(google_video_adapter, "submit_video_generation") as mock_vsub:
         with pytest.raises(HTTPException) as exc_vid:
             generation_job_manager._execute_video_job(vid_job, {"prompt": "Scene"}, test_db)
         assert exc_vid.value.status_code == 400
         assert mock_vsub.call_count == 0
+
+
+# ==============================================================================
+# Nov 13, 2026 Upgrade & Critical Billing-Safety Regression Tests
+# ==============================================================================
+
+
+def test_video_dispatch_started_before_provider_and_missing_id_anomaly(test_db, sample_project):
+    """
+    CRITICAL BILLING SAFETY:
+    1. `dispatch_state='dispatch_started'` is persisted durably BEFORE calling Google.
+    2. When `interactions.create()` returns WITHOUT `.id`, NO synthetic `uuid4()` is invented;
+       `SubmissionResponseAnomalyError` transitions job to `provider_outcome_unknown`, keeps
+       `provider_operation_id=None`, preserves budget reservation, and blocks auto-retry!
+    """
+    from backend.app.services.generation_job_manager import DuplicateGenerationRiskError
+    from backend.app.services.provider_error_classifier import SubmissionResponseAnomalyError
+
+    scene = Scene(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_number=1,
+        slugline="EXT. BRIDGE",
+        script_content="Rain on steel."
+    )
+    test_db.add(scene)
+    test_db.flush()
+    shot = Shot(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_id=scene.id,
+        shot_code="SC_ANOM_01",
+        video_prompt="Wide bridge shot"
+    )
+    test_db.add(shot)
+    test_db.commit()
+
+    seen_dispatch_states = []
+
+    adapter = GoogleVideoAdapter(api_key="mock-key")
+    mock_client = MagicMock()
+    # Anomaly: interaction object lacks a valid string `id`!
+    malformed_inter = MagicMock()
+    malformed_inter.id = None
+    malformed_inter.status = "processing"
+
+    def _capture_state_on_create(**kwargs):
+        # Verify DB already committed dispatch_started BEFORE Google call runs!
+        test_db.expire_all()
+        cur_job = test_db.query(GenerationJob).filter(GenerationJob.shot_id == shot.id).first()
+        seen_dispatch_states.append(cur_job.dispatch_state if cur_job else None)
+        return malformed_inter
+
+    mock_client.interactions.create.side_effect = _capture_state_on_create
+    adapter._client = mock_client
+
+    # Direct adapter test also confirms SubmissionResponseAnomalyError (never uuid4)
+    with pytest.raises(SubmissionResponseAnomalyError):
+        adapter.submit_video_generation(
+            prompt=shot.video_prompt,
+            project_id=sample_project.id,
+            shot_id=shot.id,
+            db=test_db,
+        )
+
+    # Full GenerationJobManager test with missing interaction.id
+    job = generation_job_manager.create_job(
+        db=test_db,
+        project_id=sample_project.id,
+        shot_id=shot.id,
+        generation_type="video_generation",
+        input_parameters={"prompt": shot.video_prompt},
+        provider="google_omni",
+        model="gemini-omni-1.2-flash",
+    )
+    assert job.dispatch_state == "not_dispatched"
+
+    spent_before = sample_project.budget_spent or 0.0
+    seen_dispatch_states.clear()
+    with patch.object(google_video_adapter, "_api_key", "mock-key"), \
+         patch.object(google_video_adapter, "_client", mock_client), \
+         patch.object(google_video_adapter, "_injected_client", True):
+        generation_job_manager._execute_video_job(job, {"prompt": shot.video_prompt}, test_db)
+
+    assert seen_dispatch_states == ["dispatch_started"]
+    test_db.refresh(job)
+    test_db.refresh(sample_project)
+    assert job.status == "provider_outcome_unknown"
+    assert job.dispatch_state == "provider_outcome_unknown"
+    assert job.provider_operation_id is None
+    # Reservation preserved ($0.35 for 5s 720p Omni 1.2)
+    assert round(sample_project.budget_spent - spent_before, 4) == 0.35
+
+    # Automatic retry MUST be blocked without explicit acknowledgement
+    with pytest.raises(DuplicateGenerationRiskError):
+        generation_job_manager.retry_job(test_db, job.id, acknowledge_new_generation=False)
+
+
+def test_crash_after_dispatch_started_recovery_preserves_reservation_and_blocks_retry(client, test_db, sample_project):
+    """
+    Simulates crash right after `dispatch_started` committed (before `provider_operation_id` saved):
+    - `recover_interrupted_jobs` + `recover_interrupted_reservations` NEVER refund/release reservation
+    - `job.status == 'provider_outcome_unknown'`, `job.dispatch_state == 'provider_outcome_unknown'`
+    - `POST /api/jobs/generation/{id}/retry` returns HTTP 409 unless `acknowledge_new_generation=true`
+    - `POST /api/jobs/generation/{id}/reconcile` with `confirmed_not_billed` releases cleanly!
+    """
+    from backend.app.services.cost_controller import CostController
+
+    job = generation_job_manager.create_job(
+        db=test_db,
+        project_id=sample_project.id,
+        generation_type="video_generation",
+        input_parameters={"prompt": "Crash mid dispatch"},
+        provider="google_omni",
+        model="gemini-omni-1.2-flash",
+    )
+    reservation = CostController.reserve_budget(
+        db=test_db,
+        project_id=sample_project.id,
+        estimated_cost=0.35,
+        operation="video_generation",
+        provider="google_omni",
+        model="gemini-omni-1.2-flash",
+        job_id=job.id,
+    )
+    job.status = "processing"
+    job.dispatch_state = "dispatch_started"
+    job.provider_operation_id = None
+    test_db.commit()
+
+    spent_before_recovery = sample_project.budget_spent
+    generation_job_manager.recover_interrupted_jobs(test_db)
+
+    test_db.refresh(job)
+    test_db.refresh(sample_project)
+    test_db.refresh(reservation)
+    assert job.status == "provider_outcome_unknown"
+    assert job.dispatch_state == "provider_outcome_unknown"
+    assert job.provider_operation_id is None
+    assert reservation.action_type == "provider_outcome_unknown"
+    # Budget must NOT be refunded!
+    assert round(sample_project.budget_spent - spent_before_recovery, 4) == 0.0
+
+    # HTTP retry without explicit ack -> 409 Conflict
+    r_block = client.post(f"/api/jobs/generation/{job.id}/retry")
+    assert r_block.status_code == 409
+
+    # Explicit reconciliation confirming not billed -> cleanly refunds reservation
+    r_rec = client.post(
+        f"/api/jobs/generation/{job.id}/reconcile",
+        json={"remote_status": "confirmed_not_billed", "notes": "Checked Google AI Studio usage log: zero runs."},
+    )
+    assert r_rec.status_code == 200
+    test_db.refresh(job)
+    test_db.refresh(sample_project)
+    assert job.dispatch_state == "provider_failed"
+    assert job.status == "failed"
+    assert round(sample_project.budget_spent - (spent_before_recovery - 0.35), 4) == 0.0
+
+    # After reconciliation settled it as failed, retry IS allowed when desired (new job attempt)
+    with patch.object(generation_job_manager, "launch_job_async"):
+        r_retry = client.post(f"/api/jobs/generation/{job.id}/retry", json={"acknowledge_new_generation": True})
+        assert r_retry.status_code == 200
+
+
+def test_missing_output_never_releases_reservation_across_all_media(test_db, sample_project):
+    """
+    Missing output bytes when provider returned completed/accepted must NEVER auto-refund
+    across Image, Video, TTS, or Music. Only confirmed failure/rejection releases.
+    """
+    from backend.app.services.google_image_adapter import GoogleImageAdapterError
+    from backend.app.services.google_tts_adapter import GoogleTTSAdapterError
+    from backend.app.services.google_music_adapter import GoogleMusicAdapterError
+
+    # 1. Image completed with output_image=None -> error + charge preserved
+    img_adapter = GoogleImageAdapter(api_key="mock-key")
+    mock_img_client = MagicMock()
+    empty_img_inter = MagicMock()
+    empty_img_inter.id = "interactions/empty-img"
+    empty_img_inter.status = "completed"
+    empty_img_inter.output_image = None
+    empty_img_inter.outputs = None
+    empty_img_inter.steps = None
+    mock_img_client.interactions.create.return_value = empty_img_inter
+    img_adapter._client = mock_img_client
+
+    spent0 = sample_project.budget_spent or 0.0
+    with pytest.raises(GoogleImageAdapterError, match="no retrievable image bytes"):
+        img_adapter.generate_image(prompt="Missing img", project_id=sample_project.id, db=test_db)
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - spent0, 4) == 0.0336
+
+    # 2. TTS completed with empty output -> error + charge preserved
+    tts_adapter = GoogleTTSAdapter(api_key="mock-key")
+    mock_tts_client = MagicMock()
+    empty_tts_inter = MagicMock()
+    empty_tts_inter.id = "interactions/empty-tts"
+    empty_tts_inter.status = "completed"
+    empty_tts_inter.output_audio = None
+    empty_tts_inter.outputs = None
+    mock_tts_client.interactions.create.return_value = empty_tts_inter
+    tts_adapter._client = mock_tts_client
+
+    spent1 = sample_project.budget_spent
+    with pytest.raises(GoogleTTSAdapterError, match="no audio candidates"):
+        tts_adapter.generate_dialogue_speech(text="Hi", project_id=sample_project.id, db=test_db)
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - spent1, 4) == 0.01
+
+    # 3. Music completed with empty output -> error + charge preserved
+    mus_adapter = GoogleMusicAdapter(api_key="mock-key")
+    mock_mus_client = MagicMock()
+    empty_mus_inter = MagicMock()
+    empty_mus_inter.id = "interactions/empty-mus"
+    empty_mus_inter.status = "completed"
+    empty_mus_inter.output_audio = None
+    empty_mus_inter.outputs = None
+    mock_mus_client.interactions.create.return_value = empty_mus_inter
+    mus_adapter._client = mock_mus_client
+
+    spent2 = sample_project.budget_spent
+    with pytest.raises(GoogleMusicAdapterError, match="no audio content"):
+        mus_adapter.generate_music_score(project_id=sample_project.id, db=test_db)
+    test_db.refresh(sample_project)
+    assert round(sample_project.budget_spent - spent2, 4) == 0.08
+
+    # 4. Video poll completed with no video bytes/uri -> status='output_missing' + charge preserved
+    vid_adapter = GoogleVideoAdapter(api_key="mock-key")
+    mock_vid_client = MagicMock()
+    empty_vid_inter = MagicMock()
+    empty_vid_inter.status = "completed"
+    empty_vid_inter.output_video = None
+    empty_vid_inter.output_audio = None
+    empty_vid_inter.outputs = None
+    mock_vid_client.interactions.get.return_value = empty_vid_inter
+    vid_adapter._client = mock_vid_client
+
+    poll_res = vid_adapter.poll_operation_status("interactions/empty-vid")
+    assert poll_res["status"] == "output_missing"
+
+
+def test_structured_provider_error_classification_and_omni12_capabilities(test_db, sample_project, tmp_path):
+    """
+    Verifies structured HTTP code extraction (not just string matching) and Omni 1.2 Flash features:
+    - Structured 400 error without '400' in message still releases reservation cleanly.
+    - Structured 504/503 error or TimeoutError preserves reservation.
+    - Omni 1.2 Flash supports 4k, 12s duration, delivery='uri', upscale with video input, and 6 ref images.
+    """
+    from backend.app.services.provider_error_classifier import classify_provider_exception
+
+    class CustomSDKClientError(Exception):
+        def __init__(self, msg, status_code):
+            super().__init__(msg)
+            self.status_code = status_code
+
+    err_400 = CustomSDKClientError("Bad prompt parameter rejected by API", status_code=400)
+    cls_400 = classify_provider_exception(err_400)
+    assert cls_400.category == "rejected_before_generation"
+    assert cls_400.http_status == 400
+
+    err_504 = CustomSDKClientError("Upstream gateway error", status_code=504)
+    cls_504 = classify_provider_exception(err_504)
+    assert cls_504.category == "provider_outcome_unknown"
+    assert cls_504.http_status == 504
+
+    # Omni 1.2 Flash 4k + 6 reference images
+    scene = Scene(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_number=1,
+        slugline="EXT. SKYLINE",
+        script_content="Wide skyline."
+    )
+    test_db.add(scene)
+    test_db.flush()
+    shot = Shot(
+        id=str(uuid.uuid4()),
+        project_id=sample_project.id,
+        scene_id=scene.id,
+        shot_code="SC_OMNI12_01",
+        video_prompt="Epic 4k skyline sweep"
+    )
+    test_db.add(shot)
+    test_db.commit()
+
+    ref_imgs = []
+    for i in range(6):
+        p = tmp_path / f"ref_{i}.png"
+        p.write_bytes(b"\x89PNG\r\n\x1a\nFAKEPNG")
+        ref_imgs.append(str(p))
+
+    adapter = GoogleVideoAdapter(api_key="mock-key", model="gemini-omni-1.2-flash")
+    mock_client = MagicMock()
+    mock_inter = MagicMock()
+    mock_inter.id = "interactions/omni12-4k-refs"
+    mock_client.interactions.create.return_value = mock_inter
+    adapter._client = mock_client
+
+    res = adapter.submit_video_generation(
+        prompt="Epic sweep",
+        project_id=sample_project.id,
+        shot_id=shot.id,
+        db=test_db,
+        duration_seconds=12,
+        resolution="4K",
+        reference_image_paths=ref_imgs,
+    )
+    assert res["model"] == "gemini-omni-1.2-flash"
+    assert res["task"] == "reference_to_video"
+    assert res["resolution"] == "4k"
+    assert res["delivery"] == "uri"
+    assert res["target_duration_seconds"] == 12
+    kwargs = mock_client.interactions.create.call_args[1]
+    assert kwargs["response_format"] == {
+        "type": "video",
+        "aspect_ratio": "16:9",
+        "resolution": "4k",
+        "duration": "12s",
+        "delivery": "uri",
+    }
+
+    # 7 reference images rejected
+    p7 = tmp_path / "ref_7.png"
+    p7.write_bytes(b"PNG")
+    with pytest.raises(ValueError, match="at most 6"):
+        adapter.submit_video_generation(
+            prompt="Too many refs",
+            project_id=sample_project.id,
+            shot_id=shot.id,
+            db=test_db,
+            reference_image_paths=ref_imgs + [str(p7)],
+        )
+
+
+def test_ai_status_live_api_tested_honesty_with_and_without_key(client, tmp_path):
+    """Verifies live_api_tested is NEVER inferred from API key presence alone, only real verification logs."""
+    from backend.app.config import settings
+    saved_key = settings.gemini_api_key
+    saved_env_key = os.environ.get("GEMINI_API_KEY")
+    try:
+        # Even when an API key is configured, live_api_tested stays False unless verification file passes
+        client.post("/api/system/ai-config", json={"gemini_api_key": "AIzaSyMOCKKEY1234567890"})
+        res = client.get("/api/system/ai-status")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["gemini"]["api_key_configured"] is True
+        assert data["live_api_tested"] is False
+        assert data["model_catalog"]["gemini-4-hydrogen"]["live_api_tested"] is False
+        assert data["model_catalog"]["gemini-4-hydrogen"]["mock_contract_tested"] is True
+
+        # Verify reading an explicit PASS record activates ONLY that exact model
+        from backend.app.services.google_model_catalog import build_model_catalog_payload
+        ver_file = tmp_path / "live_api_verification.json"
+        ver_file.write_text(json.dumps({
+            "results": {
+                "gemini-4-hydrogen": {"status": "PASS", "tested_at": "2026-11-13T10:00:00Z"}
+            }
+        }), encoding="utf-8")
+        payload = build_model_catalog_payload(verification_file=ver_file)
+        assert payload["any_live_api_tested"] is True
+        assert payload["catalog"]["gemini-4-hydrogen"]["live_api_tested"] is True
+        assert payload["catalog"]["gemini-omni-1.2-flash"]["live_api_tested"] is False
+    finally:
+        settings.gemini_api_key = saved_key
+        if saved_env_key is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = saved_env_key
+

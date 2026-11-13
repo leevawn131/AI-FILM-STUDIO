@@ -308,16 +308,11 @@ class GeminiProvider(BaseAIProvider):
         }
 
     def get_available_models(self) -> List[str]:
+        from backend.app.services.google_model_catalog import MODEL_CATALOG
         return [
-            "gemini-3.8-flash",
-            "gemini-3.1-flash-image",
-            "gemini-3-pro-image",
-            "gemini-3.1-flash-lite-image",
-            "gemini-omni-1.1-flash",
-            "gemini-3.8-flash-tts",
-            "gemini-3.8-flash-lite-tts",
-            "lyria-3.5",
-            "lyria-3-clip-preview"
+            model_id
+            for model_id, info in MODEL_CATALOG.items()
+            if info.get("status") != "deprecated"
         ]
 
     def _execute_with_retry(self, fn, *args, **kwargs):

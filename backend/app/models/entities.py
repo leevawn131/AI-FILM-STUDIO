@@ -296,9 +296,10 @@ class GenerationJob(Base):
     generation_type = Column(String(64), nullable=False, index=True) # text_scene, structured_breakdown, character_design, location_design, cinematography, continuity, image_generation, video_generation
 
     input_parameters = Column(Text, default="{}") # JSON encoded input payload
-    status = Column(String(32), nullable=False, default="pending", index=True) # pending, processing, completed, failed, cancelled
+    status = Column(String(32), nullable=False, default="pending", index=True) # pending, processing, completed, failed, cancelled, provider_outcome_unknown
+    dispatch_state = Column(String(32), nullable=False, default="not_dispatched", index=True) # not_dispatched, dispatch_started, provider_operation_known, provider_outcome_unknown, provider_completed, provider_failed, local_processing_failed
 
-    provider_operation_id = Column(String(256), nullable=True, index=True) # e.g. Google Veo operation resource name
+    provider_operation_id = Column(String(256), nullable=True, index=True) # e.g. Google Interaction / Veo operation ID
     supports_cancellation = Column(Boolean, default=False)
 
     result_metadata = Column(Text, default="{}") # JSON encoded response metadata, token counts, etc.

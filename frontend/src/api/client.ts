@@ -969,6 +969,26 @@ export async function fetchCheckpointDetail(
   return parseApiResponse<PipelineCheckpointDetail>(res, `Failed to fetch checkpoint ${checkpointType}`);
 }
 
+export interface ModelCatalogEntry {
+  model_id: string;
+  display_name: string;
+  category: string;
+  status: 'stable' | 'fallback' | 'deprecated' | 'unknown';
+  role: string;
+  api_surface: string;
+  supported_image_sizes?: string[];
+  supported_aspect_ratios?: string[];
+  supported_resolutions?: string[];
+  supported_tasks?: string[];
+  capabilities: string[];
+  pricing_estimate: Record<string, any>;
+  mock_contract_tested: boolean;
+  live_api_tested: boolean;
+  live_verified_at?: string | null;
+  replacement_model?: string;
+  notes?: string;
+}
+
 export interface AIStatusResponse {
   primary_provider?: string;
   active_provider: string;
@@ -988,6 +1008,8 @@ export interface AIStatusResponse {
     configured_model?: string;
     has_client?: boolean;
     note?: string;
+    api_key_configured?: boolean;
+    masked_key?: string;
   };
   offline_template: {
     provider: string;
@@ -1002,16 +1024,23 @@ export interface AIStatusResponse {
   };
   google_models?: {
     text: string;
+    text_reasoning?: string;
+    text_fallback?: string;
     image: string;
     image_pro?: string;
     image_lite?: string;
     video: string;
+    video_fallback?: string;
     tts?: string;
     tts_lite?: string;
     music?: string;
     music_clip?: string;
     image_sizes?: Record<string, string[]>;
   };
+  model_catalog?: Record<string, ModelCatalogEntry>;
+  selected_models?: Record<string, ModelCatalogEntry>;
+  live_api_tested?: boolean;
+  pricing_note?: string;
 }
 
 export async function fetchAIStatus(): Promise<AIStatusResponse> {
@@ -1023,11 +1052,20 @@ export async function updateAIConfig(data: {
   provider?: string;
   gemini_api_key?: string;
   gemini_model?: string;
+  gemini_reasoning_model?: string;
+  gemini_fallback_model?: string;
   ollama_enabled?: boolean;
   ollama_host?: string;
   ollama_model?: string;
   google_image_model?: string;
+  google_image_pro_model?: string;
+  google_image_lite_model?: string;
   google_video_model?: string;
+  google_video_fallback_model?: string;
+  google_tts_model?: string;
+  google_tts_lite_model?: string;
+  google_music_model?: string;
+  google_music_clip_model?: string;
 }): Promise<any> {
   const res = await fetch(`${API_BASE}/system/ai-config`, {
     method: 'POST',
@@ -1050,7 +1088,15 @@ export interface GenerationJob {
   model: string;
   generation_type: string;
   input_parameters?: string;
-  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'provider_outcome_unknown';
+  dispatch_state?:
+    | 'not_dispatched'
+    | 'dispatch_started'
+    | 'provider_operation_known'
+    | 'provider_outcome_unknown'
+    | 'provider_completed'
+    | 'provider_failed'
+    | 'local_processing_failed';
   provider_operation_id?: string | null;
   supports_cancellation: boolean;
   result_metadata?: string;
@@ -1080,6 +1126,9 @@ export async function submitImageGenerationJob(payload: {
   project_id: string;
   prompt: string;
   aspect_ratio?: string;
+  image_size?: string;
+  model?: string;
+  tier?: string;
   entity_type?: string;
   entity_id?: string;
   negative_prompt?: string;
@@ -1098,7 +1147,13 @@ export async function submitVideoGenerationJob(payload: {
   prompt: string;
   duration_seconds?: number;
   aspect_ratio?: string;
+  resolution?: string;
+  task?: string;
+  model?: string;
   negative_prompt?: string;
+  input_image_path?: string;
+  input_video_path?: string;
+  reference_image_paths?: string[];
 }): Promise<GenerationJob> {
   const res = await fetch(`${API_BASE}/jobs/generation/video`, {
     method: 'POST',
@@ -1184,16 +1239,38 @@ export async function pollGenerationJob(
     if (job.status === 'cancelled') {
       throw new Error('Generation job was cancelled');
     }
+    if (job.status === 'provider_outcome_unknown') {
+      throw new Error(
+        job.error_details || 'Provider outcome is unknown; budget reservation is preserved until reconciled.'
+      );
+    }
     await new Promise((r) => setTimeout(r, intervalMs));
   }
   throw new Error('Generation job timed out while waiting for completion');
 }
 
-export async function retryGenerationJob(jobId: string): Promise<GenerationJob> {
+export async function retryGenerationJob(
+  jobId: string,
+  acknowledgeNewGeneration = false
+): Promise<GenerationJob> {
   const res = await fetch(`${API_BASE}/jobs/generation/${jobId}/retry`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ acknowledge_new_generation: acknowledgeNewGeneration }),
   });
   return parseApiResponse<GenerationJob>(res, 'Failed to retry generation job');
+}
+
+export async function reconcileGenerationJob(
+  jobId: string,
+  payload?: { remote_status?: string; notes?: string }
+): Promise<GenerationJob> {
+  const res = await fetch(`${API_BASE}/jobs/generation/${jobId}/reconcile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  return parseApiResponse<GenerationJob>(res, 'Failed to reconcile generation job');
 }
 
 export async function fetchGoogleDriveStatus(): Promise<any> {

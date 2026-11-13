@@ -90,24 +90,24 @@ ACCOUNTING_OPERATIONS = {
     },
     "image_generation": {
         "provider": "google_nano_banana",
-        "default_model": getattr(settings, "google_image_model", "gemini-3.1-flash-image"),
-        "description": "Google Nano Banana 2 image generation",
+        "default_model": getattr(settings, "google_image_model", "gemini-nano-banana-2.1"),
+        "description": "Google Nano Banana 2.1 image generation via Interactions API (estimated)",
         "consumes_flow_credits": False,
         "default_flow_credits": 0.0,
-        "default_estimated_cost": 0.02
+        "default_estimated_cost": 0.034
     },
     "video_generation": {
         "provider": "google_omni",
-        "default_model": getattr(settings, "google_video_model", "gemini-omni-1.1-flash"),
-        "description": "Google Gemini Omni Flash 1.1 video generation via Interactions API",
+        "default_model": getattr(settings, "google_video_model", "gemini-omni-1.2-flash"),
+        "description": "Google Gemini Omni 1.2 Flash video generation via Interactions API (estimated)",
         "consumes_flow_credits": False,
         "default_flow_credits": 0.0,
-        "default_estimated_cost": 0.15
+        "default_estimated_cost": 0.35
     },
     "tts_generation": {
         "provider": "google_tts",
         "default_model": getattr(settings, "google_tts_model", "gemini-3.8-flash-tts"),
-        "description": "Google Gemini TTS dialogue speech synthesis",
+        "description": "Google Gemini TTS dialogue speech synthesis (estimated)",
         "consumes_flow_credits": False,
         "default_flow_credits": 0.0,
         "default_estimated_cost": 0.01
@@ -115,10 +115,10 @@ ACCOUNTING_OPERATIONS = {
     "music_generation": {
         "provider": "google_lyria",
         "default_model": getattr(settings, "google_music_model", "lyria-3.5"),
-        "description": "Google Lyria 3.5 score music generation via Interactions API",
+        "description": "Google Lyria 3.5 score music generation via Interactions API (estimated)",
         "consumes_flow_credits": False,
         "default_flow_credits": 0.0,
-        "default_estimated_cost": 0.05
+        "default_estimated_cost": 0.08
     }
 }
 
@@ -131,10 +131,10 @@ COST_RATES = {
     "continuity_check": {"credits": 0.5, "cost_usd": 0.0},
     "audio_synthesis": {"credits": 1.5, "cost_usd": 0.0},
     "video_render": {"credits": 3.0, "cost_usd": 0.0},
-    "image_generation": {"credits": 0.0, "cost_usd": 0.02},
-    "video_generation": {"credits": 0.0, "cost_usd": 0.15},
+    "image_generation": {"credits": 0.0, "cost_usd": 0.034},
+    "video_generation": {"credits": 0.0, "cost_usd": 0.35},
     "tts_generation": {"credits": 0.0, "cost_usd": 0.01},
-    "music_generation": {"credits": 0.0, "cost_usd": 0.05},
+    "music_generation": {"credits": 0.0, "cost_usd": 0.08},
 }
 
 class CostController:
@@ -614,7 +614,7 @@ class CostController:
 
             # Ambiguous / polling timeout state: preserve reserved budget without refunding
             if local_processing_status in ("provider_outcome_unknown", "outcome_unknown"):
-                if rec.action_type == op_name:
+                if rec.action_type == "provider_outcome_unknown":
                     return rec
                 rec.action_type = "provider_outcome_unknown"
                 rec.details = (
@@ -651,10 +651,16 @@ class CostController:
 
             rec.action_type = op_name
 
-            if local_processing_status == "failed":
+            if local_processing_status in ("failed", "local_processing_failed"):
                 rec.details = (
                     f"Provider generation succeeded ({rec.provider} {rec.model}); "
                     f"local media processing failed: {error_details or 'Unknown error'}"
+                    f"{job_suffix}"
+                )
+            elif local_processing_status == "output_unretrieved":
+                rec.details = (
+                    f"Provider call finished/accepted ({rec.provider} {rec.model}); "
+                    f"output payload missing or unretrieved (charge preserved): {error_details or 'empty output'}"
                     f"{job_suffix}"
                 )
             else:
@@ -720,8 +726,16 @@ class CostController:
         project_id: str
     ) -> Optional[CostRecord]:
         """
-        Releases any unfinalized budget reservation for a job that terminated before reaching the cloud provider.
+        Inspects any unfinalized budget reservation for an orphaned job.
+        - Releases ONLY if `dispatch_state == 'not_dispatched'` and no `provider_operation_id` exists
+          (or no GenerationJob exists).
+        - If `dispatch_state` is `dispatch_started` or `provider_outcome_unknown` (crash during/after
+          dispatch without known operation ID), NEVER releases; marks as `provider_outcome_unknown`
+          so billing accountability is preserved.
+        - If `provider_operation_id` is known, preserves `budget_reservation` for polling resumption.
         """
+        from backend.app.models.entities import GenerationJob
+
         target_details = f"job:{job_id}"
         reservation = (
             db.query(CostRecord)
@@ -732,33 +746,71 @@ class CostController:
             )
             .first()
         )
-        if reservation:
-            refund = db.query(CostRecord).filter(
-                CostRecord.operation_identity == f"refund_{reservation.id}"
-            ).first()
-            if not refund:
-                logger.info(f"Releasing orphaned budget reservation {reservation.id} for job {job_id}")
-                return CostController.release_reservation(
+        if not reservation:
+            return None
+
+        refund = db.query(CostRecord).filter(
+            CostRecord.operation_identity == f"refund_{reservation.id}"
+        ).first()
+        if refund:
+            return None
+
+        job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+        if job is not None:
+            dispatch_state = getattr(job, "dispatch_state", "not_dispatched") or "not_dispatched"
+            if getattr(job, "provider_operation_id", None):
+                logger.info(
+                    f"Preserving budget reservation {reservation.id} for job {job_id} "
+                    f"with provider_operation_id={job.provider_operation_id}"
+                )
+                return None
+            if dispatch_state in ("dispatch_started", "provider_outcome_unknown") or job.status == "provider_outcome_unknown":
+                logger.warning(
+                    f"Preserving budget reservation {reservation.id} as provider_outcome_unknown "
+                    f"for job {job_id} interrupted during dispatch ({dispatch_state})"
+                )
+                CostController.finalize_reservation(
                     db=db,
                     project_id=project_id,
                     reservation_record=reservation,
-                    reason="orphaned_job_local_backend_restart"
+                    local_processing_status="provider_outcome_unknown",
+                    error_details="interrupted_during_dispatch_without_operation_id",
                 )
-        return None
+                return None
+            if dispatch_state != "not_dispatched":
+                logger.warning(
+                    f"Preserving budget reservation {reservation.id} for job {job_id} "
+                    f"in dispatch_state={dispatch_state}"
+                )
+                return None
+
+        logger.info(f"Releasing orphaned pre-dispatch budget reservation {reservation.id} for job {job_id}")
+        return CostController.release_reservation(
+            db=db,
+            project_id=project_id,
+            reservation_record=reservation,
+            reason="orphaned_job_local_backend_restart"
+        )
 
     @staticmethod
     def recover_interrupted_reservations(db: Session) -> int:
         """
-        Scans for all outstanding unrefunded 'budget_reservation' records across projects
-        that are associated with dead jobs and safely releases them.
+        Scans outstanding unrefunded 'budget_reservation' records across projects and handles
+        them strictly according to durable `dispatch_state`:
+        - Releases ONLY confirmed pre-dispatch / rejected-before-generation orphans.
+        - Transitions `dispatch_started` (no operation ID) orphans to `provider_outcome_unknown`
+          and preserves reserved budget without refunding.
+        - Leaves `provider_operation_known` / active jobs untouched so polling can resume.
         """
         from backend.app.models.entities import GenerationJob
+
         reservations = (
             db.query(CostRecord)
             .filter(CostRecord.action_type == "budget_reservation")
             .all()
         )
         released_count = 0
+        transitioned_count = 0
         for res_rec in reservations:
             refund = db.query(CostRecord).filter(
                 CostRecord.operation_identity == f"refund_{res_rec.id}"
@@ -766,21 +818,37 @@ class CostController:
             if refund:
                 continue
 
-            is_orphaned = True
+            should_release = True
+            should_mark_unknown = False
             if "job:" in (res_rec.details or ""):
                 try:
                     parts = res_rec.details.split("job:")[1].split()
-                    job_id = parts[0].strip() if parts else ""
-                    active_job = db.query(GenerationJob).filter(
-                        GenerationJob.id == job_id,
-                        GenerationJob.status.in_(["pending", "processing"])
-                    ).first()
-                    if active_job and active_job.provider_operation_id:
-                        is_orphaned = False
+                    job_id = parts[0].strip().rstrip(".,;:)") if parts else ""
+                    job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first() if job_id else None
+                    if job is not None:
+                        dispatch_state = getattr(job, "dispatch_state", "not_dispatched") or "not_dispatched"
+                        if job.status in ("pending", "processing") and job.provider_operation_id:
+                            should_release = False
+                        elif dispatch_state in ("dispatch_started", "provider_outcome_unknown") or job.status == "provider_outcome_unknown":
+                            should_release = False
+                            if not job.provider_operation_id:
+                                should_mark_unknown = True
+                        elif dispatch_state not in ("not_dispatched",):
+                            # e.g., provider_completed / local_processing_failed / provider_operation_known
+                            should_release = False
                 except Exception:
-                    is_orphaned = True
+                    should_release = False
 
-            if is_orphaned:
+            if should_mark_unknown:
+                CostController.finalize_reservation(
+                    db=db,
+                    project_id=res_rec.project_id,
+                    reservation_record=res_rec,
+                    local_processing_status="provider_outcome_unknown",
+                    error_details="interrupted_dispatch_without_operation_id",
+                )
+                transitioned_count += 1
+            elif should_release:
                 CostController.release_reservation(
                     db=db,
                     project_id=res_rec.project_id,
@@ -789,7 +857,7 @@ class CostController:
                 )
                 released_count += 1
 
-        if released_count > 0:
+        if released_count > 0 or transitioned_count > 0:
             db.commit()
         return released_count
 

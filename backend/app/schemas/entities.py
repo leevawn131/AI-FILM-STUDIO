@@ -324,6 +324,7 @@ class GenerationJobResponse(BaseModel):
     generation_type: str
     input_parameters: Optional[str] = "{}"
     status: str
+    dispatch_state: str = "not_dispatched"
     provider_operation_id: Optional[str] = None
     supports_cancellation: bool = False
     result_metadata: Optional[str] = "{}"
@@ -341,6 +342,9 @@ class GenerateImageRequest(BaseModel):
     project_id: str
     prompt: str
     aspect_ratio: Optional[str] = "16:9"
+    image_size: Optional[str] = "1K"
+    model: Optional[str] = None
+    tier: Optional[str] = "standard"
     entity_type: Optional[str] = None
     entity_id: Optional[str] = None
     negative_prompt: Optional[str] = None
@@ -352,7 +356,13 @@ class GenerateVideoRequest(BaseModel):
     prompt: str
     duration_seconds: Optional[int] = 5
     aspect_ratio: Optional[str] = "16:9"
+    resolution: Optional[str] = "720p"
+    task: Optional[str] = "text_to_video"
+    model: Optional[str] = None
     negative_prompt: Optional[str] = None
+    input_image_path: Optional[str] = None
+    input_video_path: Optional[str] = None
+    reference_image_paths: Optional[List[str]] = None
 
 
 class GenerateTTSRequest(BaseModel):

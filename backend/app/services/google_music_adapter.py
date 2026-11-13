@@ -34,6 +34,8 @@ from backend.app.config import settings
 from backend.app.models.entities import Project, Scene, AudioTrack, MediaAsset
 from backend.app.services.cost_controller import cost_controller
 from backend.app.services.ffmpeg_service import ffmpeg_service
+from backend.app.services.google_model_catalog import estimate_music_cost_usd
+from backend.app.services.provider_error_classifier import classify_provider_exception
 
 logger = logging.getLogger("google_music_adapter")
 
@@ -44,15 +46,8 @@ class GoogleMusicAdapterError(Exception):
 
 
 def _is_ambiguous_provider_error(err: Exception) -> bool:
-    """Returns True when an error leaves remote Lyria execution outcome ambiguous."""
-    if isinstance(err, (TimeoutError, socket.timeout, ConnectionError)):
-        return True
-    msg = str(err).lower()
-    rejection_markers = ("400", "401", "403", "404", "422", "429", "invalid_argument", "permission_denied", "unauthenticated", "api key")
-    if any(m in msg for m in rejection_markers):
-        return False
-    ambiguous_markers = ("timeout", "timed out", "504", "gateway", "connection reset", "broken pipe", "remote end closed", "incomplete read")
-    return any(m in msg for m in ambiguous_markers)
+    """Delegates to structured error classifier; treats timeouts/5xx/unknowns as ambiguous."""
+    return classify_provider_exception(err).is_outcome_unknown
 
 
 def _get_interaction_status(interaction: Any) -> Optional[str]:
@@ -227,7 +222,7 @@ class GoogleMusicAdapter:
         response_format = {"type": "audio", "mime_type": "audio/mp3"}
 
         # Pre-flight budget reservation BEFORE external Google API call
-        est_cost = 0.05
+        est_cost = estimate_music_cost_usd(target_model)
         if reservation_record is None:
             reservation_record = cost_controller.reserve_budget(
                 db=db,
@@ -312,11 +307,15 @@ class GoogleMusicAdapter:
 
         audio_bytes, audio_uri = self._extract_interaction_audio(interaction)
         if not audio_bytes and not audio_uri:
-            cost_controller.release_reservation(
+            # Preserve reservation when response was not explicitly failed/cancelled
+            cost_controller.finalize_reservation(
                 db=db,
                 project_id=project_id,
                 reservation_record=reservation_record,
-                reason="lyria_empty_response",
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="output_unretrieved",
+                error_details=f"Lyria response lacked audio bytes/URI (status={status_str or 'unknown'}, id={provider_op_id or 'none'})",
             )
             db.commit()
             raise GoogleMusicAdapterError(

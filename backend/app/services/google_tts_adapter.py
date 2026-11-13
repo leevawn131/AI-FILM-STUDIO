@@ -32,6 +32,7 @@ from backend.app.config import settings
 from backend.app.models.entities import Project, Scene, Shot, Character, AudioTrack, MediaAsset
 from backend.app.services.cost_controller import cost_controller
 from backend.app.services.ffmpeg_service import ffmpeg_service
+from backend.app.services.provider_error_classifier import classify_provider_exception
 
 logger = logging.getLogger("google_tts_adapter")
 
@@ -50,16 +51,8 @@ class GoogleTTSAdapterError(Exception):
 
 
 def _is_ambiguous_provider_error(err: Exception) -> bool:
-    """Returns True when an error leaves remote provider execution outcome ambiguous (e.g. network timeout)."""
-    if isinstance(err, (TimeoutError, socket.timeout, ConnectionError)):
-        return True
-    msg = str(err).lower()
-    # Explicit HTTP client rejections or auth/validation errors are non-billable confirmed failures
-    rejection_markers = ("400", "401", "403", "404", "422", "429", "invalid_argument", "permission_denied", "unauthenticated", "api key")
-    if any(m in msg for m in rejection_markers):
-        return False
-    ambiguous_markers = ("timeout", "timed out", "504", "gateway", "connection reset", "broken pipe", "remote end closed", "incomplete read")
-    return any(m in msg for m in ambiguous_markers)
+    """Delegates to structured error classifier; treats timeouts/5xx/unknowns as ambiguous."""
+    return classify_provider_exception(err).is_outcome_unknown
 
 
 def _get_interaction_status(interaction: Any) -> Optional[str]:
@@ -330,11 +323,15 @@ class GoogleTTSAdapter:
 
         audio_bytes, audio_uri = self._extract_interaction_audio_bytes(interaction)
         if not audio_bytes and not audio_uri:
-            cost_controller.release_reservation(
+            # Provider did not return failed/cancelled status; do NOT release charge for unretrieved output
+            cost_controller.finalize_reservation(
                 db=db,
                 project_id=project_id,
                 reservation_record=reservation_record,
-                reason="tts_empty_response",
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="output_unretrieved",
+                error_details=f"TTS response lacked audio bytes/URI (status={status_str or 'unknown'}, id={provider_op_id})",
             )
             db.commit()
             raise GoogleTTSAdapterError(
@@ -658,11 +655,15 @@ class GoogleTTSAdapter:
 
         audio_bytes, audio_uri = self._extract_interaction_audio_bytes(interaction)
         if not audio_bytes and not audio_uri:
-            cost_controller.release_reservation(
+            # Preserve reservation for billing safety when completed/accepted call lacks retrievable output
+            cost_controller.finalize_reservation(
                 db=db,
                 project_id=project_id,
                 reservation_record=reservation_record,
-                reason="tts_empty_response",
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="output_unretrieved",
+                error_details=f"Multi-speaker TTS lacked audio bytes/URI (status={status_str or 'unknown'}, id={provider_op_id})",
             )
             db.commit()
             raise GoogleTTSAdapterError(

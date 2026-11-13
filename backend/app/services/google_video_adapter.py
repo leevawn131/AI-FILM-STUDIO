@@ -3,37 +3,50 @@ Google Gemini Omni Flash Video Generation Adapter.
 Officially supported Google Cloud AI video generation via `google-genai` SDK Interactions API.
 
 Capabilities:
-- Submits asynchronous video generation using Gemini Omni Flash 1.1 (`gemini-omni-1.1-flash`)
+- Submits asynchronous video generation explicitly targeting Gemini Omni 1.2 Flash (`gemini-omni-1.2-flash`)
+  with explicit fallback support for `gemini-omni-1.1-flash`
 - Uses official `client.interactions.create()` and `client.interactions.get()`
-- Supports multiple generation tasks:
+- Supports documented tasks:
   * text_to_video
   * image_to_video (reference image input)
+  * reference_to_video (up to 6 reference images on Omni 1.2 Flash)
   * edit (video editing)
   * extend (video extension)
-  * upscale (keyframe interpolation & resolution upscale)
-- Captures native audio output when returned by Omni Flash
-- Downloads and persists generated video assets locally in project directory
-- Registers MediaAsset records with incremental take versioning (_v001, _v002)
-- Multi-take selection and linking on Shot entities
-- Accurate cloud AI cost tracking via CostController (never labeled as subscription credits)
+  * upscale (video upscaling when video input is provided)
+- Supports documented aspect ratios (`16:9`, `9:16`), resolutions (`360p`, `720p`, `1080p`, `4k`),
+  duration strings (`Xs`), and URI delivery for high-resolution outputs
+- Never fabricates fake UUIDs when provider omits `interaction.id` (raises `SubmissionResponseAnomalyError`)
+- Distinguishes provider `"completed"` without retrievable output (`output_missing`) from confirmed `"failed"`
 """
 
 import os
 import time
 import uuid
-import socket
 import base64
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.models.entities import Project, Shot, MediaAsset
 from backend.app.services.cost_controller import cost_controller
 from backend.app.services.ffmpeg_service import ffmpeg_service
+from backend.app.services.google_model_catalog import (
+    estimate_video_cost_usd,
+    MODEL_CATALOG,
+)
+from backend.app.services.provider_error_classifier import (
+    SubmissionResponseAnomalyError,
+    classify_provider_exception,
+    decode_media_bytes,
+    safe_str,
+)
 
 logger = logging.getLogger("google_video_adapter")
+
+
+SUPPORTED_VIDEO_MODELS = ("gemini-omni-1.2-flash", "gemini-omni-1.1-flash")
 
 
 class GoogleVideoAdapterError(Exception):
@@ -48,14 +61,7 @@ class LocalMediaProcessingError(GoogleVideoAdapterError):
 
 def is_ambiguous_provider_error(err: Exception) -> bool:
     """Returns True when a provider call error leaves remote creation/execution outcome ambiguous."""
-    if isinstance(err, (TimeoutError, socket.timeout, ConnectionError)):
-        return True
-    msg = str(err).lower()
-    rejection_markers = ("400", "401", "403", "404", "422", "429", "invalid_argument", "permission_denied", "unauthenticated", "api key")
-    if any(m in msg for m in rejection_markers):
-        return False
-    ambiguous_markers = ("timeout", "timed out", "504", "gateway", "connection reset", "broken pipe", "remote end closed", "incomplete read")
-    return any(m in msg for m in ambiguous_markers)
+    return classify_provider_exception(err).is_outcome_unknown
 
 
 class GoogleVideoAdapter:
@@ -64,6 +70,7 @@ class GoogleVideoAdapter:
         self._model = model
         self._client = None
         self._cached_api_key = None
+        self._injected_client = False
 
     @property
     def api_key(self) -> str:
@@ -132,16 +139,14 @@ class GoogleVideoAdapter:
         task: str = "text_to_video",
         input_image_path: Optional[str] = None,
         input_video_path: Optional[str] = None,
+        reference_image_paths: Optional[List[str]] = None,
+        model: Optional[str] = None,
         negative_prompt: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Submits an asynchronous video generation request to Gemini Omni Flash 1.1 via Interactions API.
-        Uses documented tasks: text_to_video, image_to_video, reference_to_video, edit, extend.
-        Uses documented aspect ratios: 16:9, 9:16.
-        Uses documented resolutions: 720p, 1080p.
-        For video input, uploads via Google Files API and requires state to reach ACTIVE before submission.
-        Target duration is kept separate as `target_duration_seconds` and natural-language guidance;
-        actual duration is measured after download via FFprobe.
+        Submits an asynchronous video generation request explicitly to Gemini Omni 1.2 Flash
+        (`gemini-omni-1.2-flash`) or explicit fallback (`gemini-omni-1.1-flash`) via Interactions API.
+        Never synthesizes a local UUID if `interaction.id` is omitted (`SubmissionResponseAnomalyError`).
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
@@ -151,54 +156,111 @@ class GoogleVideoAdapter:
         if not shot:
             raise ValueError(f"Shot '{shot_id}' not found in project '{project_id}'.")
 
+        target_model = (model or self.model or getattr(settings, "google_video_model", "gemini-omni-1.2-flash")).strip()
+        if target_model not in SUPPORTED_VIDEO_MODELS:
+            model_meta = MODEL_CATALOG.get(target_model)
+            status_note = model_meta.get("status") if model_meta else "unknown"
+            raise ValueError(
+                f"Unsupported video model '{target_model}' (status={status_note}). "
+                f"Supported models: {list(SUPPORTED_VIDEO_MODELS)}"
+            )
+
         if not self.is_available:
             raise GoogleVideoAdapterError(
                 "Gemini Omni Flash video generation requires a valid GEMINI_API_KEY. "
                 "Configure your key in settings to enable Google Cloud AI video rendering."
             )
 
-        # Documented aspect ratios: strictly 16:9 and 9:16
-        clean_ratio = aspect_ratio if aspect_ratio in ["16:9", "9:16"] else "16:9"
-        # Documented resolutions: 720p, 1080p
-        clean_resolution = resolution if resolution in ["720p", "1080p"] else "720p"
-        clean_duration = 5 if duration_seconds <= 5 else 8
+        is_omni_12 = target_model == "gemini-omni-1.2-flash"
 
-        # Documented tasks for Omni Flash video: text_to_video, image_to_video, reference_to_video, edit, extend
-        valid_tasks = ["text_to_video", "image_to_video", "reference_to_video", "edit", "extend"]
-        resolved_task = task
-        if input_image_path and (task == "text_to_video" or task not in valid_tasks):
-            resolved_task = "image_to_video"
-        elif input_video_path and (task == "text_to_video" or task not in valid_tasks):
-            resolved_task = "edit"
-        elif resolved_task not in valid_tasks:
+        # Documented aspect ratios: strictly 16:9 and 9:16
+        clean_ratio = aspect_ratio if aspect_ratio in ("16:9", "9:16") else "16:9"
+
+        # Normalize resolution: Omni 1.2 supports 360p, 720p, 1080p, 4k; Omni 1.1 supports 360p, 720p, 1080p
+        req_res = (resolution or "720p").strip().lower()
+        supported_res = ("360p", "720p", "1080p", "4k") if is_omni_12 else ("360p", "720p", "1080p")
+        if req_res not in supported_res:
+            if req_res == "4k" and not is_omni_12:
+                raise ValueError(
+                    f"Resolution '4k' requires 'gemini-omni-1.2-flash' (not supported by '{target_model}')."
+                )
+            req_res = "720p"
+        clean_resolution = req_res
+
+        # Documented tasks: text_to_video, image_to_video, reference_to_video, edit, extend (+ upscale for video inputs on 1.2)
+        base_valid_tasks = ("text_to_video", "image_to_video", "reference_to_video", "edit", "extend")
+        video_valid_tasks = ("edit", "extend", "upscale") if is_omni_12 else ("edit", "extend")
+
+        if reference_image_paths:
+            if len(reference_image_paths) > 6:
+                raise ValueError(
+                    f"Omni Flash supports at most 6 reference images for reference_to_video (got {len(reference_image_paths)})."
+                )
+            resolved_task = "reference_to_video"
+        elif input_video_path:
+            if task in video_valid_tasks:
+                resolved_task = task
+            else:
+                resolved_task = "edit"
+        elif input_image_path:
+            # Image input supports image_to_video / reference_to_video (never video-only 'upscale')
+            resolved_task = "image_to_video" if (task == "text_to_video" or task not in ("image_to_video", "reference_to_video")) else task
+        elif task in base_valid_tasks:
+            resolved_task = task
+        else:
             resolved_task = "text_to_video"
+
+        # Duration clamping: Omni 1.2 supports 3-15s standard/edit and 3-10s extend
+        raw_dur = int(duration_seconds or 5)
+        if resolved_task == "extend":
+            clean_duration = max(3, min(10, raw_dur))
+        elif is_omni_12:
+            clean_duration = max(3, min(15, raw_dur))
+        else:
+            clean_duration = 5 if raw_dur <= 5 else 8
 
         # Prepare generation config and response format for Interactions API
         video_config: Dict[str, Any] = {
             "task": resolved_task,
         }
-
         generation_config = {
             "video_config": video_config
         }
 
-        response_format = {
+        response_format: Dict[str, Any] = {
             "type": "video",
             "aspect_ratio": clean_ratio,
-            "resolution": clean_resolution
+            "resolution": clean_resolution,
+            "duration": f"{clean_duration}s",
         }
+        if is_omni_12 and clean_resolution in ("1080p", "4k"):
+            response_format["delivery"] = "uri"
 
-        # Format input prompt with natural-language target duration guidance
         full_text = f"{prompt.strip()}\n[Target duration: approximately {clean_duration}s]"
         if negative_prompt:
             full_text = f"{full_text}\n[Avoid: {negative_prompt}]"
 
-        # Build multimodal input parts if reference files are attached
+        # Build multimodal input parts when reference files are attached
         input_payload: Any = full_text
-        if input_image_path:
+        if reference_image_paths:
+            parts: List[Dict[str, Any]] = [{"type": "text", "text": full_text}]
+            for ref_item in reference_image_paths:
+                ref_p = Path(ref_item)
+                if not ref_p.exists():
+                    raise ValueError(f"Reference image file not found: '{ref_item}'")
+                suffix = ref_p.suffix.lower()
+                mime = "image/png" if suffix == ".png" else ("image/webp" if suffix == ".webp" else "image/jpeg")
+                parts.append({
+                    "type": "image",
+                    "data": base64.b64encode(ref_p.read_bytes()).decode("utf-8"),
+                    "mime_type": mime,
+                })
+            input_payload = parts
+        elif input_image_path:
             img_p = Path(input_image_path)
             if img_p.exists():
-                mime = "image/png" if img_p.suffix.lower() == ".png" else "image/jpeg"
+                suffix = img_p.suffix.lower()
+                mime = "image/png" if suffix == ".png" else ("image/webp" if suffix == ".webp" else "image/jpeg")
                 img_data = base64.b64encode(img_p.read_bytes()).decode("utf-8")
                 input_payload = [
                     {"type": "text", "text": full_text},
@@ -259,12 +321,11 @@ class GoogleVideoAdapter:
 
         try:
             logger.info(
-                f"Submitting Omni Flash video generation ({resolved_task}) for shot {shot.shot_code} "
-                f"using model {self.model} via Interactions API..."
+                f"Submitting Omni Flash video generation ({resolved_task}, {clean_resolution}, {clean_duration}s) "
+                f"for shot {shot.shot_code} using model {target_model} via Interactions API..."
             )
-            # Official Google Interactions API
             interaction = self.client.interactions.create(
-                model=self.model,
+                model=target_model,
                 input=input_payload,
                 background=True,
                 generation_config=generation_config,
@@ -275,18 +336,28 @@ class GoogleVideoAdapter:
             logger.error(f"Gemini Omni Flash generation submission failed: {err_msg}")
             raise GoogleVideoAdapterError(f"Gemini Omni Flash submission failed: {err_msg}") from e
 
-        provider_op_id = getattr(interaction, "id", None) or str(uuid.uuid4())
+        provider_op_id = safe_str(getattr(interaction, "id", None))
+        if not provider_op_id:
+            # CRITICAL BILLING SAFETY: NEVER synthesize a fake UUID if provider omitted `id`.
+            logger.error("Google Omni Flash interactions.create returned without an interaction ID.")
+            raise SubmissionResponseAnomalyError(
+                "Provider response from interactions.create lacked a valid interaction.id; "
+                "cannot safely assume request did not execute remotely."
+            )
+
         logger.info(f"Gemini Omni Flash interaction created successfully: id={provider_op_id}")
 
         return {
             "status": "processing",
             "provider": "google_omni",
-            "model": self.model,
+            "model": target_model,
             "provider_operation_id": provider_op_id,
             "prompt": prompt,
             "task": resolved_task,
             "target_duration_seconds": clean_duration,
             "aspect_ratio": clean_ratio,
+            "resolution": clean_resolution,
+            "delivery": response_format.get("delivery", "inline"),
             "supports_cancellation": True
         }
 
@@ -311,7 +382,7 @@ class GoogleVideoAdapter:
 
         errors = getattr(interaction, "errors", None)
 
-        if status_lower in ("failed", "error"):
+        if status_lower in ("failed", "error", "budget_exceeded"):
             logger.warning(f"Omni Flash interaction '{provider_operation_id}' failed: {errors}")
             return {
                 "status": "failed",
@@ -329,39 +400,31 @@ class GoogleVideoAdapter:
             output_video = getattr(interaction, "output_video", None)
             output_audio = getattr(interaction, "output_audio", None)
 
-            video_bytes = None
-            video_uri = None
-            if output_video:
-                raw_data = getattr(output_video, "data", None)
-                if raw_data:
-                    if isinstance(raw_data, str):
-                        try:
-                            video_bytes = base64.b64decode(raw_data)
-                        except Exception:
-                            video_bytes = raw_data.encode("utf-8")
-                    else:
-                        video_bytes = raw_data
-                video_uri = getattr(output_video, "uri", None)
-
-            audio_bytes = None
-            audio_uri = None
-            if output_audio:
-                raw_aud = getattr(output_audio, "data", None)
-                if raw_aud:
-                    if isinstance(raw_aud, str):
-                        try:
-                            audio_bytes = base64.b64decode(raw_aud)
-                        except Exception:
-                            audio_bytes = raw_aud.encode("utf-8")
-                    else:
-                        audio_bytes = raw_aud
-                audio_uri = getattr(output_audio, "uri", None)
+            video_bytes = decode_media_bytes(getattr(output_video, "data", None)) if output_video else None
+            video_uri = safe_str(getattr(output_video, "uri", None)) if output_video else None
 
             if not video_bytes and not video_uri:
+                outputs = getattr(interaction, "outputs", None)
+                if isinstance(outputs, (list, tuple)):
+                    for out in outputs:
+                        raw_b = decode_media_bytes(getattr(out, "data", None))
+                        raw_u = safe_str(getattr(out, "uri", None))
+                        mime = (safe_str(getattr(out, "mime_type", None)) or "").lower()
+                        if (raw_b or raw_u) and (not mime or mime.startswith("video/")):
+                            video_bytes = raw_b
+                            video_uri = raw_u
+                            break
+
+            audio_bytes = decode_media_bytes(getattr(output_audio, "data", None)) if output_audio else None
+            audio_uri = safe_str(getattr(output_audio, "uri", None)) if output_audio else None
+
+            if not video_bytes and not video_uri:
+                # CRITICAL BILLING SAFETY: Provider reported `completed`, so do NOT report `"failed"`
+                # and do NOT release reservation! Return `"output_missing"` so budget stays preserved.
                 return {
-                    "status": "failed",
+                    "status": "output_missing",
                     "provider_operation_id": provider_operation_id,
-                    "error": "Interaction marked completed but returned no output video."
+                    "error": "Interaction marked completed remotely but returned no video bytes or URI; charge preserved."
                 }
 
             return {
@@ -371,7 +434,7 @@ class GoogleVideoAdapter:
                 "video_uri": video_uri,
                 "audio_bytes": audio_bytes,
                 "audio_uri": audio_uri,
-                "mime_type": getattr(output_video, "mime_type", "video/mp4")
+                "mime_type": safe_str(getattr(output_video, "mime_type", None)) or "video/mp4"
             }
 
         return {
@@ -556,8 +619,8 @@ class GoogleVideoAdapter:
                     provider="google_omni",
                     model=self.model,
                     operation="video_generation",
-                    details=f"Gemini Omni Flash 1.1 video generation take {next_ver} for shot {shot.shot_code}",
-                    estimated_cost=0.15,
+                    details=f"{self.model} video generation take {next_ver} for shot {shot.shot_code}",
+                    estimated_cost=estimate_video_cost_usd(self.model),
                     actual_cost=None,
                     actual_cost_known=False,
                     allow_duplicate=True

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 AI FILM STUDIO — Official Google Cloud AI Live Smoke-Test Script.
-Verified baseline: November 5, 2026.
+Verified baseline: November 13, 2026.
 
 This script executes live smoke tests against official Google Cloud AI endpoints:
-- Gemini 3.8 Flash (Reasoning): `gemini-3.8-flash`
-- Nano Banana 2 (Image Generation): `gemini-3.1-flash-image`
-- Gemini Omni Flash 1.1 (Video Generation): `gemini-omni-1.1-flash` via Interactions API
+- Gemini 4 Hydrogen (Reasoning): `gemini-4-hydrogen`
+- Nano Banana 2.1 (Image Generation): `gemini-nano-banana-2.1` via Interactions API
+- Gemini Omni 1.2 Flash (Video Generation): `gemini-omni-1.2-flash` via Interactions API
 - Gemini TTS (Speech Generation): `gemini-3.8-flash-tts`
 - Lyria 3.5 (Music Generation): `lyria-3.5` via Interactions API
 
@@ -31,17 +31,17 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from backend.app.config import settings
 
 ESTIMATED_COSTS = {
-    "Gemini 3.8 Flash (Text Reasoning)": 0.0001,
-    "Nano Banana 2 (Image Generation)": 0.02,
-    "Gemini Omni Flash 1.1 (Video Generation)": 0.15,
+    "Gemini 4 Hydrogen (Text Reasoning)": 0.0005,
+    "Nano Banana 2.1 (Image Generation)": 0.0336,
+    "Gemini Omni 1.2 Flash (Video Generation)": 0.35,
     "Gemini TTS (Speech Generation)": 0.01,
-    "Lyria 3.5 (Music Generation)": 0.05
+    "Lyria 3.5 (Music Generation)": 0.08
 }
 
 
 def print_banner():
     print("=" * 72)
-    print("  AI FILM STUDIO — GOOGLE CLOUD AI LIVE API SMOKE TEST (Nov 5, 2026)")
+    print("  AI FILM STUDIO — GOOGLE CLOUD AI LIVE API SMOKE TEST (Nov 13, 2026)")
     print("=" * 72)
 
 
@@ -121,54 +121,56 @@ def main():
             "error": str(e)
         })
 
-    # 2. Nano Banana 2 (Image Generation)
-    print(f"\n[2/5] Testing Nano Banana 2 image generation ({settings.google_image_model})...")
+    # 2. Nano Banana 2.1 (Image Generation via Interactions API)
+    print(f"\n[2/5] Testing Nano Banana 2.1 image generation ({settings.google_image_model})...")
     t0 = time.time()
     try:
-        img_resp = client.models.generate_images(
+        img_resp = client.interactions.create(
             model=settings.google_image_model,
-            prompt="A minimalist cinematic film clapboard in volumetric blue light, 16:9 widescreen.",
-            config=types.GenerateImagesConfig(number_of_images=1, aspect_ratio="16:9")
+            input="A minimalist cinematic film clapboard in volumetric blue light, 16:9 widescreen.",
+            response_format={"type": "image", "aspect_ratio": "16:9", "image_size": "1K"}
         )
         latency = time.time() - t0
-        if hasattr(img_resp, "generated_images") and img_resp.generated_images:
-            img_bytes = img_resp.generated_images[0].image.image_bytes
-            print(f"  -> SUCCESS ({latency:.2f}s, size={len(img_bytes)} bytes)")
+        out_img = getattr(img_resp, "output_image", None)
+        img_data = getattr(out_img, "data", None) if out_img else None
+        if img_data:
+            raw_len = len(img_data)
+            print(f"  -> SUCCESS ({latency:.2f}s, payload_len={raw_len})")
             results.append({
-                "service": "Image Generation (Nano Banana 2)",
+                "service": "Image Generation (Nano Banana 2.1)",
                 "model": settings.google_image_model,
                 "status": "PASS",
                 "latency_seconds": round(latency, 2),
-                "bytes_received": len(img_bytes)
+                "bytes_received": raw_len
             })
         else:
-            print(f"  -> FAILED: No images in response")
+            print("  -> FAILED: No output_image.data in response")
             results.append({
-                "service": "Image Generation (Nano Banana 2)",
+                "service": "Image Generation (Nano Banana 2.1)",
                 "model": settings.google_image_model,
                 "status": "FAIL",
-                "error": "No images returned"
+                "error": "No output image returned"
             })
     except Exception as e:
         print(f"  -> FAILED: {e}")
         results.append({
-            "service": "Image Generation (Nano Banana 2)",
+            "service": "Image Generation (Nano Banana 2.1)",
             "model": settings.google_image_model,
             "status": "FAIL",
             "error": str(e)
         })
 
-    # 3. Gemini Omni Flash 1.1 (Video Generation via Interactions API)
+    # 3. Gemini Omni 1.2 Flash (Video Generation via Interactions API)
     if args.skip_video:
-        print("\n[3/5] Skipping Gemini Omni Flash video generation as requested.")
+        print("\n[3/5] Skipping Gemini Omni 1.2 Flash video generation as requested.")
         results.append({
-            "service": "Video Generation (Gemini Omni Flash 1.1)",
+            "service": "Video Generation (Gemini Omni 1.2 Flash)",
             "model": settings.google_video_model,
             "status": "SKIPPED",
             "note": "Skipped by user flag"
         })
     else:
-        print(f"\n[3/5] Testing Gemini Omni Flash video generation ({settings.google_video_model}) via Interactions API...")
+        print(f"\n[3/5] Testing Gemini Omni 1.2 Flash video generation ({settings.google_video_model}) via Interactions API...")
         t0 = time.time()
         try:
             interaction = client.interactions.create(
@@ -176,13 +178,13 @@ def main():
                 input="Slow cinematic pan across a futuristic cityscape at dusk, 4k photoreal.",
                 background=True,
                 generation_config={"video_config": {"task": "text_to_video"}},
-                response_format={"type": "video", "aspect_ratio": "16:9", "resolution": "720p"}
+                response_format={"type": "video", "aspect_ratio": "16:9", "resolution": "720p", "duration": "5s"}
             )
             op_id = getattr(interaction, "id", None)
             latency = time.time() - t0
             print(f"  -> SUCCESS: Created interaction ID {op_id} ({latency:.2f}s)")
             results.append({
-                "service": "Video Generation (Gemini Omni Flash 1.1)",
+                "service": "Video Generation (Gemini Omni 1.2 Flash)",
                 "model": settings.google_video_model,
                 "status": "PASS",
                 "interaction_id": op_id,

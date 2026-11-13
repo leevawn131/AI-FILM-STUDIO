@@ -1,23 +1,19 @@
 """
-Google Nano Banana 2 Image Generation Adapter.
-Officially supported Google Cloud AI image generation via `google-genai` SDK.
+Google Nano Banana Image Generation Adapter.
+Officially supported Google Cloud AI image generation via `google-genai` Interactions API
+(`client.interactions.create(...)`).
 
 Capabilities:
-- Nano Banana 2 (`gemini-3.1-flash-image`) default fast cinematic image generation
-- Nano Banana Pro (`gemini-3-pro-image`) high-fidelity artistic renders
-- Nano Banana 2 Lite (`gemini-3.1-flash-lite-image`) lightweight rapid ideation
-- Character reference portraits and costume sheets
-- Location architectural and environment concept art
-- Storyboard visual frames
-- Local file persistence in studio data directory
-- Automatic MediaAsset registration in SQLite database
+- Nano Banana 2.1 (`gemini-nano-banana-2.1`) primary image model (1K, 2K, 4K; 14 aspect ratios incl. panoramic 1:4, 4:1, 1:8, 8:1)
+- Nano Banana Pro (`gemini-3-pro-image`) high-fidelity renders (1K, 2K, 4K)
+- Nano Banana 2 Lite (`gemini-3.1-flash-lite-image`) lightweight rapid ideation (512, 1K)
+- Strict rejection of deprecated (`gemini-3.1-flash-image`) and unknown model IDs (no silent fallback)
+- Local file persistence in studio data directory and SQLite MediaAsset registration
 """
 
 import os
 import io
 import uuid
-import socket
-import base64
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
@@ -26,26 +22,51 @@ from sqlalchemy.orm import Session
 from backend.app.config import settings
 from backend.app.models.entities import Project, MediaAsset, Character, Location, Shot
 from backend.app.services.cost_controller import cost_controller
+from backend.app.services.google_model_catalog import (
+    DEPRECATED_IMAGE_MODELS,
+    IMAGE_SUPPORTED_SIZES_BY_MODEL,
+    NANO_BANANA_PANORAMIC_ASPECT_RATIOS,
+    STANDARD_IMAGE_ASPECT_RATIOS,
+    estimate_image_cost_usd,
+)
+from backend.app.services.provider_error_classifier import (
+    classify_provider_exception,
+    decode_media_bytes,
+    safe_str,
+)
 
 logger = logging.getLogger("google_image_adapter")
 
 
-SUPPORTED_IMAGE_SIZES = {
-    "gemini-3.1-flash-image": ["512", "1K", "2K", "4K"],
-    "gemini-3.1-flash-lite-image": ["512", "1K"],
-    "gemini-3-pro-image": ["1K", "2K", "4K"],
-}
+SUPPORTED_IMAGE_SIZES: Dict[str, List[str]] = dict(IMAGE_SUPPORTED_SIZES_BY_MODEL)
 
 
 def get_supported_image_sizes_for_model(model_name: str) -> List[str]:
-    """Returns the list of officially supported image sizes for a given model."""
-    m = model_name.lower()
-    if "lite" in m:
-        return ["512", "1K"]
-    elif "pro" in m:
-        return ["1K", "2K", "4K"]
-    else:
-        return ["512", "1K", "2K", "4K"]
+    """
+    Returns the officially supported image sizes for a verified Nano Banana model.
+    Explicitly rejects deprecated (`gemini-3.1-flash-image`) and unknown models instead of
+    guessing or silently falling back.
+    """
+    if not model_name or not isinstance(model_name, str):
+        raise ValueError("Image model name must be a non-empty string.")
+    if model_name in DEPRECATED_IMAGE_MODELS:
+        raise ValueError(
+            f"Image model '{model_name}' is deprecated ({DEPRECATED_IMAGE_MODELS[model_name]}). "
+            "Use 'gemini-nano-banana-2.1' instead."
+        )
+    if model_name not in SUPPORTED_IMAGE_SIZES:
+        raise ValueError(
+            f"Unknown or unsupported image model '{model_name}'. "
+            f"Supported models: {list(SUPPORTED_IMAGE_SIZES.keys())}"
+        )
+    return list(SUPPORTED_IMAGE_SIZES[model_name])
+
+
+def get_supported_aspect_ratios_for_model(model_name: str) -> List[str]:
+    """Returns supported aspect ratios for a verified Nano Banana model."""
+    if model_name == "gemini-3-pro-image":
+        return list(STANDARD_IMAGE_ASPECT_RATIOS)
+    return list(NANO_BANANA_PANORAMIC_ASPECT_RATIOS)
 
 
 class GoogleImageAdapterError(Exception):
@@ -54,15 +75,8 @@ class GoogleImageAdapterError(Exception):
 
 
 def _is_ambiguous_provider_error(err: Exception) -> bool:
-    """Returns True when an API exception leaves remote execution outcome ambiguous."""
-    if isinstance(err, (TimeoutError, socket.timeout, ConnectionError)):
-        return True
-    msg = str(err).lower()
-    rejection_markers = ("400", "401", "403", "404", "422", "429", "invalid_argument", "permission_denied", "unauthenticated", "api key")
-    if any(m in msg for m in rejection_markers):
-        return False
-    ambiguous_markers = ("timeout", "timed out", "504", "gateway", "connection reset", "broken pipe", "remote end closed", "incomplete read")
-    return any(m in msg for m in ambiguous_markers)
+    """Compatibility helper delegating to structured `classify_provider_exception`."""
+    return classify_provider_exception(err).is_outcome_unknown
 
 
 class GoogleImageAdapter:
@@ -111,8 +125,13 @@ class GoogleImageAdapter:
     def is_available(self) -> bool:
         return bool(self.client and self.api_key)
 
-    def _resolve_model(self, model: Optional[str] = None, tier: str = "default") -> Tuple[str, float]:
-        """Resolves target Nano Banana model and corresponding estimated cost."""
+    def _resolve_model(
+        self,
+        model: Optional[str] = None,
+        tier: str = "default",
+        image_size: str = "1K",
+    ) -> Tuple[str, float]:
+        """Resolves validated Nano Banana model and corresponding estimated cost."""
         if model:
             target_model = model
         elif tier == "pro":
@@ -120,15 +139,12 @@ class GoogleImageAdapter:
         elif tier == "lite":
             target_model = getattr(settings, "google_image_lite_model", "gemini-3.1-flash-lite-image")
         else:
-            target_model = self.model or getattr(settings, "google_image_model", "gemini-3.1-flash-image")
+            target_model = self.model or getattr(settings, "google_image_model", "gemini-nano-banana-2.1")
 
-        if "pro" in target_model.lower():
-            cost = 0.04
-        elif "lite" in target_model.lower():
-            cost = 0.01
-        else:
-            cost = 0.02
-        return target_model, cost
+        # Validate known & non-deprecated model explicitly
+        get_supported_image_sizes_for_model(target_model)
+        est_cost = estimate_image_cost_usd(target_model, image_size=image_size)
+        return target_model, est_cost
 
     @staticmethod
     def get_supported_image_sizes(model_name: Optional[str] = None) -> Any:
@@ -137,27 +153,84 @@ class GoogleImageAdapter:
             return get_supported_image_sizes_for_model(model_name)
         return SUPPORTED_IMAGE_SIZES
 
-    @staticmethod
-    def _extract_inline_image_bytes(gc_resp: Any) -> Optional[bytes]:
-        """Extracts inline image bytes from GenerateContentResponse parts or candidates."""
-        candidates = getattr(gc_resp, "candidates", None)
+    def _download_uri_bytes(self, uri: str) -> Optional[bytes]:
+        files_api = getattr(self.client, "files", None)
+        download_fn = getattr(files_api, "download", None) if files_api else None
+        if callable(download_fn):
+            try:
+                downloaded = download_fn(file=uri)
+                if isinstance(downloaded, (bytes, bytearray)):
+                    return bytes(downloaded)
+                if hasattr(downloaded, "read") and callable(downloaded.read):
+                    buf = downloaded.read()
+                    if isinstance(buf, (bytes, bytearray)):
+                        return bytes(buf)
+            except Exception as dl_err:
+                logger.warning(f"Failed downloading Nano Banana output URI '{uri}': {dl_err}")
+        return None
+
+    def _extract_interaction_image_bytes(self, interaction: Any) -> Optional[bytes]:
+        """
+        Extracts image bytes from a Google Interactions API response.
+        Primary: `interaction.output_image.data` (or `.uri` download).
+        Fallback: type-guarded `outputs` / `steps` or legacy `candidates`/`parts` inline data.
+        Strictly checks real `bytes`/`str` types to avoid MagicMock truthiness in tests.
+        """
+        output_image = getattr(interaction, "output_image", None)
+        if output_image is not None:
+            raw = decode_media_bytes(getattr(output_image, "data", None))
+            if raw:
+                return raw
+            uri = safe_str(getattr(output_image, "uri", None))
+            if uri:
+                dl = self._download_uri_bytes(uri)
+                if dl:
+                    return dl
+
+        outputs = getattr(interaction, "outputs", None)
+        if isinstance(outputs, (list, tuple)):
+            for item in outputs:
+                raw = decode_media_bytes(getattr(item, "data", None))
+                if raw:
+                    return raw
+                inline = getattr(item, "inline_data", None)
+                if inline is not None:
+                    raw = decode_media_bytes(getattr(inline, "data", None))
+                    if raw:
+                        return raw
+                uri = safe_str(getattr(item, "uri", None))
+                if uri:
+                    dl = self._download_uri_bytes(uri)
+                    if dl:
+                        return dl
+
+        steps = getattr(interaction, "steps", None)
+        if isinstance(steps, (list, tuple)):
+            for step in steps:
+                step_outputs = getattr(step, "outputs", None)
+                if isinstance(step_outputs, (list, tuple)):
+                    for out in step_outputs:
+                        raw = decode_media_bytes(getattr(out, "data", None))
+                        if raw:
+                            return raw
+                        uri = safe_str(getattr(out, "uri", None))
+                        if uri:
+                            dl = self._download_uri_bytes(uri)
+                            if dl:
+                                return dl
+
+        # Legacy candidate/parts fallback only if explicitly real lists
+        candidates = getattr(interaction, "candidates", None)
         if isinstance(candidates, (list, tuple)) and candidates:
             content = getattr(candidates[0], "content", None)
             cand_parts = getattr(content, "parts", None) if content else None
             if isinstance(cand_parts, (list, tuple)):
                 for part in cand_parts:
                     inline = getattr(part, "inline_data", None)
-                    raw_data = getattr(inline, "data", None) if inline else None
-                    if raw_data:
-                        return base64.b64decode(raw_data) if isinstance(raw_data, str) else bytes(raw_data)
+                    raw = decode_media_bytes(getattr(inline, "data", None)) if inline else None
+                    if raw:
+                        return raw
 
-        top_parts = getattr(gc_resp, "parts", None)
-        if isinstance(top_parts, (list, tuple)):
-            for part in top_parts:
-                inline = getattr(part, "inline_data", None)
-                raw_data = getattr(inline, "data", None) if inline else None
-                if raw_data:
-                    return base64.b64decode(raw_data) if isinstance(raw_data, str) else bytes(raw_data)
         return None
 
     def generate_image(
@@ -165,43 +238,47 @@ class GoogleImageAdapter:
         prompt: str,
         project_id: str,
         db: Session,
-        aspect_ratio: str = "16:9", # "1:1", "3:4", "4:3", "9:16", "16:9"
-        image_size: str = "1K",     # "512", "1K", "2K", "4K"
+        aspect_ratio: str = "16:9", # "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9", "1:4", "4:1", "1:8", "8:1"
+        image_size: str = "1K",     # "1K", "2K", "4K" on 2.1/Pro; "512", "1K" on Lite
         entity_type: Optional[str] = None, # "character", "location", "storyboard"
         entity_id: Optional[str] = None,
         negative_prompt: Optional[str] = None,
         model: Optional[str] = None,
         tier: str = "default",
         reservation_record: Optional[Any] = None,
-        job_id: Optional[str] = None
+        job_id: Optional[str] = None,
+        reference_image_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        Generates an image via Google Nano Banana 2 using `client.models.generate_content()`,
+        Generates an image via Google Nano Banana using `client.interactions.create()`,
         reserves budget pre-flight before the external API call, validates output bytes with Pillow
         (failing clearly on corrupted/invalid payloads without fabricating dimensions),
-        and registers a local MediaAsset record in SQLite.
+        and never releases a reservation when a provider operation returns without image bytes.
         """
         project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
             raise ValueError(f"Project '{project_id}' not found.")
 
-        target_model, est_cost = self._resolve_model(model=model, tier=tier)
+        clean_size = str(image_size or "1K").strip()
+        target_model, est_cost = self._resolve_model(model=model, tier=tier, image_size=clean_size)
 
-        # Enforce model-specific image-size limitations per documentation:
-        # - Flash Image: 512, 1K, 2K, 4K
-        # - Flash Lite Image: 512, 1K
-        # - Pro Image: 1K, 2K, 4K
         supported_sizes = get_supported_image_sizes_for_model(target_model)
-        if image_size not in supported_sizes:
+        if clean_size not in supported_sizes:
             raise ValueError(
-                f"Image size '{image_size}' is not supported by model '{target_model}'. "
+                f"Image size '{clean_size}' is not supported by model '{target_model}'. "
                 f"Supported sizes: {supported_sizes}"
             )
-        clean_size = image_size
 
-        # Normalize aspect ratio for Nano Banana
-        valid_ratios = ["1:1", "3:4", "4:3", "9:16", "16:9"]
-        clean_ratio = aspect_ratio if aspect_ratio in valid_ratios else "16:9"
+        supported_ratios = get_supported_aspect_ratios_for_model(target_model)
+        req_ratio = (aspect_ratio or "16:9").strip()
+        if req_ratio == "2.39:1":
+            req_ratio = "21:9"
+        if req_ratio not in supported_ratios:
+            raise ValueError(
+                f"Aspect ratio '{aspect_ratio}' is not supported by model '{target_model}'. "
+                f"Supported aspect ratios: {supported_ratios}"
+            )
+        clean_ratio = req_ratio
 
         # Ensure project references directory exists
         dest_dir = settings.projects_dir / project_id / "references"
@@ -209,7 +286,6 @@ class GoogleImageAdapter:
 
         if not self.is_available:
             # Deterministic fallback when Google API key is not configured
-            # Generates a clean concept placeholder with explicit fallback attribution
             logger.info("Google API key not configured for Nano Banana. Generating deterministic reference visual.")
             return self._generate_fallback_reference(
                 prompt=prompt,
@@ -234,63 +310,94 @@ class GoogleImageAdapter:
             )
             db.commit()
 
-        from google.genai import types
-        gc_config = types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            image_config=types.ImageConfig(
-                aspect_ratio=clean_ratio,
-                image_size=clean_size,
-            ),
-        )
-        full_contents = f"{prompt}\n[Avoid: {negative_prompt}]" if negative_prompt else prompt
+        full_prompt = f"{prompt}\n[Avoid: {negative_prompt}]" if negative_prompt else prompt
+        interaction_input: Any = full_prompt
+        if reference_image_paths:
+            import base64
+            content_items: List[Dict[str, Any]] = [{"type": "text", "text": full_prompt}]
+            for ref_path in reference_image_paths:
+                p = Path(ref_path)
+                if p.exists() and p.is_file():
+                    suffix = p.suffix.lower()
+                    ref_mime = "image/png" if suffix == ".png" else ("image/webp" if suffix == ".webp" else "image/jpeg")
+                    content_items.append({
+                        "type": "image",
+                        "data": base64.b64encode(p.read_bytes()).decode("ascii"),
+                        "mime_type": ref_mime,
+                    })
+            if len(content_items) > 1:
+                interaction_input = [{"type": "user_input", "content": content_items}]
 
-        gc_resp = None
+        response_format = {
+            "type": "image",
+            "aspect_ratio": clean_ratio,
+            "image_size": clean_size,
+        }
+
+        interaction = None
         try:
             logger.info(
                 f"Submitting Nano Banana image generation ({target_model}, {clean_ratio}, {clean_size}) "
-                f"via models.generate_content()..."
+                f"via client.interactions.create()..."
             )
-            gc_resp = self.client.models.generate_content(
+            interaction = self.client.interactions.create(
                 model=target_model,
-                contents=full_contents,
-                config=gc_config,
+                input=interaction_input,
+                response_format=response_format,
             )
         except Exception as api_err:
             err_msg = str(api_err)
-            logger.error(f"Nano Banana models.generate_content failed: {err_msg}")
-            if _is_ambiguous_provider_error(api_err):
+            logger.error(f"Nano Banana interactions.create failed: {err_msg}")
+            classified = classify_provider_exception(api_err)
+            if classified.is_confirmed_pre_generation_rejection:
+                cost_controller.release_reservation(
+                    db=db,
+                    project_id=project_id,
+                    reservation_record=reservation_record,
+                    reason=f"image_provider_rejected: {classified.reason}",
+                )
+            else:
                 cost_controller.finalize_reservation(
                     db=db,
                     project_id=project_id,
                     reservation_record=reservation_record,
                     local_processing_status="provider_outcome_unknown",
-                    error_details=err_msg,
-                )
-            else:
-                cost_controller.release_reservation(
-                    db=db,
-                    project_id=project_id,
-                    reservation_record=reservation_record,
-                    reason=f"image_provider_error: {err_msg}",
+                    error_details=classified.reason,
                 )
             db.commit()
             raise GoogleImageAdapterError(f"Nano Banana generation failed: {err_msg}") from api_err
 
-        provider_op_id = getattr(gc_resp, "response_id", None) or getattr(gc_resp, "id", None)
-        if not isinstance(provider_op_id, str):
-            provider_op_id = None
+        provider_op_id = safe_str(getattr(interaction, "id", None)) or safe_str(getattr(interaction, "response_id", None))
+        remote_status = (safe_str(getattr(interaction, "status", None)) or "").lower()
 
-        img_bytes = self._extract_inline_image_bytes(gc_resp)
-        if not img_bytes:
+        if remote_status in ("failed", "cancelled", "budget_exceeded"):
             cost_controller.release_reservation(
                 db=db,
                 project_id=project_id,
                 reservation_record=reservation_record,
-                reason="image_no_inline_bytes_returned",
+                reason=f"image_provider_status_{remote_status}",
             )
             db.commit()
             raise GoogleImageAdapterError(
-                f"Google Nano Banana ({target_model}) returned no inline image bytes in response."
+                f"Google Nano Banana ({target_model}) returned status '{remote_status}'."
+            )
+
+        img_bytes = self._extract_interaction_image_bytes(interaction)
+        if not img_bytes:
+            # Provider returned a response (e.g. completed or accepted) without retrievable image bytes.
+            # NEVER auto-refund/release this reservation — keep billing accountability intact!
+            cost_controller.finalize_reservation(
+                db=db,
+                project_id=project_id,
+                reservation_record=reservation_record,
+                actual_cost=None,
+                actual_cost_known=False,
+                local_processing_status="output_unretrieved",
+                error_details=f"No retrievable image bytes returned (remote_status={remote_status or 'unknown'}, id={provider_op_id or 'none'})",
+            )
+            db.commit()
+            raise GoogleImageAdapterError(
+                f"Google Nano Banana ({target_model}) returned no retrievable image bytes in response."
             )
 
         # Provider outcome SUCCEEDED; validate bytes strictly with Pillow (no fake dimensions)
@@ -307,9 +414,14 @@ class GoogleImageAdapter:
                 elif fmt == "webp":
                     ext = ".webp"
                     mime_type = "image/webp"
-                else:
+                elif fmt == "gif":
+                    ext = ".gif"
+                    mime_type = "image/gif"
+                elif fmt in ("jpeg", "jpg"):
                     ext = ".jpg"
                     mime_type = "image/jpeg"
+                else:
+                    raise ValueError(f"Unsupported decoded image format: '{fmt}'")
                 if real_width <= 0 or real_height <= 0:
                     raise ValueError(f"Invalid image dimensions: {real_width}x{real_height}")
         except Exception as img_err:
